@@ -360,9 +360,12 @@ namespace vk
 	{
 		if (!m_in_use) [[unlikely]]
 		{
-			m_image_info_pool.reserve(m_pool_size);
-			m_buffer_view_pool.reserve(m_pool_size);
-			m_buffer_info_pool.reserve(m_pool_size);
+			// vanillad1 leak fix: reserving m_pool_size here committed ~0.9 MB per set that was almost
+			// never written (2 sets per graphics program). Start small; flush() grows the pools.
+			m_cache_size = min_cache_size;
+			m_image_info_pool.reserve(m_cache_size + max_overflow_size);
+			m_buffer_view_pool.reserve(m_cache_size + max_overflow_size);
+			m_buffer_info_pool.reserve(m_cache_size + max_overflow_size);
 
 			m_in_use = true;
 			m_update_after_bind_mask = g_render_device->get_descriptor_update_after_bind_support();
@@ -540,11 +543,22 @@ namespace vk
 
 		m_storage_cache_id++;
 
+		const bool grow = m_in_use && m_cache_size < max_cache_size && storage_cache_pressure();
 		m_push_type_mask = 0;
 		m_pending_writes.clear();
 		m_pending_copies.clear();
 		m_image_info_pool.clear();
 		m_buffer_info_pool.clear();
 		m_buffer_view_pool.clear();
+
+		if (grow)
+		{
+			// Safe to reallocate: the pools are empty and the cache id changed, so no pending write
+			// or descriptor template points into them any more.
+			m_cache_size = std::min(m_cache_size * 2, static_cast<u32>(max_cache_size));
+			m_image_info_pool.reserve(m_cache_size + max_overflow_size);
+			m_buffer_view_pool.reserve(m_cache_size + max_overflow_size);
+			m_buffer_info_pool.reserve(m_cache_size + max_overflow_size);
+		}
 	}
 }

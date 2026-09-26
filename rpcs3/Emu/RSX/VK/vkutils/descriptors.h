@@ -96,8 +96,10 @@ namespace vk
 	class descriptor_set
 	{
 		static constexpr size_t max_cache_size = 16384;
-		static constexpr size_t max_overflow_size = 64;
+		static constexpr size_t max_overflow_size = 256; // vanillad1 leak fix: was 64
 		static constexpr size_t m_pool_size = max_cache_size + max_overflow_size;
+		// vanillad1 leak fix: pools start at min_cache_size entries and double in flush() when full.
+		static constexpr u32 min_cache_size = 256;
 
 		void init(VkDescriptorSet new_set);
 
@@ -191,9 +193,9 @@ namespace vk
 		FORCE_INLINE bool storage_cache_pressure() const
 		{
 			return
-				m_image_info_pool.size() >= max_cache_size ||
-				m_buffer_info_pool.size() >= max_cache_size ||
-				m_buffer_view_pool.size() >= max_cache_size;
+				m_image_info_pool.size() >= m_cache_size ||
+				m_buffer_info_pool.size() >= m_cache_size ||
+				m_buffer_view_pool.size() >= m_cache_size;
 		}
 
 		// Temporary storage accessors
@@ -209,6 +211,7 @@ namespace vk
 		u64 m_update_after_bind_mask = 0;
 		u64 m_push_type_mask = 0;
 		bool m_in_use = false;
+		u32 m_cache_size = static_cast<u32>(max_cache_size); // flush threshold; init() lowers it
 
 		shared_mutex m_storage_lock;
 		atomic_t<u64> m_storage_cache_id = 0;
