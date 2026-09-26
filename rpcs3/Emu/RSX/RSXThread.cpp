@@ -2150,6 +2150,36 @@ namespace rsx
 		return expected_ctrl;
 	}
 
+	// vanillad1: depth-only draws. RPCS3's NOP fragment program: one instruction, opcode 0, END bit
+	// set (analyse_fragment_program's is_nop_shader case).
+	alignas(16) static u8 s_nop_fragment_program[16] = { 0x00, 0x01 };
+
+	// vanillad1: a draw with no colour target that can't discard (KIL, alpha test, texture alpha kill,
+	// stipple, alpha to coverage) or export depth ignores its fragment program's output. Destiny
+	// (BLUS31181) points such draws at a per-frame constant block holding a clock, which RPCS3 compiled
+	// as a new program every tick (~50 pipelines each).
+	bool thread::fragment_program_output_is_unused()
+	{
+		if (rsx::utility::get_mrt_buffers_count(REGS(m_ctx)->surface_color_target()) != 0 ||
+			(REGS(m_ctx)->shader_control() & (CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT | RSX_SHADER_CONTROL_USES_KIL)) ||
+			REGS(m_ctx)->alpha_test_enabled() ||
+			REGS(m_ctx)->msaa_alpha_to_coverage_enabled() ||
+			REGS(m_ctx)->polygon_stipple_enabled())
+		{
+			return false;
+		}
+
+		for (u32 textures_ref = m_fp_original_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
+		{
+			if ((textures_ref & 1) && REGS(m_ctx)->fragment_textures[i].enabled() && REGS(m_ctx)->fragment_textures[i].alpha_kill_enabled())
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	void thread::prefetch_fragment_program()
 	{
 		if (!m_graphics_state.test(rsx::pipeline_state::fragment_program_ucode_dirty))
@@ -2168,10 +2198,21 @@ namespace rsx
 		auto data_ptr = vm::base(rsx::get_address(program_offset, program_location));
 		current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
 
+		// vanillad1: depth-only draws that ignore the program's output key and compile the NOP program.
+		// total_length keeps covering the real ucode, so writes to it still trigger a new prefetch.
+		const u32 real_total_length = current_fp_metadata.program_ucode_length + current_fp_metadata.program_start_offset;
+		m_fp_original_textures_mask = current_fp_metadata.referenced_textures_mask;
+		m_fp_nop_substituted = fragment_program_output_is_unused();
+		if (m_fp_nop_substituted)
+		{
+			data_ptr = s_nop_fragment_program;
+			current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+		}
+
 		current_fragment_program.data = (static_cast<u8*>(data_ptr) + current_fp_metadata.program_start_offset);
 		current_fragment_program.offset = program_offset + current_fp_metadata.program_start_offset;
 		current_fragment_program.ucode_length = current_fp_metadata.program_ucode_length;
-		current_fragment_program.total_length = current_fp_metadata.program_ucode_length + current_fp_metadata.program_start_offset;
+		current_fragment_program.total_length = real_total_length;
 		current_fragment_program.texture_state.import(current_fp_texture_state, current_fp_metadata.referenced_textures_mask);
 		current_fragment_program.valid = true;
 
@@ -2242,6 +2283,16 @@ namespace rsx
 
 	void thread::analyse_current_rsx_pipeline()
 	{
+		// vanillad1: depth-only draws. Redo the fragment program prefetch when the NOP decision flips on
+		// state alone (colour targets, alpha test, KIL/depth export, alpha kill...). Mark the program state
+		// dirty too: the prefetch clears the ucode bit, and load_program() must not keep the old pipeline.
+		if (current_fragment_program.valid &&
+			!m_graphics_state.test(rsx::pipeline_state::fragment_program_ucode_dirty) &&
+			fragment_program_output_is_unused() != m_fp_nop_substituted)
+		{
+			m_graphics_state |= rsx::pipeline_state::fragment_program_ucode_dirty | rsx::pipeline_state::fragment_program_state_dirty;
+		}
+
 		m_program_cache_hint.invalidate(m_graphics_state.load());
 
 		if (u32 export_ctrl = get_fragment_program_export_config();

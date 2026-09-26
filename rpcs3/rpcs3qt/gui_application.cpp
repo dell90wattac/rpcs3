@@ -112,7 +112,9 @@ int gui_application::exec()
 		func();
 	};
 
-	if (!rpcs3::is_release_build() && !rpcs3::is_local_build())
+	// vanillad1: depth-only fix builds come from our fork; no warning for them (unattended boots).
+	if (!rpcs3::is_release_build() && !rpcs3::is_local_build() &&
+		!rpcs3::get_full_branch().starts_with("dell90wattac/rpcs3/"))
 	{
 		steps->push_back([this]()
 		{

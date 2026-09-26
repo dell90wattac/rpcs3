@@ -251,6 +251,9 @@ namespace rsx
 
 		program_hash_util::fragment_program_utils::fragment_program_metadata current_fp_metadata = {};
 		program_hash_util::vertex_program_utils::vertex_program_metadata current_vp_metadata = {};
+		// vanillad1: depth-only draws that ignore their fragment program use the NOP program (RSXThread.cpp)
+		bool m_fp_nop_substituted = false;
+		u32 m_fp_original_textures_mask = 0; // textures the real program reads
 
 		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
 		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};
@@ -279,6 +282,9 @@ namespace rsx
 
 		// Prefetch and analyze the currently active fragment program ucode
 		void prefetch_fragment_program();
+
+		// vanillad1: depth-only draw whose fragment program output can't matter (RSXThread.cpp)
+		bool fragment_program_output_is_unused();
 
 		// Prefetch and analyze the currently active vertex program ucode
 		void prefetch_vertex_program();
