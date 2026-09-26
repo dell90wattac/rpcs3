@@ -2154,14 +2154,22 @@ namespace rsx
 	// set (analyse_fragment_program's is_nop_shader case).
 	alignas(16) static u8 s_nop_fragment_program[16] = { 0x00, 0x01 };
 
-	// vanillad1: a draw with no colour target that can't discard (KIL, alpha test, texture alpha kill,
-	// stipple, alpha to coverage) or export depth ignores its fragment program's output. Destiny
-	// (BLUS31181) points such draws at a per-frame constant block holding a clock, which RPCS3 compiled
-	// as a new program every tick (~50 pipelines each).
+	// vanillad1: a draw that writes no colour (no colour target, or every channel of every bound target
+	// masked), can't discard (KIL, alpha test, texture alpha kill, stipple, alpha to coverage) and
+	// doesn't export depth ignores its fragment program's output. Destiny (BLUS31181) points such draws
+	// at a per-frame constant block holding a clock, which RPCS3 compiled as a new program every tick.
 	bool thread::fragment_program_output_is_unused()
 	{
-		if (rsx::utility::get_mrt_buffers_count(REGS(m_ctx)->surface_color_target()) != 0 ||
-			(REGS(m_ctx)->shader_control() & (CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT | RSX_SHADER_CONTROL_USES_KIL)) ||
+		const u32 mrt_count = rsx::utility::get_mrt_buffers_count(REGS(m_ctx)->surface_color_target());
+		for (u32 i = 0; i < mrt_count; ++i)
+		{
+			if (REGS(m_ctx)->color_mask_r(i) || REGS(m_ctx)->color_mask_g(i) || REGS(m_ctx)->color_mask_b(i) || REGS(m_ctx)->color_mask_a(i))
+			{
+				return false;
+			}
+		}
+
+		if ((REGS(m_ctx)->shader_control() & (CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT | RSX_SHADER_CONTROL_USES_KIL)) ||
 			REGS(m_ctx)->alpha_test_enabled() ||
 			REGS(m_ctx)->msaa_alpha_to_coverage_enabled() ||
 			REGS(m_ctx)->polygon_stipple_enabled())
