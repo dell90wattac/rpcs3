@@ -109,6 +109,14 @@ namespace vk
 			}
 
 			dma_mapping = vk::map_dma(dma_sync_region.start, dma_sync_region.length());
+			// vanillad1: passthrough labels only (L20.2.1): VANILLAD1_PT_LOG=1 logs wide readbacks into main memory
+			static const bool s_pt_log = []() { const char* env = std::getenv("VANILLAD1_PT_LOG"); return env && *env == '1'; }();
+			if (s_pt_log && !load && dma_sync_region.start < 0xC0000000 && transfer_width >= 512)
+			{
+				rsx_log.notice("vanillad1 ptdma readback dst=0x%x len=0x%x %ux%u ext=%d spec=%d", dma_sync_region.start,
+					dma_sync_region.length(), transfer_width, transfer_height,
+					!!dynamic_cast<vk::memory_block_host*>(dma_mapping.second->memory.get()), !!speculatively_flushed);
+			}
 			if (load)
 			{
 				vk::load_dma(dma_sync_region.start, dma_sync_region.length());

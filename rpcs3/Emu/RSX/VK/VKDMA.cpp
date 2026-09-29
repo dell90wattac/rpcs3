@@ -9,6 +9,7 @@
 
 #include "util/asm.hpp"
 #include <unordered_map>
+#include <cstdlib>
 
 namespace vk
 {
@@ -300,8 +301,25 @@ namespace vk
 #endif
 	}
 
+	// vanillad1: passthrough labels only (L20.2.1). With VANILLAD1_PT_LABELS_ONLY=1 only the blocks
+	// a host GPU label is written to become passthrough (dma_block_EXT); everything else is staged.
+	static thread_local bool s_dma_label_hint = false;
+
+	void set_dma_label_hint(bool label)
+	{
+		s_dma_label_hint = label;
+	}
+
 	void create_dma_block(std::unique_ptr<dma_block>& block, u32 base_address, usz expected_length)
 	{
+		static const bool s_pt_labels_only = []()
+		{
+			const char* env = std::getenv("VANILLAD1_PT_LABELS_ONLY");
+			const bool on = env && *env == '1';
+			if (on) rsx_log.notice("vanillad1: passthrough DMA only for host labels (VANILLAD1_PT_LABELS_ONLY=1)");
+			return on;
+		}();
+
 		bool allow_host_buffers = false;
 		if (rsx::get_current_renderer()->get_backend_config().supports_passthrough_dma)
 		{
@@ -311,6 +329,11 @@ namespace vk
 					test_host_pointer(base_address, expected_length) :
 #endif
 				true;
+
+			if (s_pt_labels_only && !s_dma_label_hint)
+			{
+				allow_host_buffers = false;
+			}
 
 			if (!allow_host_buffers)
 			{

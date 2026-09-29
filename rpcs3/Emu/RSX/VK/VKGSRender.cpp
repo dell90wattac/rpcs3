@@ -1604,7 +1604,9 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		return false;
 	}
 
+	vk::set_dma_label_hint(true); // vanillad1: passthrough labels only (VKDMA.cpp)
 	const auto mapping = vk::map_dma(address, 4);
+	vk::set_dma_label_hint(false);
 	const auto write_data = std::bit_cast<u32, be_t<u32>>(args);
 
 	if (!dynamic_cast<vk::memory_block_host*>(mapping.second->memory.get()))

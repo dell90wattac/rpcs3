@@ -6,6 +6,8 @@ namespace vk
 	using dma_mapping_handle = std::pair<u32, vk::buffer*>;
 
 	dma_mapping_handle map_dma(u32 local_address, u32 length);
+	// vanillad1: passthrough labels only (L20.2.1): set around a host label's map_dma (VKDMA.cpp)
+	void set_dma_label_hint(bool label);
 	void load_dma(u32 local_address, u32 length);
 	void flush_dma(u32 local_address, u32 length);
 	void unmap_dma(u32 local_address, u32 length);
