@@ -40,6 +40,10 @@ namespace vk
 
 		// DMA relevant data
 		std::unique_ptr<vk::event> dma_fence;
+		// vanillad1: staged readbacks (L20.2.1): private copy target when the DMA block is passthrough
+		std::unique_ptr<vk::buffer> m_staging;
+		void* m_staging_map = nullptr;
+		utils::address_range32 m_staged_range{};
 		vk::render_device* m_device = nullptr;
 		vk::viewable_image* vram_texture = nullptr;
 
@@ -127,6 +131,8 @@ namespace vk
 				auto gc = vk::get_resource_manager();
 				gc->dispose(dma_fence);
 			}
+
+			m_staged_range.invalidate(); // vanillad1: staged readbacks
 		}
 
 		void dma_abort() override
@@ -149,6 +155,12 @@ namespace vk
 			vram_texture = nullptr;
 			ensure(!managed_texture);
 			release_dma_resources();
+
+			if (m_staging) // vanillad1: staged readbacks
+			{
+				m_staging_map = nullptr;
+				vk::get_resource_manager()->dispose(m_staging);
+			}
 
 			baseclass::on_section_resources_destroyed();
 		}
@@ -315,7 +327,14 @@ namespace vk
 				flush_length = std::min(max_content_size, available_tile_size);
 			}
 
-			vk::flush_dma(range.start, flush_length);
+			if (m_staged_range.valid()) // vanillad1: staged readbacks: exclusions apply
+			{
+				imp_flush_memcpy(m_staged_range.start, static_cast<u8*>(m_staging_map), m_staged_range.length());
+			}
+			else
+			{
+				vk::flush_dma(range.start, flush_length);
+			}
 
 #if DEBUG_DMA_TILING
 			// Are we a tiled region?

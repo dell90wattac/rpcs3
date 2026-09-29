@@ -320,6 +320,20 @@ namespace vk
 			return on;
 		}();
 
+		// vanillad1: passthrough deny range (L20.2.1): VANILLAD1_PT_DENY=<start>-<end> (hex) stages the
+		// blocks overlapping the range; passthrough stays on everywhere else
+		static const std::pair<u32, u32> s_pt_deny = []() -> std::pair<u32, u32>
+		{
+			const char* env = std::getenv("VANILLAD1_PT_DENY");
+			if (!env || !*env) return { 0, 0 };
+			char* rest = nullptr;
+			const u32 lo = static_cast<u32>(std::strtoul(env, &rest, 16));
+			const u32 hi = (rest && *rest == '-') ? static_cast<u32>(std::strtoul(rest + 1, nullptr, 16)) : 0;
+			if (hi <= lo) return { 0, 0 };
+			rsx_log.notice("vanillad1: no passthrough DMA for 0x%x-0x%x (VANILLAD1_PT_DENY)", lo, hi);
+			return { lo, hi };
+		}();
+
 		bool allow_host_buffers = false;
 		if (rsx::get_current_renderer()->get_backend_config().supports_passthrough_dma)
 		{
@@ -333,6 +347,13 @@ namespace vk
 			if (s_pt_labels_only && !s_dma_label_hint)
 			{
 				allow_host_buffers = false;
+			}
+
+			if (allow_host_buffers && !s_dma_label_hint && s_pt_deny.second > s_pt_deny.first &&
+				base_address < s_pt_deny.second && u64{base_address} + expected_length > s_pt_deny.first)
+			{
+				allow_host_buffers = false;
+				rsx_log.notice("vanillad1: staged DMA block 0x%x-0x%x (VANILLAD1_PT_DENY)", base_address, base_address + expected_length - 1);
 			}
 
 			if (!allow_host_buffers)

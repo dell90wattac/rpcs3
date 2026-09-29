@@ -6,6 +6,7 @@
 #include "vkutils/data_heap.h"
 
 #include "util/asm.hpp"
+#include <chrono> // vanillad1: staged readbacks
 
 namespace vk
 {
@@ -100,6 +101,7 @@ namespace vk
 
 		auto dma_sync_region = valid_range;
 		dma_mapping_handle dma_mapping = { 0, nullptr };
+		bool staged = false; // vanillad1: staged readbacks (L20.2.1)
 
 		auto dma_sync = [&](bool load, bool force = false)
 		{
@@ -117,6 +119,42 @@ namespace vk
 					dma_sync_region.length(), transfer_width, transfer_height,
 					!!dynamic_cast<vk::memory_block_host*>(dma_mapping.second->memory.get()), !!speculatively_flushed);
 			}
+			// vanillad1: staged readbacks (L20.2.1): VANILLAD1_PT_STAGED_RB=1 copies into a private staging
+			// buffer when the block is passthrough; imp_flush then writes guest memory honouring the exclusions
+			static const bool s_staged_rb = []()
+			{
+				const char* env = std::getenv("VANILLAD1_PT_STAGED_RB");
+				const bool on = env && *env == '1';
+				if (on) rsx_log.notice("vanillad1: staged readbacks under passthrough (VANILLAD1_PT_STAGED_RB=1)");
+				return on;
+			}();
+			if (s_staged_rb && dynamic_cast<vk::memory_block_host*>(dma_mapping.second->memory.get()))
+			{
+				const u32 length = dma_sync_region.length();
+				if (!m_staging || m_staging->size() < length)
+				{
+					if (m_staging)
+					{
+						vk::get_resource_manager()->dispose(m_staging);
+					}
+					m_staging = std::make_unique<vk::buffer>(*m_device, length,
+						m_device->get_memory_mapping().host_visible_coherent, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+						VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0,
+						VMM_ALLOCATION_POOL_UNDEFINED);
+					m_staging_map = m_staging->map(0, VK_WHOLE_SIZE); // kept mapped, as dma_block does
+				}
+				ensure(length <= m_staging->size());
+				if (load)
+				{
+					std::memcpy(m_staging_map, vm::get_super_ptr<u8>(dma_sync_region.start), length);
+				}
+				dma_mapping = { 0, m_staging.get() };
+				m_staged_range = dma_sync_region;
+				staged = true;
+				return;
+			}
+			m_staged_range.invalidate();
+
 			if (load)
 			{
 				vk::load_dma(dma_sync_region.start, dma_sync_region.length());
@@ -366,6 +404,13 @@ namespace vk
 			.size = valid_range.length()
 		};
 
+		if (staged) // vanillad1: staged readbacks: the host reads the staging buffer in imp_flush
+		{
+			mem_barrier.dstStageMask |= VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+			mem_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+			mem_barrier.size = dma_sync_region.length();
+		}
+
 		// Create event object for this transfer and queue signal op
 		dma_fence = std::make_unique<vk::event>(*m_device, sync_domain::host);
 		dma_fence->signal(cmd,
@@ -395,6 +440,18 @@ namespace vk
 
 		synchronized = true;
 		sync_timestamp = rsx::get_shared_tag();
+
+		if (staged) // vanillad1: staged readbacks: at most one notice per second, with the running count
+		{
+			static u32 s_staged_count = 0;
+			static auto s_staged_last = std::chrono::steady_clock::time_point{};
+			++s_staged_count;
+			if (const auto now = std::chrono::steady_clock::now(); now - s_staged_last > std::chrono::seconds(1))
+			{
+				s_staged_last = now;
+				rsx_log.notice("vanillad1 staged readback dst=0x%x len=0x%x n=%u", m_staged_range.start, m_staged_range.length(), s_staged_count);
+			}
+		}
 	}
 
 	void texture_cache::on_section_destroyed(cached_texture_section& tex)

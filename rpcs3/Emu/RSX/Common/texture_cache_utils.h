@@ -1531,7 +1531,7 @@ namespace rsx
 		/**
 		 * Flush
 		 */
-	private:
+	protected: // vanillad1: staged readbacks (VKTextureCache.h imp_flush calls it)
 		void imp_flush_memcpy(u32 vm_dst, u8* src, u32 len) const
 		{
 			u8 *dst = get_ptr<u8>(vm_dst);
