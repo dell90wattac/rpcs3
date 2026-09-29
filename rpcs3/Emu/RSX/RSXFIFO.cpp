@@ -346,6 +346,10 @@ namespace rsx
 				return;
 			}
 
+			// vanillad1 selfjump (L20.2.2): how long RSX has spun on the jump-to-self at s_spin_get
+			static u32 s_spin_get = umax;
+			static u64 s_spin_since = 0;
+
 			if (m_memwatch_addr)
 			{
 				if (m_internal_get == m_memwatch_addr)
@@ -354,13 +358,38 @@ namespace rsx
 					{
 						if (vm::read32(addr) == m_memwatch_cmp)
 						{
-							// Still spinning in place
-							data.reg = FIFO_EMPTY;
-							return;
+							// vanillad1 selfjump: a self-jump the game never re-pointed while commands are queued
+							// past it (put far away, a NOP after it) deadlocks Destiny (BLUS31181): its job thread
+							// waits for a fence the GPU writes behind the jump. After 2 s, go on at get + 4, which is
+							// what the missing edit does. The normal idle has put right behind the jump.
+							const u64 now = get_system_time();
+
+							if (s_spin_get != m_memwatch_addr)
+							{
+								s_spin_get = m_memwatch_addr;
+								s_spin_since = now;
+							}
+
+							const u32 put = read_put();
+
+							if (now - s_spin_since < 2'000'000 || put == m_memwatch_addr || put - m_memwatch_addr - 1 < 0x200u || vm::read32(addr + 4) != 0)
+							{
+								// Still spinning in place
+								data.reg = FIFO_EMPTY;
+								return;
+							}
+
+							rsx_log.error("vanillad1 selfjump: RSX spun %.1fs on a jump-to-self at io 0x%x (ea 0x%x, cmd 0x%x) with put 0x%x; continuing at io 0x%x",
+								(now - s_spin_since) / 1'000'000., m_memwatch_addr, addr, m_memwatch_cmp, put, m_memwatch_addr + 4);
+
+							invalidate_cache();
+							m_ctrl->get.release(m_internal_get = m_memwatch_addr + 4);
+							m_remaining_commands = 0;
 						}
 					}
 				}
 
+				s_spin_get = umax;
 				m_memwatch_addr = 0;
 				m_memwatch_cmp = 0;
 			}
