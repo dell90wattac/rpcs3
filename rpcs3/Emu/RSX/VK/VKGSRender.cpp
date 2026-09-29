@@ -1620,7 +1620,9 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 
 	vk::insert_global_memory_barrier(*m_current_command_buffer);
 
-	if (host_ctx->has_unflushed_texture_loads())
+	// vanillad1: host label order (L20.2.1): only a texture-read release may overtake the draws
+	// still in the primary command buffer; any other label is written behind them
+	if (host_ctx->has_unflushed_texture_loads() || type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE)
 	{
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
 		flush_command_queue();
