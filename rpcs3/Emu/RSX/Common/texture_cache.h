@@ -11,12 +11,69 @@
 #include "texture_cache_blit_helpers.h"
 
 #include <unordered_map>
+#include <cstdlib> // vanillad1: WCB only range (P5)
+#include <utility>
+#include <vector>
 
 #define RSX_GCM_FORMAT_IGNORED 0
 
 namespace rsx
 {
 	namespace helpers = rsx::texture_cache_helpers;
+
+	// vanillad1: WCB only range (P5): VANILLAD1_WCB_ONLY=<lo>-<hi>[,<lo>-<hi>...] (hex, read once). With Write Color
+	// Buffers on, only colour targets overlapping a range are locked and written back; the rest
+	// behave as with WCB off. Unset / unparsable = true for every range (stock). log: RSX thread only.
+	inline bool vd1_wcb_covers(const utils::address_range32& range, bool log = false)
+	{
+		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* env = std::getenv("VANILLAD1_WCB_ONLY");
+			if (!env || !*env) return out;
+			for (const char* p = env;;)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				u32 hi = 0;
+				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (hi <= lo)
+				{
+					rsx_log.error("vanillad1: VANILLAD1_WCB_ONLY=%s not understood; every colour target written back", env);
+					out.clear();
+					return out;
+				}
+				out.emplace_back(lo, hi);
+				if (!rest || *rest != ',') break;
+				p = rest + 1;
+			}
+			for (const auto& [lo, hi] : out)
+				rsx_log.notice("vanillad1: colour write-back only for 0x%x-0x%x (VANILLAD1_WCB_ONLY)", lo, hi);
+			return out;
+		}();
+
+		if (s_ranges.empty()) return true;
+
+		bool covered = false;
+		for (const auto& [lo, hi] : s_ranges)
+		{
+			if (range.start < hi && range.end >= lo)
+			{
+				covered = true;
+				break;
+			}
+		}
+
+		if (log)
+		{
+			static std::unordered_map<u32, bool> s_seen;
+			if (s_seen.size() < 256 && s_seen.emplace(range.start, covered).second)
+				rsx_log.notice("vanillad1: colour target 0x%x-0x%x %s (VANILLAD1_WCB_ONLY)", range.start, range.end,
+					covered ? "written back" : "not written back");
+		}
+
+		return covered;
+	}
 
 	template <typename derived_type, typename _traits>
 	class texture_cache
@@ -1482,7 +1539,8 @@ namespace rsx
 					return true;
 				}
 
-				const bool should_be_locked = is_depth_texture ? !!g_cfg.video.write_depth_buffer : !!g_cfg.video.write_color_buffers;
+				const bool should_be_locked = is_depth_texture ? !!g_cfg.video.write_depth_buffer :
+					(!!g_cfg.video.write_color_buffers && vd1_wcb_covers(range)); // vanillad1: WCB only range (P5)
 				if (!should_be_locked)
 				{
 					// Data is lost anyway.
@@ -2831,7 +2889,10 @@ namespace rsx
 				}
 
 				bool result_is_valid = result.atlas_covers_target_area(section_count == 1 ? 99 : 90);
-				if (_pool == 0 && !result_is_valid && !g_cfg.video.write_color_buffers && !g_cfg.video.write_depth_buffer)
+				// vanillad1: WCB only range (P5): a sampled range outside the ranges was not written back: as with WCB off
+				const bool vd1_wcb = !!g_cfg.video.write_color_buffers && vd1_wcb_covers(utils::address_range32::start_length(
+					attr.address, std::max<u32>(std::max<u32>(attr.pitch, attr.width * attr.bpp), 1u) * std::max<u16>(attr.height, 1)));
+				if (_pool == 0 && !result_is_valid && !vd1_wcb && !g_cfg.video.write_depth_buffer)
 				{
 					// Avoid WCB requirement for some games with wrongly declared sampler dimensions.
 					// Some games may render a small region (e.g 1024x256x2) and sample a huge texture (e.g 1024x1024).

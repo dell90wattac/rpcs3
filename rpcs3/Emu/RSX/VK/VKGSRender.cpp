@@ -2549,7 +2549,8 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	for (u8 i = 0; i < rsx::limits::color_buffers_count; ++i)
 	{
 		// Flush old address if we keep missing it
-		if (m_surface_info[i].pitch && g_cfg.video.write_color_buffers)
+		if (m_surface_info[i].pitch && g_cfg.video.write_color_buffers &&
+			rsx::vd1_wcb_covers(m_surface_info[i].get_memory_range())) // vanillad1: WCB only range (P5)
 		{
 			const utils::address_range32 rsx_range = m_surface_info[i].get_memory_range();
 			m_texture_cache.set_memory_read_flags(rsx_range, rsx::memory_read_flags::flush_once);
@@ -2634,7 +2635,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		for (auto& [base_addr, surface] : m_rtts.orphaned_surfaces)
 		{
 			bool lock = surface->is_depth_surface() ? !!g_cfg.video.write_depth_buffer :
-				!!g_cfg.video.write_color_buffers;
+				(!!g_cfg.video.write_color_buffers && rsx::vd1_wcb_covers(surface->get_memory_range(), true)); // vanillad1: WCB only range (P5)
 
 			if (lock &&
 #ifdef TEXTURE_CACHE_DEBUG
@@ -2670,7 +2671,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		if (!m_surface_info[index].address || !m_surface_info[index].pitch) continue;
 
 		const utils::address_range32 surface_range = m_surface_info[index].get_memory_range();
-		if (g_cfg.video.write_color_buffers)
+		if (g_cfg.video.write_color_buffers && rsx::vd1_wcb_covers(surface_range, true)) // vanillad1: WCB only range (P5)
 		{
 			m_texture_cache.lock_memory_region(
 				*m_current_command_buffer, m_rtts.m_bound_render_targets[index].second, surface_range, true,
