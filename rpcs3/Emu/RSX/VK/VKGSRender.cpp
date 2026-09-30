@@ -1623,14 +1623,24 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	vk::insert_global_memory_barrier(*m_current_command_buffer);
 
 	// vanillad1: host label order (L20.2.1): only a texture-read release may overtake the draws
-	// still in the primary command buffer; any other label is written behind them
-	if (host_ctx->has_unflushed_texture_loads() || type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE)
+	// still in the primary command buffer; any other label is written behind them.
+	// vanillad1: label order opt-in (P4): only with VANILLAD1_LABEL_ORDER=1 (its flushes cost 5.7 ms a frame, P3,
+	// and it was not the band's fix); otherwise RPCS3's own condition
+	static const bool s_label_order = []()
+	{
+		const char* env = std::getenv("VANILLAD1_LABEL_ORDER");
+		const bool on = env && *env == '1';
+		if (on) rsx_log.notice("vanillad1: host labels behind the pending draws (VANILLAD1_LABEL_ORDER=1)");
+		return on;
+	}();
+	if (host_ctx->has_unflushed_texture_loads() || (s_label_order && type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE))
 	{
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit); flush_command_queue(); } // vanillad1: RSX timers (P3)
 	}
 	else
 	{
+		rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit); // vanillad1: label order opt-in (P4): the secondary path too
 		auto cmd = m_secondary_cb_list.next();
 		cmd->begin();
 		vkCmdUpdateBuffer(*cmd, mapping.second->value, mapping.first, 4, &write_data);
