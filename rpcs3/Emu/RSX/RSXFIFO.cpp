@@ -917,7 +917,16 @@ namespace rsx
 
 			if (auto method = methods[reg])
 			{
-				method(m_ctx, reg, value);
+				if (m_profiler.enabled && reg != NV406E_SEMAPHORE_ACQUIRE) [[unlikely]] // vanillad1: RSX timers (P3)
+				{
+					const u64 vd1_t0 = get_system_time();
+					method(m_ctx, reg, value);
+					m_frame_stats.vd1_methods += static_cast<s64>(get_system_time() - vd1_t0);
+				}
+				else
+				{
+					method(m_ctx, reg, value);
+				}
 
 				if (state & cpu_flag::again)
 				{

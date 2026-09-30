@@ -652,6 +652,36 @@ namespace rsx
 		 */
 
 		shared_mutex m_cache_mutex;
+
+		// vanillad1: RSX timers (P3): time the RSX thread blocked on m_cache_mutex (debug overlay only). A pre-wait:
+		// try the lock; only when it is taken, a timed lock / unlock, then the site locks as usual.
+		void vd1_wait_cache_mutex(bool exclusive)
+		{
+			auto* rsxthr = rsx::get_current_renderer();
+			if (!rsxthr || !rsxthr->profiling_enabled() || !rsxthr->is_current_thread()) [[likely]]
+			{
+				return;
+			}
+
+			if (exclusive ? m_cache_mutex.try_lock() : m_cache_mutex.try_lock_shared())
+			{
+				exclusive ? m_cache_mutex.unlock() : m_cache_mutex.unlock_shared();
+				return;
+			}
+
+			const u64 t0 = get_system_time();
+			if (exclusive)
+			{
+				m_cache_mutex.lock();
+				m_cache_mutex.unlock();
+			}
+			else
+			{
+				m_cache_mutex.lock_shared();
+				m_cache_mutex.unlock_shared();
+			}
+			rsxthr->get_stats().vd1_cachewait += static_cast<s64>(get_system_time() - t0);
+		}
 		ranged_storage m_storage;
 		std::unordered_multimap<u32, std::pair<deferred_subresource, image_view_type>> m_temporary_subresource_cache;
 		std::vector<image_view_type> m_uncached_subresources;
@@ -779,6 +809,7 @@ namespace rsx
 			}
 
 			// Check that there is at least one valid (locked) section in the test_range
+			vd1_wait_cache_mutex(false);
 			reader_lock lock(m_cache_mutex);
 			if (m_storage.range_begin(test_range, locked_range, true) == m_storage.range_end())
 				return false;
@@ -2030,6 +2061,7 @@ namespace rsx
 		{
 			AUDIT(g_cfg.video.write_color_buffers || g_cfg.video.write_depth_buffer); // this method is only called when either WCB or WDB are enabled
 
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 
 			lock_memory_region_impl(cmd, image, rsx_range, is_active_surface, width, height, pitch, std::forward<Args>(extras)...);
@@ -2043,6 +2075,7 @@ namespace rsx
 			if (!region_intersects_cache(rsx_range, true))
 				return;
 
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 			invalidate_range_impl_base(cmd, rsx_range, invalidation_cause::committed_as_fbo, {}, std::forward<Args>(extras)...);
 		}
@@ -2060,6 +2093,7 @@ namespace rsx
 
 		void set_memory_read_flags(const address_range32 &memory_range, memory_read_flags flags)
 		{
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 
 			auto* region_ptr = find_cached_texture(memory_range, { .gcm_format = RSX_GCM_FORMAT_IGNORED }, false, false, true);
@@ -2141,6 +2175,7 @@ namespace rsx
 			if (!region_intersects_cache(range, !cause.is_read()))
 				return{};
 
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 			return invalidate_range_impl_base(cmd, range, cause, on_data_transfer_completed, std::forward<Args>(extras)...);
 		}
@@ -2157,6 +2192,7 @@ namespace rsx
 			if (!region_intersects_cache(range, !cause.is_read()))
 				return {};
 
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 			return invalidate_range_impl_base(cmd, range, cause, on_data_transfer_completed, std::forward<Args>(extras)...);
 		}
@@ -2164,6 +2200,7 @@ namespace rsx
 		template <typename ...Args>
 		bool flush_all(commandbuffer_type& cmd, thrashed_set& data, std::function<void()> on_data_transfer_completed = {}, Args&&... extras)
 		{
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 
 			AUDIT(data.cause.deferred_flush());
@@ -2198,6 +2235,7 @@ namespace rsx
 			if (block.empty())
 				return false;
 
+			vd1_wait_cache_mutex(false);
 			reader_lock lock(m_cache_mutex);
 
 			// Try to find matching regions
@@ -2231,6 +2269,7 @@ namespace rsx
 
 		void purge_unreleased_sections()
 		{
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 
 			m_storage.purge_unreleased_sections();
@@ -2255,6 +2294,7 @@ namespace rsx
 
 		void trim_sections()
 		{
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 
 			m_storage.trim_sections();
@@ -2397,6 +2437,7 @@ namespace rsx
 				}
 			}
 
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 			image_view_type result = 0;
 
@@ -3172,6 +3213,7 @@ namespace rsx
 			}
 
 			const auto lookup_range = utils::address_range32::start_length(attributes.address, attributes.pitch * required_surface_height);
+			vd1_wait_cache_mutex(false);
 			reader_lock lock(m_cache_mutex);
 
 			auto result = fast_texture_search(cmd, attributes, scale, tex.decoded_remap(),
@@ -3531,6 +3573,7 @@ namespace rsx
 				}
 			}
 
+			vd1_wait_cache_mutex(false);
 			reader_lock lock(m_cache_mutex);
 
 			if (dst_is_render_target)
@@ -3849,6 +3892,7 @@ namespace rsx
 				return;
 			}
 
+			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
 			bool update_tag = false;
 
@@ -3888,6 +3932,7 @@ namespace rsx
 
 		bool is_protected(u32 section_base_address, const address_range32& test_range, rsx::texture_upload_context context)
 		{
+			vd1_wait_cache_mutex(false);
 			reader_lock lock(m_cache_mutex);
 
 			const auto& block = m_storage.block_for(section_base_address);

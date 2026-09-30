@@ -952,7 +952,11 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				"Flush requests: %13d  = %2d (%3d%%) hard faults, %2d unavoidable, %2d misprediction(s), %2d speculation(s)\n"
 				"Texture uploads: %12u (%u from CPU - %02u%%, %u copies avoided)\n"
 				"Vertex cache hits: %10u/%u (%u%%)\n"
-				"Program cache lookup ellision: %u/%u (%u%%)",
+				"Program cache lookup ellision: %u/%u (%u%%)\n"
+				// vanillad1: RSX timers (P3)
+				"vd1 frame %dus idle %dus fifo %dus methods %dus local %dus\n"
+				"vd1 rtts %dus flush svc %dus drain %dus label submit %dus\n"
+				"vd1 cache wait %dus sync %dus",
 				info.stats.framebuffer_stats.to_string(resolution_scaling_config, !backend_config.supports_hw_msaa),
 				get_load(), info.stats.draw_calls, info.stats.submit_count, info.stats.setup_time, info.stats.vertex_upload_time,
 				info.stats.textures_upload_time, info.stats.draw_exec_time, info.stats.flip_time,
@@ -960,8 +964,26 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				num_flushes, num_misses, cache_miss_ratio, num_unavoidable, num_mispredict, num_speculate,
 				num_texture_upload, num_texture_upload_miss, texture_upload_miss_ratio, texture_copies_ellided,
 				vertex_cache_hit_count, info.stats.vertex_cache_request_count, vertex_cache_hit_ratio,
-				program_cache_ellided, program_cache_lookups, program_cache_ellision_rate)
+				program_cache_ellided, program_cache_lookups, program_cache_ellision_rate,
+				info.stats.vd1_frame, info.stats.vd1_idle, info.stats.vd1_fifo, info.stats.vd1_methods, info.stats.vd1_local,
+				info.stats.vd1_rtts, info.stats.vd1_flushsvc, info.stats.vd1_drain, info.stats.vd1_lsubmit,
+				info.stats.vd1_cachewait, info.stats.vd1_sync)
 			);
+
+			// vanillad1: RSX timers (P3): the same numbers in RPCS3.log, at most one line a second
+			static u64 s_vd1_last_log = 0;
+			if (const u64 vd1_now = get_system_time(); vd1_now - s_vd1_last_log >= 1'000'000)
+			{
+				s_vd1_last_log = vd1_now;
+				const auto& s = info.stats;
+				rsx_log.notice("vanillad1 frame: frame=%d idle=%d fifo=%d methods=%d local=%d rtts=%d flushsvc=%d drain=%d "
+					"lsubmit=%d cachewait=%d sync=%d setup=%d vtx=%d tex=%d exec=%d flip=%d draws=%u submits=%u "
+					"flushes=%u hard=%u unavoidable=%u mispredict=%u speculate=%u load=%u",
+					s.vd1_frame, s.vd1_idle, s.vd1_fifo, s.vd1_methods, s.vd1_local, s.vd1_rtts, s.vd1_flushsvc, s.vd1_drain,
+					s.vd1_lsubmit, s.vd1_cachewait, s.vd1_sync, s.setup_time, s.vertex_upload_time, s.textures_upload_time,
+					s.draw_exec_time, s.flip_time, s.draw_calls, s.submit_count,
+					num_flushes, num_misses, num_unavoidable, num_mispredict, num_speculate, get_load());
+			}
 		}
 
 		direct_fbo->release();

@@ -157,6 +157,7 @@ namespace rsx
 		// Profiler
 		rsx::profiling_timer m_profiler;
 		frame_statistics_t m_frame_stats{};
+		u64 m_vd1_last_flip = 0, m_vd1_last_idle = 0; // vanillad1: RSX timers (P3)
 
 		// Savestates related
 		u32 m_pause_after_x_flips = 0;
@@ -199,6 +200,7 @@ namespace rsx
 		struct
 		{
 			atomic_t<u64> idle_time{ 0 };  // Time spent idling in microseconds
+			u64 vd1_idle_total = 0;         // vanillad1: RSX timers (P3): idle_time before get_load's resets
 			u64 last_update_timestamp = 0; // Timestamp of last load update
 			u64 FIFO_idle_timestamp = 0;   // Timestamp of when FIFO queue becomes idle
 			FIFO::state state = FIFO::state::running;
@@ -471,6 +473,7 @@ namespace rsx
 
 		// Get stats object
 		frame_statistics_t& get_stats() { return m_frame_stats; }
+		bool profiling_enabled() const { return m_profiler.enabled; } // vanillad1: RSX timers (P3)
 
 		// Returns true if the current thread is the active RSX thread
 		inline bool is_current_thread() const

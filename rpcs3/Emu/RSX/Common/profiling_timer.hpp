@@ -32,4 +32,24 @@ namespace rsx
 			return static_cast<s64>(last - old);
 		}
 	};
+
+	// vanillad1: RSX timers (P3): adds the scope's host time (us) to a frame stat when on
+	struct scoped_stat_timer
+	{
+		s64* dst;
+		u64 t0;
+
+		scoped_stat_timer(bool on, s64& stat)
+			: dst(on ? &stat : nullptr), t0(on ? get_system_time() : 0)
+		{
+		}
+
+		~scoped_stat_timer()
+		{
+			if (dst) [[unlikely]]
+			{
+				*dst += static_cast<s64>(get_system_time() - t0);
+			}
+		}
+	};
 }

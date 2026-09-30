@@ -1600,7 +1600,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	{
 		// All texture loads already seen by the host GPU
 		// Wait for all previously submitted labels to be flushed
-		m_host_dma_ctrl->drain_label_queue();
+		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
 		return false;
 	}
 
@@ -1614,7 +1614,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		// NVIDIA GPUs can disappoint when DMA blocks straddle VirtualAlloc boundaries.
 		// Take the L and try the fallback.
 		rsx_log.warning("Host label update at 0x%x was not possible.", address);
-		m_host_dma_ctrl->drain_label_queue();
+		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
 		return false;
 	}
 
@@ -1627,7 +1627,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	if (host_ctx->has_unflushed_texture_loads() || type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE)
 	{
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
-		flush_command_queue();
+		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit); flush_command_queue(); } // vanillad1: RSX timers (P3)
 	}
 	else
 	{
@@ -1756,6 +1756,7 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 	{
 		if (m_flush_queue_mutex.try_lock())
 		{
+			rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_flushsvc); // vanillad1: RSX timers (P3)
 			// TODO: Determine if a hard sync is necessary
 			// Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
 			flush_command_queue();
@@ -2383,7 +2384,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
 
 void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)
 {
-	prepare_rtts(context);
+	{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_rtts); prepare_rtts(context); } // vanillad1: RSX timers (P3)
 }
 
 void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)

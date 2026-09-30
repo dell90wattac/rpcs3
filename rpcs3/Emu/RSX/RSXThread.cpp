@@ -1279,7 +1279,7 @@ namespace rsx
 			if ((m_cycles_counter++ & 63) == 0 || m_eng_interrupt_mask)
 			{
 				// Execute backend-local tasks first
-				do_local_task(performance_counters.state);
+				{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_local); do_local_task(performance_counters.state); } // vanillad1: RSX timers (P3)
 
 				// Update other sub-units
 				zcull_ctrl->update(this);
@@ -1291,7 +1291,7 @@ namespace rsx
 			}
 
 			// Execute FIFO queue
-			run_FIFO();
+			{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_fifo); run_FIFO(); } // vanillad1: RSX timers (P3)
 		}
 	}
 
@@ -2893,6 +2893,7 @@ namespace rsx
 
 	void thread::sync()
 	{
+		rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_sync); // vanillad1: RSX timers (P3)
 		m_eng_interrupt_mask.clear(rsx::pipe_flush_interrupt);
 
 		mm_flush();
@@ -3422,6 +3423,7 @@ namespace rsx
 			else
 				performance_counters.approximate_load = 0u;
 
+			performance_counters.vd1_idle_total += idle; // vanillad1: RSX timers (P3)
 			performance_counters.idle_time = 0;
 			performance_counters.sampled_frames = 0;
 			performance_counters.last_update_timestamp = timestamp;
@@ -3494,6 +3496,17 @@ namespace rsx
 			// This can lead to the zcull unit using up all the memory queueing up operations that never get consumed.
 			// Seen in Diablo III and Yakuza 5
 			zcull_ctrl->clear(this, CELL_GCM_ZPASS_PIXEL_CNT | CELL_GCM_ZCULL_STATS);
+		}
+
+		// vanillad1: RSX timers (P3): this frame's wall time and RSX idle time
+		if (m_profiler.enabled)
+		{
+			const u64 vd1_now = get_system_time();
+			const u64 vd1_idle = performance_counters.vd1_idle_total + performance_counters.idle_time.load();
+			m_frame_stats.vd1_frame = m_vd1_last_flip ? static_cast<s64>(vd1_now - m_vd1_last_flip) : 0;
+			m_frame_stats.vd1_idle = m_vd1_last_flip ? static_cast<s64>(vd1_idle - m_vd1_last_idle) : 0;
+			m_vd1_last_flip = vd1_now;
+			m_vd1_last_idle = vd1_idle;
 		}
 
 		// Save current state

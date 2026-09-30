@@ -7,7 +7,8 @@
 ARTIFACT_DIR="$BUILD_ARTIFACTSTAGINGDIRECTORY"
 
 # Remove unecessary files
-rm -f ./bin/rpcs3.exp ./bin/rpcs3.lib ./bin/rpcs3.pdb ./bin/vc_redist.x64.exe
+# vanillad1: RSX timers (P3): rpcs3.pdb kept (public symbols; profiles name functions)
+rm -f ./bin/rpcs3.exp ./bin/rpcs3.lib ./bin/vc_redist.x64.exe
 
 # Prepare compatibility and SDL database for packaging
 mkdir ./bin/config

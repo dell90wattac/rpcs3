@@ -58,6 +58,19 @@ namespace rsx
 		s64 draw_exec_time;
 		s64 flip_time;
 
+		// vanillad1: RSX timers (P3)
+		s64 vd1_frame;
+		s64 vd1_idle;
+		s64 vd1_fifo;
+		s64 vd1_methods;
+		s64 vd1_local;
+		s64 vd1_rtts;
+		s64 vd1_flushsvc;
+		s64 vd1_drain;
+		s64 vd1_lsubmit;
+		s64 vd1_cachewait;
+		s64 vd1_sync;
+
 		u32 vertex_cache_request_count;
 		u32 vertex_cache_miss_count;
 
