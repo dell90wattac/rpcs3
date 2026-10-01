@@ -1158,6 +1158,8 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	{
 		if (draw_call.is_trivial_instanced_draw)
 		{
+			m_frame_stats.vd1_inst++;
+			if (rsx::FIFO::vd1_flatten_log()) { static u32 s_n = 0; if (s_n++ < 300) rsx_log.notice("vanillad1 inst: passes=%u elements=%u", draw_call.pass_count(), upload_info.vertex_draw_count); } // vanillad1: flatten repeat draws (P8)
 			vkCmdDraw(*m_current_command_buffer, upload_info.vertex_draw_count, draw_call.pass_count(), 0, 0);
 		}
 		else if (draw_call.is_single_draw())
@@ -1190,6 +1192,8 @@ void VKGSRender::emit_geometry(u32 sub_index)
 
 		if (draw_call.is_trivial_instanced_draw)
 		{
+			m_frame_stats.vd1_inst++;
+			if (rsx::FIFO::vd1_flatten_log()) { static u32 s_n = 0; if (s_n++ < 300) rsx_log.notice("vanillad1 inst: passes=%u elements=%u", draw_call.pass_count(), upload_info.vertex_draw_count); } // vanillad1: flatten repeat draws (P8)
 			vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, draw_call.pass_count(), 0, 0, 0);
 		}
 		else if (rsx::method_registers.current_draw_clause.is_single_draw())

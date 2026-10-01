@@ -504,6 +504,49 @@ namespace rsx
 			data.set(m_cmd & 0xfffc, vm::read32(m_args_ptr));
 		}
 
+		// vanillad1: flatten repeat draws (P8): VANILLAD1_FLATTEN=1 keeps the flattener open across the game's constant
+		// uploads between two draws of one mesh (the game instances by hand)
+		bool vd1_flatten_enabled()
+		{
+			static const bool s_on = []()
+			{
+				const char* env = std::getenv("VANILLAD1_FLATTEN");
+				const bool on = env && (*env == '1' || *env == '2');
+				if (on) rsx_log.notice("vanillad1: FIFO flattener keeps repeat draws open (VANILLAD1_FLATTEN=%s)", env);
+				return on;
+			}();
+			return s_on;
+		}
+
+		bool vd1_flatten_log()
+		{
+			static const bool s_log = []() { const char* env = std::getenv("VANILLAD1_FLATTEN"); return env && *env == '2'; }();
+			return s_log;
+		}
+
+		u32 vd1_flatten_max()
+		{
+			static const u32 s_max = []()
+			{
+				const char* env = std::getenv("VANILLAD1_FLATTEN_MAX");
+				const u32 n = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+				if (n) rsx_log.notice("vanillad1: FIFO flattener runs limited to %u draws (VANILLAD1_FLATTEN_MAX)", n);
+				return n;
+			}();
+			return s_max;
+		}
+
+		bool vd1_flatten_off(char what)
+		{
+			static const std::string s_off = []()
+			{
+				const char* env = std::getenv("VANILLAD1_FLATTEN_OFF");
+				if (env && *env) rsx_log.notice("vanillad1: FIFO flattener pieces off: %s (VANILLAD1_FLATTEN_OFF)", env);
+				return env ? std::string(env) : std::string();
+			}();
+			return s_off.find(what) != std::string::npos;
+		}
+
 		void flattening_helper::reset(bool _enabled)
 		{
 			enabled = _enabled;
@@ -524,6 +567,17 @@ namespace rsx
 
 		void flattening_helper::evaluate_performance(u32 total_draw_count)
 		{
+			// vanillad1: flatten repeat draws (P8): one line a frame with VANILLAD1_FLATTEN=2
+			if (enabled && vd1_flatten_log())
+			{
+				rsx_log.notice("vanillad1 flatten: chained=%u noconst=%u norange=%u otherrange=%u primchg=%u breaker=%u other=%u collapsed=%u",
+					vd1_stat[0], vd1_stat[1], vd1_stat[2], vd1_stat[3], vd1_stat[4], vd1_stat[5], vd1_stat[6], num_collapsed);
+				rsx_log.notice("vanillad1 peek: args=%u beyondput=%u translate=%u nonmethod=%u othermethod=%u mixed=%u incr=%u wordsput=%u wordtr=%u gap=%u nodraw=%u many=%u",
+					vd1_pstat[1], vd1_pstat[2], vd1_pstat[3], vd1_pstat[4], vd1_pstat[5], vd1_pstat[6], vd1_pstat[7], vd1_pstat[8], vd1_pstat[9], vd1_pstat[10], vd1_pstat[11], vd1_pstat[12]);
+			}
+			for (u32& s : vd1_stat) s = 0;
+			for (u32& s : vd1_pstat) s = 0;
+
 			if (!enabled)
 			{
 				if (fifo_hint == optimization_hint::application_not_compatible)
@@ -549,9 +603,11 @@ namespace rsx
 			if (enabled)
 			{
 				// Currently activated. Check if there is any benefit
-				if (num_collapsed < 500)
+				// vanillad1: flatten repeat draws (P8): never off for lack of benefit with VANILLAD1_FLATTEN (the first frame, a loading frame, said 43 of 3889)
+				if (num_collapsed < (vd1_flatten_enabled() ? 0u : 500u))
 				{
 					// Not worth it, disable
+					if (vd1_flatten_enabled()) rsx_log.notice("vanillad1: FIFO flattener off (collapsed %u of %u draws)", num_collapsed, total_draw_count + num_collapsed);
 					enabled = false;
 					fifo_hint = load_unoptimizable;
 				}
@@ -577,11 +633,28 @@ namespace rsx
 					ensure(in_begin_end == false); // "Incorrect initial state"
 					ensure(num_collapsed == 0);
 					enabled = true;
+					if (vd1_flatten_enabled()) rsx_log.notice("vanillad1: FIFO flattener on (%u draws a frame)", total_draw_count); // vanillad1: flatten repeat draws (P8)
 				}
 			}
 		}
 
-		flatten_op flattening_helper::test(register_pair& command)
+		// vanillad1: flatten repeat draws (P8): a look-ahead gave no range (VANILLAD1_FLATTEN=2: counted by reason, the first 60 logged with the words)
+		void flattening_helper::vd1_peek_fail(u32 why, u32 a, u32 b, u32 c)
+		{
+			if (!vd1_flatten_log())
+			{
+				return;
+			}
+
+			vd1_pstat[why & 15]++;
+			if (vd1_pfail_logged < 60)
+			{
+				vd1_pfail_logged++;
+				rsx_log.notice("vanillad1 peek fail %u: %08x %08x %08x", why, a, b, c);
+			}
+		}
+
+		flatten_op flattening_helper::test(register_pair& command, const u32* regs, u64 vd1_range)
 		{
 			u32 flush_cmd = ~0u;
 			switch (const u32 reg = (command.reg >> 2))
@@ -597,10 +670,17 @@ namespace rsx
 					{
 						// New primitive block
 						deferred_primitive = command.value;
+						vd1_last_range = (command.value == 5u) ? vd1_range : 0; // vanillad1: flatten repeat draws (P8)
 					}
-					else if (deferred_primitive == command.value)
+					// vanillad1: flatten repeat draws (P8): with the env a repeat chains only if constants came since the END, the primitive is a
+					// triangle list (no restart barriers) and the next block's draw words are one range equal to the last
+					// block's (the run is then one instanced draw; any other merged run would lose its constants)
+					else if (deferred_primitive == command.value && (!regs || !vd1_flatten_enabled() ||
+						(vd1_constants_seen && !vd1_flatten_off('c') && vd1_range && vd1_range == vd1_last_range && (!vd1_flatten_max() || draw_count < vd1_flatten_max()))))
 					{
 						// Same primitive can be chanined; do nothing
+						vd1_constants_seen = false;
+						vd1_stat[0]++;
 						command.reg = FIFO_DISABLED_COMMAND;
 					}
 					else
@@ -608,12 +688,19 @@ namespace rsx
 						// Primitive command has changed!
 						// Flush
 						flush_cmd = command.value;
+						// vanillad1: flatten repeat draws (P8): why the run closed (VANILLAD1_FLATTEN=2)
+						if (vd1_flatten_log())
+						{
+							vd1_stat[deferred_primitive != command.value ? 4 : !vd1_constants_seen ? 1 : !vd1_range ? 2 : vd1_range != vd1_last_range ? 3 : 6]++;
+						}
+						vd1_last_range = (command.value == 5u) ? vd1_range : 0; // vanillad1: flatten repeat draws (P8)
 					}
 				}
 				else if (deferred_primitive)
 				{
 					command.reg = FIFO_DRAW_BARRIER;
 					draw_count++;
+					vd1_constants_seen = false; // vanillad1: flatten repeat draws (P8)
 				}
 				else
 				{
@@ -639,10 +726,24 @@ namespace rsx
 						// Always ignore
 						command.reg = FIFO_DISABLED_COMMAND;
 					}
+					// vanillad1: flatten repeat draws (P8): between an END and the next BEGIN the game sends constant data and
+					// re-sends the constant load and the index array with their old values: neither
+					// ends the run (the RSX is still inside the draw, so the data become barriers)
+					else if (regs && !in_begin_end && vd1_flatten_enabled() && !vd1_flatten_off('t') &&
+						(reg >= NV4097_SET_TRANSFORM_CONSTANT && reg < NV4097_SET_TRANSFORM_CONSTANT + 32))
+					{
+						vd1_constants_seen = true;
+					}
+					else if (regs && !in_begin_end && vd1_flatten_enabled() && !vd1_flatten_off('d') && regs[reg] == command.value &&
+						(reg == NV4097_SET_TRANSFORM_CONSTANT_LOAD || reg == NV4097_SET_INDEX_ARRAY_ADDRESS || reg == NV4097_SET_INDEX_ARRAY_DMA))
+					{
+						command.reg = FIFO_DISABLED_COMMAND;
+					}
 					else
 					{
 						// Flush
 						flush_cmd = (in_begin_end) ? deferred_primitive : 0u;
+						if (vd1_flatten_log() && !in_begin_end) vd1_stat[5]++; // vanillad1: flatten repeat draws (P8)
 					}
 				}
 				else
@@ -673,6 +774,115 @@ namespace rsx
 		FIFO::register_pair command;
 		fifo_ctrl->read(command);
 		const auto cmd = command.reg;
+
+		// vanillad1: flatten repeat draws (P8): the draw words after the BEGIN just read, merged the way draw_clause::append does: one range
+		// (first << 32 | count), or 0 if there is anything else, a gap, more than 256 packets, or FIFO data not yet put
+		auto vd1_peek_range = [&]() -> u64
+		{
+			// VANILLAD1_FLATTEN=2: why a look-ahead gave nothing (counted per frame, the first 60 with the raw words)
+			auto fail = [&](u32 why, u32 a = 0, u32 b = 0, u32 c = 0) -> u64 { m_flattener.vd1_peek_fail(why, a, b, c); return 0; };
+
+			if (fifo_ctrl->get_remaining_args_count())
+			{
+				return fail(1, fifo_ctrl->get_remaining_args_count());
+			}
+
+			const u32 put = ctrl->put & ~3;
+			u32 addr = fifo_ctrl->get_pos() + 4;
+			// put behind get = the producer has wrapped the ring: everything up to the ring's end jump is written (measured:
+			// put 0x0448cedc, get 0x0450xxxx in the steady plaza, so every look-ahead said 'beyond put')
+			const bool bounded = put > fifo_ctrl->get_pos();
+			u32 first = 0, next = 0, method = 0;
+			bool have = false;
+
+			for (u32 packets = 0; packets < 256; ++packets)
+			{
+				const u32 head_addr = fifo_ctrl->translate_address(addr);
+				if (head_addr == umax)
+				{
+					return fail(3, addr);
+				}
+
+				if (bounded && addr >= put)
+				{
+					return fail(2, addr, put, packets);
+				}
+
+				const u32 head = vm::read32(head_addr);
+				if (head & RSX_METHOD_NON_METHOD_CMD_MASK)
+				{
+					return fail(4, head, addr, packets); // a jump, call, return or nop: not a plain draw block
+				}
+
+				const u32 reg = (head & RSX_METHOD_METHOD_MASK) >> 2;
+				const u32 count = (head & RSX_METHOD_COUNT_MASK) >> RSX_METHOD_COUNT_SHIFT;
+				if (reg == NV4097_SET_BEGIN_END)
+				{
+					break; // the END
+				}
+
+				if (reg != NV4097_DRAW_INDEX_ARRAY && reg != NV4097_DRAW_ARRAYS)
+				{
+					return fail(5, head, addr, packets); // another method before the END
+				}
+
+				if (method && method != reg)
+				{
+					return fail(6, head);
+				}
+
+				if (count > 1 && (head & RSX_METHOD_NON_INCREMENT_CMD_MASK) != RSX_METHOD_NON_INCREMENT_CMD)
+				{
+					return fail(7, head);
+				}
+
+				if (bounded && addr + 4 * (count + 1) > put)
+				{
+					return fail(8, addr + 4 * (count + 1), put, count);
+				}
+
+				method = reg;
+				for (u32 i = 1; i <= count; ++i)
+				{
+					const u32 word_addr = fifo_ctrl->translate_address(addr + 4 * i);
+					if (word_addr == umax)
+					{
+						return fail(9, addr + 4 * i);
+					}
+
+					const u32 word = vm::read32(word_addr);
+					const u32 start = word & 0xffffff;
+					const u32 length = (word >> 24) + 1;
+					if (!have)
+					{
+						first = start;
+						next = start + length;
+						have = true;
+					}
+					else if (start == next)
+					{
+						next += length;
+					}
+					else
+					{
+						return fail(10, start, next, length); // not one contiguous range
+					}
+				}
+
+				addr += 4 * (count + 1);
+				if (packets == 255)
+				{
+					return fail(12);
+				}
+			}
+
+			if (!have)
+			{
+				return fail(11, addr);
+			}
+
+			return (static_cast<u64>(first) << 32) | (next - first);
+		};
 
 		if (cmd & (0xffff0000 | RSX_METHOD_NON_METHOD_CMD_MASK)) [[unlikely]]
 		{
@@ -877,7 +1087,9 @@ namespace rsx
 
 			if (m_flattener.is_enabled()) [[unlikely]]
 			{
-				switch(m_flattener.test(command))
+				// vanillad1: flatten repeat draws (P8): at a BEGIN, look ahead at the block's draw words (one contiguous range or none)
+				const bool vd1_begin = FIFO::vd1_flatten_enabled() && (command.reg >> 2) == NV4097_SET_BEGIN_END && command.value;
+				switch(m_flattener.test(command, m_ctx->register_state->registers.data(), vd1_begin ? vd1_peek_range() : 0))
 				{
 				case FIFO::NOTHING:
 				{

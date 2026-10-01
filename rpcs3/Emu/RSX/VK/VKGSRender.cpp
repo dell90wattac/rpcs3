@@ -2205,7 +2205,9 @@ void VKGSRender::load_program_env()
 		m_program->bind_uniform({ predicate, offset, 4 }, vk::glsl::binding_set_index_vertex, m_vs_binding_table->cr_pred_buffer_location);
 	}
 
-	if (current_vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS)
+	// vanillad1: flatten repeat draws (P8): a vertex program without instancing bindings (it reads no constants) has nothing to bind
+	if ((current_vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) &&
+		m_vs_binding_table->instanced_lut_buffer_location != umax && m_vs_binding_table->instanced_cbuf_location != umax)
 	{
 		m_program->bind_uniform(m_instancing_indirection_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->instanced_lut_buffer_location);
 		m_program->bind_uniform(m_instancing_constants_array_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->instanced_cbuf_location);

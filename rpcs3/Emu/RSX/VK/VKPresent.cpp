@@ -978,11 +978,12 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				const auto& s = info.stats;
 				rsx_log.notice("vanillad1 frame: frame=%d idle=%d fifo=%d methods=%d local=%d rtts=%d flushsvc=%d drain=%d "
 					"lsubmit=%d cachewait=%d sync=%d setup=%d vtx=%d tex=%d exec=%d flip=%d draws=%u submits=%u "
-					"flushes=%u hard=%u unavoidable=%u mispredict=%u speculate=%u load=%u",
+					"flushes=%u hard=%u unavoidable=%u mispredict=%u speculate=%u load=%u collapsed=%u inst=%u",
 					s.vd1_frame, s.vd1_idle, s.vd1_fifo, s.vd1_methods, s.vd1_local, s.vd1_rtts, s.vd1_flushsvc, s.vd1_drain,
 					s.vd1_lsubmit, s.vd1_cachewait, s.vd1_sync, s.setup_time, s.vertex_upload_time, s.textures_upload_time,
 					s.draw_exec_time, s.flip_time, s.draw_calls, s.submit_count,
-					num_flushes, num_misses, num_unavoidable, num_mispredict, num_speculate, get_load());
+					num_flushes, num_misses, num_unavoidable, num_mispredict, num_speculate, get_load(),
+					s.vd1_collapsed, s.vd1_inst); // vanillad1: flatten repeat draws (P8)
 			}
 		}
 

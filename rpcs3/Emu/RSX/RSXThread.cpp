@@ -3510,6 +3510,7 @@ namespace rsx
 		}
 
 		// Save current state
+		m_frame_stats.vd1_collapsed = m_flattener.get_collapsed(); // vanillad1: flatten repeat draws (P8)
 		m_queued_flip.stats = m_frame_stats;
 		m_queued_flip.push(buffer);
 		m_queued_flip.skip_frame = skip_current_frame;

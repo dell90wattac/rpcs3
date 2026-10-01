@@ -284,7 +284,7 @@ namespace rsx
 				{
 					// Dangling execution barrier
 					current_range_index = draw_command_ranges.size() - 1;
-					execute_pipeline_dependencies(ctx);
+					vd1_execute_dangling(ctx); // vanillad1: flatten repeat draws (P8)
 					current_range_index = 0;
 				}
 			}
@@ -294,6 +294,9 @@ namespace rsx
 		 * Executes commands reqiured to make the current draw state valid
 		 */
 		u32 execute_pipeline_dependencies(struct context* ctx, instanced_draw_config_t* instance_config = nullptr) const;
+		// vanillad1: flatten repeat draws (P8): the dangling barrier at the end of a run: with VANILLAD1_FLATTEN the constants only go to the register file
+		// and the next draw uploads them once (stock uploads the whole constants block for every update)
+		void vd1_execute_dangling(struct context* ctx) const;
 
 		/**
 		 * Returns the first-count data for the current subdraw

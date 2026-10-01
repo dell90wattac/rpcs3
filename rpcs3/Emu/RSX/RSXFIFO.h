@@ -60,6 +60,15 @@ namespace rsx
 			}
 		};
 
+		// vanillad1: flatten repeat draws (P8): VANILLAD1_FLATTEN=1 (read once, logged once); =2 also logs the first instanced draws;
+		// VANILLAD1_FLATTEN_MAX=<n> closes a run after n draws (0 / unset: no limit)
+		bool vd1_flatten_enabled();
+		bool vd1_flatten_log();
+		u32 vd1_flatten_max();
+		// VANILLAD1_FLATTEN_OFF=<letters> turns pieces off for a bisection: t = constant data passthrough,
+		// d = dropping unchanged registers, c = chaining of repeat blocks
+		bool vd1_flatten_off(char what);
+
 		class flattening_helper
 		{
 			enum register_props : u8
@@ -107,6 +116,11 @@ namespace rsx
 			u32 deferred_primitive = 0;
 			u32 draw_count = 0;
 			bool in_begin_end = false;
+			bool vd1_constants_seen = false; // vanillad1: flatten repeat draws (P8): constant data came since the last END
+			u64 vd1_last_range = 0;          // the last block's one index range (first << 32 | count), 0 = unknown
+			u32 vd1_pstat[16] = {};           // VANILLAD1_FLATTEN=2: look-ahead failures by reason (vd1_peek_fail)
+			u32 vd1_pfail_logged = 0;
+			u32 vd1_stat[8] = {};            // VANILLAD1_FLATTEN=2: chained, no constants, no range, other range, prim change, breaker register, other
 
 			bool enabled = false;
 			u32  num_collapsed = 0;
@@ -120,10 +134,12 @@ namespace rsx
 
 			u32 get_primitive() const { return deferred_primitive; }
 			bool is_enabled() const { return enabled; }
+			u32 get_collapsed() const { return num_collapsed; } // vanillad1: flatten repeat draws (P8)
 
 			void force_disable();
 			void evaluate_performance(u32 total_draw_count);
-			inline flatten_op test(register_pair& command);
+			void vd1_peek_fail(u32 why, u32 a, u32 b, u32 c);
+			inline flatten_op test(register_pair& command, const u32* regs = nullptr, u64 vd1_range = 0);
 		};
 
 		class FIFO_control

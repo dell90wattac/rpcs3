@@ -117,7 +117,16 @@ namespace rsx
 		// For instancing all draw calls must be identical
 		// FIXME: This requirement can be easily lifted by chunking contiguous chunks.
 		const auto& ref = draw_command_ranges.front();
-		return !draw_command_ranges.any(FN(x.first != ref.first || x.count != ref.count));
+		// vanillad1: flatten repeat draws (P8): with VANILLAD1_FLATTEN=1 a dangling trailing barrier (count 0) is no draw
+		const u32 vd1_n = rsx::FIFO::vd1_flatten_enabled() ? pass_count() : ::size32(draw_command_ranges);
+		for (u32 i = 1; i < vd1_n; ++i)
+		{
+			if (draw_command_ranges[i].first != ref.first || draw_command_ranges[i].count != ref.count)
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	void draw_clause::reset(primitive_type type)
@@ -180,6 +189,24 @@ namespace rsx
 		return ret;
 	}
 
+	// vanillad1: flatten repeat draws (P8)
+	void draw_clause::vd1_execute_dangling(context* ctx) const
+	{
+		if (!rsx::FIFO::vd1_flatten_enabled())
+		{
+			execute_pipeline_dependencies(ctx);
+			return;
+		}
+
+		// An instance config makes the replay copy the constants into the register file and skip the upload
+		instanced_draw_config_t config{};
+		execute_pipeline_dependencies(ctx, &config);
+		if (config.transform_constants_data_changed)
+		{
+			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::transform_constants_dirty;
+		}
+	}
+
 	u32 draw_clause::execute_pipeline_dependencies(context* ctx, instanced_draw_config_t* instance_config) const
 	{
 		u32 result = 0u;
@@ -218,7 +245,8 @@ namespace rsx
 			case transform_constant_load_modifier_barrier:
 			{
 				// Change the transform load target. Does not change result mask.
-				REGS(ctx)->decode(NV4097_SET_TRANSFORM_PROGRAM_LOAD, barrier.arg0);
+				// vanillad1: flatten repeat draws (P8): stock writes the program load register; with VANILLAD1_FLATTEN=1 the constant load
+				REGS(ctx)->decode(rsx::FIFO::vd1_flatten_enabled() ? NV4097_SET_TRANSFORM_CONSTANT_LOAD : NV4097_SET_TRANSFORM_PROGRAM_LOAD, barrier.arg0);
 				break;
 			}
 			case transform_constant_update_barrier:
