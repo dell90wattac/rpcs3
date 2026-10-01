@@ -7,6 +7,12 @@
 
 #include "Utilities/deferred_op.hpp"
 
+// vanillad1: NV0039 stride 4 -> 1 in SIMD (P10)
+#ifdef ARCH_X64
+#include <emmintrin.h>
+#endif
+#include <cstdlib>
+
 #include "context_accessors.define.h"
 
 namespace rsx
@@ -26,6 +32,52 @@ namespace rsx
 
 					src_ptr += src_stride;
 					dst_ptr += dst_stride;
+				}
+
+				dst += dst_pitch;
+				src += src_pitch;
+			}
+		}
+
+		// vanillad1: NV0039 stride 4 -> 1 in SIMD (P10): VANILLAD1_NV0039_SCALAR=1 keeps the byte loop (A/B)
+		inline bool vd1_nv0039_scalar()
+		{
+			static const bool s_scalar = []()
+			{
+				const char* env = std::getenv("VANILLAD1_NV0039_SCALAR");
+				const bool on = env && *env == '1';
+				if (on) rsx_log.notice("vanillad1: NV0039 byte copy: scalar loop (VANILLAD1_NV0039_SCALAR=1)");
+				else rsx_log.notice("vanillad1: NV0039 byte copy: 16 pixels a step for stride 4 -> 1");
+				return on;
+			}();
+			return s_scalar;
+		}
+
+		// One byte (the first) of every 4-byte pixel, 16 pixels a step; the row's tail with the old loop.
+		// Reads at most column_count * 4 source bytes of a row, writes column_count destination bytes.
+		inline void block2d_copy_stride4_to_1(u8* dst, const u8* src, u32 column_count, u32 row_count, s32 src_pitch, s32 dst_pitch)
+		{
+			for (u32 row = 0; row < row_count; ++row)
+			{
+				u32 column = 0;
+#ifdef ARCH_X64
+				const __m128i low_byte = _mm_set1_epi32(0xff);
+				for (; column + 16 <= column_count; column += 16)
+				{
+					const __m128i* in = reinterpret_cast<const __m128i*>(src + column * 4);
+					const __m128i a = _mm_and_si128(_mm_loadu_si128(in + 0), low_byte);
+					const __m128i b = _mm_and_si128(_mm_loadu_si128(in + 1), low_byte);
+					const __m128i c = _mm_and_si128(_mm_loadu_si128(in + 2), low_byte);
+					const __m128i d = _mm_and_si128(_mm_loadu_si128(in + 3), low_byte);
+					// dwords 0..255 -> words -> bytes, in order
+					const __m128i ab = _mm_packs_epi32(a, b);
+					const __m128i cd = _mm_packs_epi32(c, d);
+					_mm_storeu_si128(reinterpret_cast<__m128i*>(dst + column), _mm_packus_epi16(ab, cd));
+				}
+#endif
+				for (; column < column_count; ++column)
+				{
+					dst[column] = src[column * 4];
 				}
 
 				dst += dst_pitch;
@@ -146,6 +198,12 @@ namespace rsx
 				// The formats are just input channel strides. You can use this to do cool tricks like gathering channels
 				// Very rare, only seen in use by Destiny
 				// TODO: Hw accel
+				// vanillad1: NV0039 stride 4 -> 1 in SIMD (P10): the G-buffer copy for the SPUs; not for overlapping ranges (the loop's order matters there)
+				if (in_format == 4 && out_format == 1 && !is_overlapping && !vd1_nv0039_scalar())
+				{
+					block2d_copy_stride4_to_1(dst, src, line_length, line_count, in_pitch, out_pitch);
+					return;
+				}
 				block2d_copy_with_stride(dst, src, line_length, line_count, in_pitch, out_pitch, in_format, out_format);
 				return;
 			}
