@@ -489,6 +489,7 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	// Create secondary command_buffer for parallel operations
 	m_secondary_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
 	m_secondary_cb_list.create(m_secondary_command_buffer_pool, vk::command_buffer::access_type_hint::all);
+	m_vd1_label_cb_list.create(m_secondary_command_buffer_pool, vk::command_buffer::access_type_hint::all); // vanillad1: label batching (P9)
 
 	//Occlusion
 	m_occlusion_query_manager = std::make_unique<vk::query_pool_manager>(*m_device, VK_QUERY_TYPE_OCCLUSION, OCCLUSION_MAX_POOL_SIZE);
@@ -879,6 +880,8 @@ VKGSRender::~VKGSRender()
 	// Command buffer
 	m_primary_cb_list.destroy();
 	m_secondary_cb_list.destroy();
+	m_vd1_label_cb = nullptr; // vanillad1: label batching (P9)
+	m_vd1_label_cb_list.destroy();
 
 	m_command_buffer_pool.destroy();
 	m_secondary_command_buffer_pool.destroy();
@@ -1582,6 +1585,43 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 	m_current_command_buffer->begin();
 }
 
+// vanillad1: label batching (P9): VANILLAD1_LABEL_BATCH=<n> (read once, logged once; 0 / unset = stock)
+static u32 vd1_label_batch_n()
+{
+	static const u32 s_n = []()
+	{
+		const char* env = std::getenv("VANILLAD1_LABEL_BATCH");
+		const u32 n = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+		if (n) rsx_log.notice("vanillad1: host labels in batches (VANILLAD1_LABEL_BATCH=%u)", n);
+		return n;
+	}();
+	return s_n;
+}
+
+// vanillad1: label batching (P9): end the open batch: the newest label id, one submit, then the label counts as released
+void VKGSRender::vd1_label_flush()
+{
+	if (!m_vd1_label_cb)
+	{
+		return;
+	}
+
+	rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit);
+	auto cmd = m_vd1_label_cb;
+	m_vd1_label_cb = nullptr;
+	m_vd1_label_open = false;
+	m_vd1_label_count = 0;
+
+	vkCmdUpdateBuffer(*cmd, m_host_object_data->value, ::offset32(&vk::host_data_t::commands_complete_event), 8, &m_vd1_label_last_id);
+	cmd->end();
+
+	vk::queue_submit_t submit_info = { m_device->get_graphics_queue(), nullptr };
+	cmd->submit(submit_info);
+
+	m_host_dma_ctrl->host_ctx()->on_label_release();
+	m_frame_stats.vd1_lbatches++;
+}
+
 std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data() const
 {
 	return { m_host_dma_ctrl->host_ctx(), m_host_object_data->value };
@@ -1596,7 +1636,12 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 
 	auto host_ctx = ensure(m_host_dma_ctrl->host_ctx());
 
-	if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed())
+	// vanillad1: label batching (P9)
+	const u32 vd1_n = vd1_label_batch_n();
+	m_vd1_label_n = vd1_n;
+	const bool vd1_texread_batched = vd1_n && m_vd1_label_cb && type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed();
+
+	if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed() && !vd1_texread_batched)
 	{
 		// All texture loads already seen by the host GPU
 		// Wait for all previously submitted labels to be flushed
@@ -1614,12 +1659,12 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		// NVIDIA GPUs can disappoint when DMA blocks straddle VirtualAlloc boundaries.
 		// Take the L and try the fallback.
 		rsx_log.warning("Host label update at 0x%x was not possible.", address);
+		vd1_label_flush(); // vanillad1: label batching (P9)
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
 		return false;
 	}
 
-	const auto release_event_id = host_ctx->on_label_acquire();
-
+	// vanillad1: label batching (P9): the label id is taken below, after the batch has been flushed for a primary-path label
 	vk::insert_global_memory_barrier(*m_current_command_buffer);
 
 	// vanillad1: host label order (L20.2.1): only a texture-read release may overtake the draws
@@ -1633,10 +1678,41 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		if (on) rsx_log.notice("vanillad1: host labels behind the pending draws (VANILLAD1_LABEL_ORDER=1)");
 		return on;
 	}();
-	if (host_ctx->has_unflushed_texture_loads() || (s_label_order && type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE))
+	// vanillad1: label batching (P9): an open batch counts as released for the texture-load test (it is the newest acquire)
+	const u64 vd1_released = m_vd1_label_cb ? host_ctx->last_label_acquire_event : host_ctx->last_label_release2_event;
+	const bool vd1_primary = !vd1_texread_batched && (host_ctx->texture_load_request_event > vd1_released ||
+		(s_label_order && type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE));
+	if (vd1_primary)
+	{
+		vd1_label_flush(); // the primary submit writes commands_complete_event for this label: older ids go first
+	}
+
+	const auto release_event_id = host_ctx->on_label_acquire();
+	m_frame_stats.vd1_labels++;
+
+	if (vd1_primary)
 	{
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit); flush_command_queue(); } // vanillad1: RSX timers (P3)
+	}
+	else if (vd1_n) // vanillad1: label batching (P9): append to the open batch
+	{
+		if (!m_vd1_label_cb)
+		{
+			m_vd1_label_cb = m_vd1_label_cb_list.next();
+			m_vd1_label_cb->begin();
+			m_vd1_label_count = 0;
+			m_vd1_label_open = true;
+		}
+
+		vkCmdUpdateBuffer(*m_vd1_label_cb, mapping.second->value, mapping.first, 4, &write_data);
+		m_vd1_label_last_id = release_event_id;
+		m_vd1_label_count++;
+
+		if (vd1_n > 1 && m_vd1_label_count >= vd1_n)
+		{
+			vd1_label_flush();
+		}
 	}
 	else
 	{
@@ -2399,6 +2475,8 @@ void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)
 
 void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
 {
+	vd1_label_flush(); // vanillad1: label batching (P9): the batch first (the primary submit writes commands_complete_event for newer labels)
+
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
 
 	// Host MM sync before executing anything on the GPU
