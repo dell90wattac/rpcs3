@@ -107,6 +107,11 @@ private:
 	shared_mutex m_secondary_cb_guard;
 	vk::command_pool m_secondary_command_buffer_pool;
 	vk::command_buffer_chain<VK_MAX_ASYNC_CB_COUNT> m_secondary_cb_list;
+	// vanillad1: label batching (P9): the open batch of host labels has its own ring (m_secondary_cb_list.get() is used by others)
+	vk::command_buffer_chain<VK_MAX_ASYNC_CB_COUNT> m_vd1_label_cb_list;
+	vk::command_buffer_chunk* m_vd1_label_cb = nullptr;
+	u32 m_vd1_label_count = 0;
+	u64 m_vd1_label_last_id = 0;
 
 	vk::command_pool m_command_buffer_pool;
 	vk::command_buffer_chain<VK_MAX_ASYNC_CB_COUNT> m_primary_cb_list;
@@ -261,6 +266,7 @@ public:
 	void write_barrier(u32 address, u32 range) override;
 	void sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_hint_payload_t payload) override;
 	bool release_GCM_label(u32 type, u32 address, u32 data) override;
+	void vd1_label_flush() override; // vanillad1: label batching (P9)
 
 	void begin_occlusion_query(rsx::reports::occlusion_query_info* query) override;
 	void end_occlusion_query(rsx::reports::occlusion_query_info* query) override;

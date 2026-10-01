@@ -129,6 +129,10 @@ namespace rsx
 
 	protected:
 		FIFO::flattening_helper m_flattener;
+		// vanillad1: label batching (P9): an open batch of host labels (set by the backend), its size limit, the flush
+		bool m_vd1_label_open = false;
+		u32 m_vd1_label_n = 0;
+		virtual void vd1_label_flush() {}
 		u32 fifo_ret_addr = RSX_CALL_STACK_EMPTY;
 		u32 saved_fifo_ret = RSX_CALL_STACK_EMPTY;
 		u32 restore_fifo_cmd = 0;

@@ -886,6 +886,8 @@ namespace rsx
 
 		if (cmd & (0xffff0000 | RSX_METHOD_NON_METHOD_CMD_MASK)) [[unlikely]]
 		{
+			// vanillad1: label batching (P9): the FIFO ran dry (FIFO_EMPTY, also the jump-to-self spin; not the game's NOP padding, FIFO_NOP): the guest may be waiting for a label
+			if (m_vd1_label_open && cmd == FIFO::FIFO_EMPTY) vd1_label_flush();
 			// Check for special FIFO commands
 			switch (cmd)
 			{
@@ -1124,6 +1126,12 @@ namespace rsx
 
 			const u32 reg = (command.reg & 0xffff) >> 2;
 			const u32 value = command.value;
+			// vanillad1: label batching (P9): burst mode (n = 1) flushes at the first command that is not a label method; any n before a wait
+			if (m_vd1_label_open && (reg == NV406E_SEMAPHORE_ACQUIRE || (m_vd1_label_n == 1 &&
+				reg != NV4097_SET_SEMAPHORE_OFFSET && reg != NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE && reg != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE))) [[unlikely]]
+			{
+				vd1_label_flush();
+			}
 
 			m_ctx->register_state->decode(reg, value);
 

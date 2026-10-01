@@ -70,6 +70,8 @@ namespace rsx
 		s64 vd1_lsubmit;
 		s64 vd1_cachewait;
 		s64 vd1_sync;
+		u32 vd1_labels;   // vanillad1: label batching (P9): host labels written
+		u32 vd1_lbatches; // batch flushes
 		u32 vd1_collapsed; // vanillad1: flatten repeat draws (P8): draws the FIFO flattener merged away
 		u32 vd1_inst;      // instanced host draws
 
