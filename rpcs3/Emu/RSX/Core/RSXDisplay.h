@@ -70,6 +70,8 @@ namespace rsx
 		s64 vd1_lsubmit;
 		s64 vd1_cachewait;
 		s64 vd1_sync;
+		u32 vd1_collapsed; // vanillad1: flatten repeat draws (P8): draws the FIFO flattener merged away
+		u32 vd1_inst;      // instanced host draws
 
 		u32 vertex_cache_request_count;
 		u32 vertex_cache_miss_count;

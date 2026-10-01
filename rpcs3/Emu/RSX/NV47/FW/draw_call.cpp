@@ -117,7 +117,16 @@ namespace rsx
 		// For instancing all draw calls must be identical
 		// FIXME: This requirement can be easily lifted by chunking contiguous chunks.
 		const auto& ref = draw_command_ranges.front();
-		return !draw_command_ranges.any(FN(x.first != ref.first || x.count != ref.count));
+		// vanillad1: flatten repeat draws (P8): with VANILLAD1_FLATTEN=1 a dangling trailing barrier (count 0) is no draw
+		const u32 vd1_n = rsx::FIFO::vd1_flatten_enabled() ? pass_count() : ::size32(draw_command_ranges);
+		for (u32 i = 1; i < vd1_n; ++i)
+		{
+			if (draw_command_ranges[i].first != ref.first || draw_command_ranges[i].count != ref.count)
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	void draw_clause::reset(primitive_type type)
@@ -218,7 +227,8 @@ namespace rsx
 			case transform_constant_load_modifier_barrier:
 			{
 				// Change the transform load target. Does not change result mask.
-				REGS(ctx)->decode(NV4097_SET_TRANSFORM_PROGRAM_LOAD, barrier.arg0);
+				// vanillad1: flatten repeat draws (P8): stock writes the program load register; with VANILLAD1_FLATTEN=1 the constant load
+				REGS(ctx)->decode(rsx::FIFO::vd1_flatten_enabled() ? NV4097_SET_TRANSFORM_CONSTANT_LOAD : NV4097_SET_TRANSFORM_PROGRAM_LOAD, barrier.arg0);
 				break;
 			}
 			case transform_constant_update_barrier:
