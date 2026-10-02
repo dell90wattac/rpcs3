@@ -7,10 +7,57 @@
 #include "Emu/Memory/vm.h"
 #include "Emu/system_config.h"
 
+#include <cstdlib> // vanillad1: RCB range (P13)
+#include <utility>
+#include <vector>
+
 #define ENABLE_SURFACE_CACHE_DEBUG 0
 
 namespace rsx
 {
+	// vanillad1: RCB range (P13): VANILLAD1_RCB_RANGE=<lo>-<hi>[,<lo>-<hi>...] (hex, hi exclusive, read once). Colour
+	// surfaces overlapping a range read colour buffers back whatever Read Color Buffers says: a read
+	// reloads them from guest memory once per frame (VKRenderTargets.cpp) and views converted from
+	// them are never cached (texture_cache.h). Unset / empty / unparsable = false (stock).
+	inline bool vd1_rcb_covers(const rsx::address_range32& range)
+	{
+		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* env = std::getenv("VANILLAD1_RCB_RANGE");
+			if (!env || !*env) return out;
+			for (const char* p = env;;)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				u32 hi = 0;
+				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (hi <= lo)
+				{
+					rsx_log.error("vanillad1: VANILLAD1_RCB_RANGE=%s not understood; colour buffers read back as configured", env);
+					out.clear();
+					return out;
+				}
+				out.emplace_back(lo, hi);
+				if (!rest || *rest != ',') break;
+				p = rest + 1;
+			}
+			for (const auto& [lo, hi] : out)
+				rsx_log.notice("vanillad1: colour buffers read back every frame for 0x%x-0x%x (VANILLAD1_RCB_RANGE)", lo, hi);
+			return out;
+		}();
+
+		for (const auto& [lo, hi] : s_ranges)
+		{
+			if (range.start < hi && range.end >= lo)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	enum surface_state_flags : u32
 	{
 		ready               = 0x00,
@@ -373,7 +420,7 @@ namespace rsx
 
 			return is_depth_surface()
 				? !!g_cfg.video.read_depth_buffer
-				: !!g_cfg.video.read_color_buffers;
+				: (!!g_cfg.video.read_color_buffers || vd1_rcb_covers(get_memory_range())); // vanillad1: RCB range (P13)
 		}
 
 #if (ENABLE_SURFACE_CACHE_DEBUG)
