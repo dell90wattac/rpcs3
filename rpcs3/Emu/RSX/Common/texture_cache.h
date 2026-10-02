@@ -9,6 +9,7 @@
 #include "texture_cache_predictor.h"
 #include "texture_cache_helpers.h"
 #include "texture_cache_blit_helpers.h"
+#include "surface_utils.h" // vanillad1: RCB range (P13): vd1_rcb_covers
 
 #include <unordered_map>
 #include <cstdlib> // vanillad1: WCB only range (P5)
@@ -2479,6 +2480,14 @@ namespace rsx
 
 		image_view_type create_temporary_subresource(commandbuffer_type &cmd, deferred_subresource& desc)
 		{
+			// vanillad1: RCB range (P13): a view converted from a surface in VANILLAD1_RCB_RANGE is never cached (released
+			// after the draw): each bind converts again from the surface as it is now
+			if (!desc.do_not_cache && vd1_rcb_covers(utils::address_range32::start_length(desc.address,
+				std::max<u32>(std::max<u32>(desc.pitch, desc.width * desc.bpp), 1u) * std::max<u16>(desc.height, 1))))
+			{
+				desc.do_not_cache = true;
+			}
+
 			if (!desc.do_not_cache) [[likely]]
 			{
 				const auto desc_key = desc.encoded_properties();

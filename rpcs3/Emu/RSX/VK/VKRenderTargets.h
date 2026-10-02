@@ -11,6 +11,8 @@
 #include "vkutils/image.h"
 #include "vkutils/scratch.h"
 
+#include <array> // vanillad1: RCB range (P13)
+
 namespace vk
 {
 	namespace surface_cache_utils
@@ -109,6 +111,13 @@ namespace vk
 		u64 last_rw_access_tag = 0;     // timestamp when this object was last used
 		u64 spill_request_tag = 0;      // timestamp when spilling was requested
 		bool is_bound = false;          // set when the surface is bound for rendering
+
+		// vanillad1: RCB range (P13): a colour surface in VANILLAD1_RCB_RANGE (VKRenderTargets.cpp)
+		u64 vd1_reload_frame = umax;            // int_flip_index of the frame's first read reload
+		std::array<u64, 16> vd1_band_samples{}; // lower band, sampled at the last read reload
+		std::array<u32, 8> vd1_wait_samples{};  // last row, sampled at the end of the last band wait
+		bool vd1_wait_primed = false;
+		bool vd1_rcb_reload_due();
 
 		using drawable_surface_t::drawable_surface_t;
 

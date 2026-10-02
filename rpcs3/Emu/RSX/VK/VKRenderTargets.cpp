@@ -7,6 +7,11 @@
 
 #include "Emu/RSX/Common/tiled_dma_copy.hpp"
 
+#include <array> // vanillad1: RCB range (P13)
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 namespace vk
 {
 	namespace surface_cache_utils
@@ -810,7 +815,7 @@ namespace vk
 	{
 		const bool read_buffers_config = is_depth_surface() ?
 			!!g_cfg.video.read_depth_buffer :
-			!!g_cfg.video.read_color_buffers;
+			(!!g_cfg.video.read_color_buffers || rsx::vd1_rcb_covers(get_memory_range())); // vanillad1: RCB range (P13)
 
 		const bool should_read_buffers = (state_flags & rsx::surface_state_flags::force_data_load) || read_buffers_config;
 
@@ -935,6 +940,135 @@ namespace vk
 		return vk::viewable_image::get_view(remap, mask);
 	}
 
+	// vanillad1: RCB range (P13): VANILLAD1_RCB_WAIT_US=<n> (decimal, read once; unset / 0 = off). Diagnostic: before the
+	// frame's first read reload of a surface in VANILLAD1_RCB_RANGE, wait up to n us for its last row to change.
+	static u32 vd1_rcb_wait_us()
+	{
+		static const u32 s_wait_us = []()
+		{
+			const char* env = std::getenv("VANILLAD1_RCB_WAIT_US");
+			const u32 us = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+			if (us)
+			{
+				rsx_log.notice("vanillad1: rcb reload waits up to %u us for the last row to change (VANILLAD1_RCB_WAIT_US)", us);
+			}
+			return us;
+		}();
+		return s_wait_us;
+	}
+
+	// vanillad1: RCB range (P13): guest memory as the SPUs leave it (volatile: re-read on every call)
+	static inline u32 vd1_read_guest_u32(u32 addr)
+	{
+		return *reinterpret_cast<const volatile u32*>(vm::g_sudo_addr + addr);
+	}
+
+	// vanillad1: RCB range (P13): on a read of a colour surface in VANILLAD1_RCB_RANGE. True = reload it from guest memory now:
+	// the frame's first read, whatever the memory tag says (the SPUs rewrite it in place after the RSX wrote it),
+	// or a later read once its lower band changed since that reload (the SPUs finished it after the first read).
+	bool render_target::vd1_rcb_reload_due()
+	{
+		const auto rsxthr = rsx::get_current_renderer();
+		const u64 frame = rsxthr ? rsxthr->int_flip_index : 0;
+
+		const u32 rows = static_cast<u32>(surface_height) * samples_y;
+		const bool can_sample = raster_type == rsx::surface_raster_type::linear &&
+			native_pitch >= 32 && rsx_pitch >= native_pitch && rows >= 32;
+
+		// 16 u64 down the lower half (rows 312-623 of 624), in the middle of the row
+		const auto read_band = [&](std::array<u64, 16>& out)
+		{
+			const u32 half = rows / 2;
+			const u32 col = native_pitch / 2 - 4;
+			for (u32 k = 0; k < 16; ++k)
+			{
+				const u32 addr = base_addr + (half + ((2 * k + 1) * (rows - half)) / 32) * rsx_pitch + col;
+				out[k] = (u64{vd1_read_guest_u32(addr)} << 32) | vd1_read_guest_u32(addr + 4);
+			}
+		};
+
+		if (frame != vd1_reload_frame)
+		{
+			if (const u32 wait_us = vd1_rcb_wait_us(); wait_us && can_sample)
+			{
+				// 8 u32 across the last row
+				const u32 last_row = base_addr + (rows - 1) * rsx_pitch;
+				const u32 step = (native_pitch / 8) & ~3u;
+				std::array<u32, 8> now{};
+				const auto read_row = [&]()
+				{
+					for (u32 k = 0; k < 8; ++k)
+					{
+						now[k] = vd1_read_guest_u32(last_row + k * step);
+					}
+				};
+
+				read_row();
+				if (!vd1_wait_primed)
+				{
+					vd1_wait_samples = now;
+					vd1_wait_primed = true;
+				}
+
+				const auto start = std::chrono::steady_clock::now();
+				const auto limit = std::chrono::microseconds(wait_us);
+				bool changed = (now != vd1_wait_samples);
+				while (!changed && (std::chrono::steady_clock::now() - start) < limit)
+				{
+					std::this_thread::yield();
+					read_row();
+					changed = (now != vd1_wait_samples);
+				}
+
+				vd1_wait_samples = now;
+
+				static u32 s_changed = 0;
+				static u32 s_timed_out = 0;
+				if (changed)
+				{
+					s_changed++;
+				}
+				else
+				{
+					s_timed_out++;
+				}
+
+				if ((s_changed + s_timed_out) % 300 == 0)
+				{
+					rsx_log.notice("vanillad1: rcb reload 0x%x: %u changed, %u timed out (VANILLAD1_RCB_WAIT_US=%u)", base_addr, s_changed, s_timed_out, wait_us);
+				}
+			}
+
+			vd1_reload_frame = frame;
+			if (can_sample)
+			{
+				read_band(vd1_band_samples);
+			}
+			return true;
+		}
+
+		if (!can_sample)
+		{
+			return false;
+		}
+
+		std::array<u64, 16> band{};
+		read_band(band);
+		if (band == vd1_band_samples)
+		{
+			return false;
+		}
+
+		vd1_band_samples = band;
+
+		static u32 s_late = 0;
+		if (++s_late % 300 == 1)
+		{
+			rsx_log.notice("vanillad1: rcb reload 0x%x: lower band changed after the frame's first reload (%u times, VANILLAD1_RCB_RANGE)", base_addr, s_late);
+		}
+		return true;
+	}
+
 	void render_target::memory_barrier(vk::command_buffer& cmd, rsx::surface_access access)
 	{
 		if (access == rsx::surface_access::gpu_reference)
@@ -950,10 +1084,21 @@ namespace vk
 		}
 
 		const bool is_depth = is_depth_surface();
-		const bool read_buffers_config = is_depth ? !!g_cfg.video.read_depth_buffer : !!g_cfg.video.read_color_buffers;
+		// vanillad1: RCB range (P13): a colour surface in VANILLAD1_RCB_RANGE reads colour buffers back. A write never reloads
+		// it (the game overwrites it in full); a read reloads it once per frame whatever the memory tag says,
+		// and again when its lower band changed since (vd1_rcb_reload_due).
+		const bool vd1_rcb = !is_depth && rsx::vd1_rcb_covers(get_memory_range());
+		const bool read_buffers_config = is_depth ? !!g_cfg.video.read_depth_buffer : (!!g_cfg.video.read_color_buffers || vd1_rcb);
 		const bool should_read_buffers = (state_flags & rsx::surface_state_flags::force_data_load) || read_buffers_config;
 
-		if (should_read_buffers)
+		if (vd1_rcb)
+		{
+			if (access.is_read() && last_use_tag && vd1_rcb_reload_due())
+			{
+				state_flags |= rsx::surface_state_flags::erase_bkgnd;
+			}
+		}
+		else if (should_read_buffers)
 		{
 			// TODO: Decide what to do when memory loads are disabled but the underlying has memory changed
 			// NOTE: Assume test() is expensive when in a pinch
