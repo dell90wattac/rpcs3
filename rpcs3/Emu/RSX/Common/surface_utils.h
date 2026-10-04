@@ -8,6 +8,7 @@
 #include "Emu/system_config.h"
 
 #include <cstdlib> // vanillad1: RCB range (P13)
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -56,6 +57,27 @@ namespace rsx
 		}
 
 		return false;
+	}
+
+	// vanillad1: RCB range (P13): set while the texture cache copies a surface out to guest memory (VKTextureCache.h
+	// copy_texture, the Write Color Buffers readback): that read must not reload a surface in
+	// VANILLAD1_RCB_RANGE (the SPUs have not lit the fresh blit yet).
+	inline thread_local bool vd1_rcb_in_readback = false;
+
+	// vanillad1: RCB range (P13): VANILLAD1_RCB_MODE=any (read once): any read reloads, as build 8631bdf did (A/B only).
+	inline bool vd1_rcb_any_read()
+	{
+		static const bool s_any = []()
+		{
+			const char* env = std::getenv("VANILLAD1_RCB_MODE");
+			const bool any = env && std::string_view(env) == "any";
+			if (any)
+			{
+				rsx_log.warning("vanillad1: rcb reloads on any read, readbacks included (VANILLAD1_RCB_MODE=any)");
+			}
+			return any;
+		}();
+		return s_any;
 	}
 
 	enum surface_state_flags : u32
