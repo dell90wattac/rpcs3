@@ -957,6 +957,10 @@ namespace vk
 		return s_wait_us;
 	}
 
+	// vanillad1: RCB range (P13): reloads of surfaces in VANILLAD1_RCB_RANGE (all of them, for the stats line)
+	static u32 vd1_rcb_frame_reloads = 0;
+	static u32 vd1_rcb_late_reloads = 0;
+
 	// vanillad1: RCB range (P13): guest memory as the SPUs leave it (volatile: re-read on every call)
 	static inline u32 vd1_read_guest_u32(u32 addr)
 	{
@@ -1040,6 +1044,7 @@ namespace vk
 			}
 
 			vd1_reload_frame = frame;
+			vd1_rcb_frame_reloads++;
 			if (can_sample)
 			{
 				read_band(vd1_band_samples);
@@ -1061,10 +1066,9 @@ namespace vk
 
 		vd1_band_samples = band;
 
-		static u32 s_late = 0;
-		if (++s_late % 300 == 1)
+		if (++vd1_rcb_late_reloads % 300 == 1)
 		{
-			rsx_log.notice("vanillad1: rcb reload 0x%x: lower band changed after the frame's first reload (%u times, VANILLAD1_RCB_RANGE)", base_addr, s_late);
+			rsx_log.notice("vanillad1: rcb reload 0x%x: lower band changed after the frame's first reload (%u times, VANILLAD1_RCB_RANGE)", base_addr, vd1_rcb_late_reloads);
 		}
 		return true;
 	}
@@ -1093,9 +1097,26 @@ namespace vk
 
 		if (vd1_rcb)
 		{
-			if (access.is_read() && last_use_tag && vd1_rcb_reload_due())
+			// only a read that consumes the image reloads it: not the readback to guest memory, not
+			// RPCS3's housekeeping memory_read (unless VANILLAD1_RCB_MODE=any)
+			static u32 s_readbacks = 0, s_housekeeping = 0;
+			const bool consuming = rsx::vd1_rcb_any_read() ||
+				(!rsx::vd1_rcb_in_readback && !(access == rsx::surface_access::memory_read));
+			if (access.is_read() && !consuming)
+			{
+				if (rsx::vd1_rcb_in_readback) s_readbacks++;
+				else s_housekeeping++;
+			}
+			else if (access.is_read() && last_use_tag && vd1_rcb_reload_due())
 			{
 				state_flags |= rsx::surface_state_flags::erase_bkgnd;
+
+				static u32 s_reloads = 0;
+				if (++s_reloads % 600 == 0)
+				{
+					rsx_log.notice("vanillad1: rcb stats: %u frame reloads, %u late, %u readbacks kept, %u housekeeping reads skipped",
+						vd1_rcb_frame_reloads, vd1_rcb_late_reloads, s_readbacks, s_housekeeping);
+				}
 			}
 		}
 		else if (should_read_buffers)

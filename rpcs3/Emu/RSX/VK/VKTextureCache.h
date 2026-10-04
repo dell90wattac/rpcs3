@@ -248,7 +248,9 @@ namespace vk
 			if (context == rsx::texture_upload_context::framebuffer_storage)
 			{
 				auto surface = vk::as_rtt(vram_texture);
+				rsx::vd1_rcb_in_readback = true; // vanillad1: RCB range (P13): the readback to guest memory is not a consuming read
 				surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
+				rsx::vd1_rcb_in_readback = false;
 				locked_resource = surface->get_surface(rsx::surface_access::transfer_read);
 				transfer_width *= surface->samples_x;
 				transfer_height *= surface->samples_y;
