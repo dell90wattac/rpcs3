@@ -8,6 +8,7 @@
 #include "util/tsc.hpp"
 
 #include "util/sysinfo.hpp"
+#include <cstdlib>
 
 u64 g_timebase_offs{};
 static u64 systemtime_offset;
@@ -256,6 +257,9 @@ u64 get_guest_system_time(u64 time)
 	return result - systemtime_offset;
 }
 
+// vanillad1: pause wall clock (L62.4): the paused time held off sys_time_get_current_time (VANILLAD1_PAUSE_WALLCLOCK=1).
+static u64 s_pause_wall_ns = 0;
+
 // vanillad1: pause clock (L62.4): VANILLAD1_PAUSE_CLOCK=1. Called by Emulator::Resume with the paused span before
 // the threads run again: the timebase and the guest system time go on from where they stopped.
 void add_guest_pause_time(u64 host_us)
@@ -263,6 +267,7 @@ void add_guest_pause_time(u64 host_us)
 	const u64 us = host_us * g_cfg.core.clocks_scale / 100u;
 	systemtime_offset += us;
 	g_timebase_offs += us * (g_timebase_freq / 1000000ull);
+	s_pause_wall_ns += us * 1000ull; // vanillad1: pause wall clock (L62.4)
 }
 
 // Functions
@@ -370,7 +375,14 @@ error_code sys_time_get_current_time(vm::ptr<s64> sec, vm::ptr<s64> nsec)
 	const u64 diff = utils::udiv128(diff_sh, diff_sl, s_time_aux_info.perf_freq);
 
 	// get time since Epoch in nanoseconds
-	const u64 time = s_time_aux_info.start_ftime * 100u + (diff * g_cfg.core.clocks_scale / 100u);
+	static const bool s_pause_wall = []()
+	{
+		const char* env = std::getenv("VANILLAD1_PAUSE_WALLCLOCK");
+		return env && env[0] == '1' && env[1] == '\0';
+	}();
+	// vanillad1: pause wall clock (L62.4)
+	const u64 time = s_time_aux_info.start_ftime * 100u + (diff * g_cfg.core.clocks_scale / 100u)
+		- (s_pause_wall ? s_pause_wall_ns : 0);
 
 	// scale to seconds, and add the console time offset (which might be negative)
 	*sec = (time / 1000000000ull) + g_cfg.sys.console_time_offset;
