@@ -22,6 +22,8 @@
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/Cell/lv2/sys_process.h"
 #include "Emu/Cell/lv2/sys_sync.h"
+#include "Emu/Cell/timers.hpp"
+#include <cstdlib>
 #include "Emu/Cell/lv2/sys_prx.h"
 #include "Emu/Cell/lv2/sys_overlay.h"
 #include "Emu/Cell/lv2/sys_spu.h"
@@ -3171,7 +3173,21 @@ void Emulator::Resume()
 	// Try to increment summary pause time
 	if (time)
 	{
-		m_pause_amend_time += get_system_time() - time;
+		const u64 paused = get_system_time() - time;
+		m_pause_amend_time += paused;
+
+		// vanillad1: pause clock (L62.4): VANILLAD1_PAUSE_CLOCK=1 holds the guest clocks too (read once).
+		static const bool s_pause_clock = []()
+		{
+			const char* env = std::getenv("VANILLAD1_PAUSE_CLOCK");
+			return env && env[0] == '1' && env[1] == '\0';
+		}();
+
+		if (s_pause_clock)
+		{
+			add_guest_pause_time(paused);
+			sys_log.notice("VANILLAD1_PAUSE_CLOCK: guest clocks held for %u ms", paused / 1000);
+		}
 	}
 	else
 	{

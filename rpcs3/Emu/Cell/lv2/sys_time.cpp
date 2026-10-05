@@ -256,6 +256,15 @@ u64 get_guest_system_time(u64 time)
 	return result - systemtime_offset;
 }
 
+// vanillad1: pause clock (L62.4): VANILLAD1_PAUSE_CLOCK=1. Called by Emulator::Resume with the paused span before
+// the threads run again: the timebase and the guest system time go on from where they stopped.
+void add_guest_pause_time(u64 host_us)
+{
+	const u64 us = host_us * g_cfg.core.clocks_scale / 100u;
+	systemtime_offset += us;
+	g_timebase_offs += us * (g_timebase_freq / 1000000ull);
+}
+
 // Functions
 error_code sys_time_set_timezone(s32 timezone, s32 summertime)
 {

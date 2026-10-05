@@ -10,3 +10,6 @@ u64 get_system_time();
 
 // As get_system_time but obeys Clocks scaling setting. Microseconds.
 u64 get_guest_system_time(u64 time = umax);
+
+// vanillad1: pause clock (L62.4): hold the guest clocks for a paused span (host microseconds).
+void add_guest_pause_time(u64 host_us);
