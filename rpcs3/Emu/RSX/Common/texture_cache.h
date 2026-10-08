@@ -22,6 +22,47 @@ namespace rsx
 {
 	namespace helpers = rsx::texture_cache_helpers;
 
+	// vanillad1: no speculative readback (P13.1): VANILLAD1_NO_SPEC_FLUSH=<lo>-<hi>[,<lo>-<hi>...] (hex, hi exclusive, read once). Sections
+	// overlapping a range are never read back speculatively; unset / empty / unparsable = false (stock).
+	inline bool vd1_nospec_covers(const utils::address_range32& range)
+	{
+		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* env = std::getenv("VANILLAD1_NO_SPEC_FLUSH");
+			if (!env || !*env) return out;
+			for (const char* p = env;;)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				u32 hi = 0;
+				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (hi <= lo)
+				{
+					rsx_log.error("vanillad1: VANILLAD1_NO_SPEC_FLUSH=%s not understood; speculative readbacks as stock", env);
+					out.clear();
+					return out;
+				}
+				out.emplace_back(lo, hi);
+				if (!rest || *rest != ',') break;
+				p = rest + 1;
+			}
+			for (const auto& [lo, hi] : out)
+				rsx_log.notice("vanillad1: no speculative readback for 0x%x-0x%x (VANILLAD1_NO_SPEC_FLUSH)", lo, hi);
+			return out;
+		}();
+
+		for (const auto& [lo, hi] : s_ranges)
+		{
+			if (range.start < hi && range.end >= lo)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	// vanillad1: WCB only range (P5): VANILLAD1_WCB_ONLY=<lo>-<hi>[,<lo>-<hi>...] (hex, read once). With Write Color
 	// Buffers on, only colour targets overlapping a range are locked and written back; the rest
 	// behave as with WCB off. Unset / unparsable = true for every range (stock). log: RSX thread only.
@@ -2306,6 +2347,18 @@ namespace rsx
 
 				if (!region.matches(range))
 					continue;
+
+				// vanillad1: no speculative readback (P13.1): the read that needs this section does a fresh synchronous copy instead
+				if (vd1_nospec_covers(region.get_section_range()))
+				{
+					static u32 s_skipped = 0;
+					if (++s_skipped % 1000 == 1)
+					{
+						rsx_log.notice("vanillad1: speculative readback of 0x%x skipped (%u times, VANILLAD1_NO_SPEC_FLUSH)",
+							region.get_section_base(), s_skipped);
+					}
+					continue;
+				}
 
 				if (!region.tracked_by_predictor())
 					continue;
