@@ -815,7 +815,7 @@ namespace vk
 	{
 		const bool read_buffers_config = is_depth_surface() ?
 			!!g_cfg.video.read_depth_buffer :
-			(!!g_cfg.video.read_color_buffers || rsx::vd1_rcb_covers(get_memory_range())); // vanillad1: RCB range (P13)
+			(!!g_cfg.video.read_color_buffers || (rsx::vd1_rcb_covers(get_memory_range()) && rsx::vd1_rcb_size_ok(surface_width, surface_height))); // vanillad1: RCB range (P13), size (vanillad1: RCB changed (P13.2))
 
 		const bool should_read_buffers = (state_flags & rsx::surface_state_flags::force_data_load) || read_buffers_config;
 
@@ -940,8 +940,8 @@ namespace vk
 		return vk::viewable_image::get_view(remap, mask);
 	}
 
-	// vanillad1: RCB range (P13): VANILLAD1_RCB_WAIT_US=<n> (decimal, read once; unset / 0 = off). Diagnostic: before the
-	// frame's first read reload of a surface in VANILLAD1_RCB_RANGE, wait up to n us for its last row to change.
+	// vanillad1: RCB changed (P13.2): VANILLAD1_RCB_WAIT_US=<n> (decimal, read once; unset / 0 = off): a reload that finds one half of the
+	// surface new and the other not (the SPUs light the halves in turn) waits up to n us for the other to change too.
 	static u32 vd1_rcb_wait_us()
 	{
 		static const u32 s_wait_us = []()
@@ -950,126 +950,245 @@ namespace vk
 			const u32 us = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
 			if (us)
 			{
-				rsx_log.notice("vanillad1: rcb reload waits up to %u us for the last row to change (VANILLAD1_RCB_WAIT_US)", us);
+				rsx_log.notice("vanillad1: rcb reload waits up to %u us for the other half to change (VANILLAD1_RCB_WAIT_US)", us);
 			}
 			return us;
 		}();
 		return s_wait_us;
 	}
 
-	// vanillad1: RCB range (P13): reloads of surfaces in VANILLAD1_RCB_RANGE (all of them, for the stats line)
+	// vanillad1: RCB changed (P13.2): VANILLAD1_RCB_SETTLE_US=<m> (decimal, read once; unset / 0 = off): a reload first waits until the
+	// memory held still for m us (within VANILLAD1_RCB_WAIT_US, or 4 * m when that is unset).
+	static u32 vd1_rcb_settle_us()
+	{
+		static const u32 s_settle_us = []()
+		{
+			const char* env = std::getenv("VANILLAD1_RCB_SETTLE_US");
+			const u32 us = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+			if (us)
+			{
+				rsx_log.notice("vanillad1: rcb reload waits for the memory to hold still for %u us (VANILLAD1_RCB_SETTLE_US)", us);
+			}
+			return us;
+		}();
+		return s_settle_us;
+	}
+
+	// vanillad1: RCB changed (P13.2): VANILLAD1_RCB_TRACE=<n> (decimal, read once; unset / 0 = off): every 10 s, one log line per barrier on
+	// a covered surface (and per readback flush into the range, VKTextureCache.h) for the next n frames.
+	static bool vd1_rcb_tracing(u64 frame)
+	{
+		static const u32 s_frames = []()
+		{
+			const char* env = std::getenv("VANILLAD1_RCB_TRACE");
+			const u32 n = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+			if (n)
+			{
+				rsx_log.notice("vanillad1: rcb trace: %u frames every 10 s (VANILLAD1_RCB_TRACE)", n);
+			}
+			return n;
+		}();
+		if (!s_frames)
+		{
+			return false;
+		}
+
+		static u64 s_until = 0;
+		static s64 s_last_ms = 0;
+		const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (frame >= s_until && now_ms - s_last_ms >= 10000)
+		{
+			s_last_ms = now_ms;
+			s_until = frame + s_frames;
+			rsx::g_vd1_rcb_trace_until = s_until;
+		}
+		return frame < s_until;
+	}
+
+	// vanillad1: RCB changed (P13.2): reloads of surfaces in VANILLAD1_RCB_RANGE (the P13 "rcb stats" line: first in a frame / again)
 	static u32 vd1_rcb_frame_reloads = 0;
 	static u32 vd1_rcb_late_reloads = 0;
 
-	// vanillad1: RCB range (P13): guest memory as the SPUs leave it (volatile: re-read on every call)
-	static inline u32 vd1_read_guest_u32(u32 addr)
+	// vanillad1: RCB changed (P13.2): a hash of guest memory over each half of the surface (rows 0..h/2-1, h/2..h-1): 24 rows x 4 u64 per
+	// half, spread across the row (volatile: the SPUs rewrite it while we look). False = can't sample it.
+	bool render_target::vd1_rcb_bands(std::array<u64, 2>& out)
 	{
-		return *reinterpret_cast<const volatile u32*>(vm::g_sudo_addr + addr);
+		const u32 rows = static_cast<u32>(surface_height) * samples_y;
+		const u32 slots = native_pitch / 8;
+		if (raster_type != rsx::surface_raster_type::linear || slots < 8 || rsx_pitch < native_pitch || rows < 48)
+		{
+			return false;
+		}
+
+		constexpr u32 band_rows = 24, band_cols = 4;
+		const u32 half = rows / 2;
+		for (u32 b = 0; b < 2; ++b)
+		{
+			const u32 first = b ? half : 0u;
+			const u32 count = b ? rows - half : half;
+			u64 h = 0xcbf29ce484222325ull;
+			for (u32 j = 0; j < band_rows; ++j)
+			{
+				const u32 row = first + ((2 * j + 1) * count) / (2 * band_rows);
+				for (u32 k = 0; k < band_cols; ++k)
+				{
+					const u32 slot = (((2 * k + 1) * slots) / (2 * band_cols) + j * 5) % slots;
+					const u32 addr = base_addr + row * rsx_pitch + slot * 8;
+					const u64 v = *reinterpret_cast<const volatile u64*>(vm::g_sudo_addr + addr);
+					h = (h ^ v) * 0x100000001b3ull;
+					h ^= (h >> 29);
+				}
+			}
+			out[b] = h;
+		}
+		return true;
 	}
 
-	// vanillad1: RCB range (P13): on a read of a colour surface in VANILLAD1_RCB_RANGE. True = reload it from guest memory now:
-	// the frame's first read, whatever the memory tag says (the SPUs rewrite it in place after the RSX wrote it),
-	// or a later read once its lower band changed since that reload (the SPUs finished it after the first read).
-	bool render_target::vd1_rcb_reload_due()
+	// vanillad1: RCB changed (P13.2): on a consuming read or a write of a colour surface in VANILLAD1_RCB_RANGE. True = reload it from guest
+	// memory now: the memory changed since the surface last matched it (its last reload, or its first write),
+	// judged by vd1_rcb_bands (stock RCB's rule with a 192-sample hash for the 3-word tag). Sets vd1_why.
+	bool render_target::vd1_rcb_reload_due(rsx::surface_access access)
 	{
 		const auto rsxthr = rsx::get_current_renderer();
 		const u64 frame = rsxthr ? rsxthr->int_flip_index : 0;
+		auto& c = rsx::g_vd1_rcb;
 
-		const u32 rows = static_cast<u32>(surface_height) * samples_y;
-		const bool can_sample = raster_type == rsx::surface_raster_type::linear &&
-			native_pitch >= 32 && rsx_pitch >= native_pitch && rows >= 32;
-
-		// 16 u64 down the lower half (rows 312-623 of 624), in the middle of the row
-		const auto read_band = [&](std::array<u64, 16>& out)
+		std::array<u64, 2> now{};
+		if (!vd1_rcb_bands(now))
 		{
-			const u32 half = rows / 2;
-			const u32 col = native_pitch / 2 - 4;
-			for (u32 k = 0; k < 16; ++k)
+			// can't sample: the frame's first read reloads (P13's rule)
+			c.nosamp++;
+			vd1_why = "nosample";
+			if (!access.is_read() || frame == vd1_reload_frame)
 			{
-				const u32 addr = base_addr + (half + ((2 * k + 1) * (rows - half)) / 32) * rsx_pitch + col;
-				out[k] = (u64{vd1_read_guest_u32(addr)} << 32) | vd1_read_guest_u32(addr + 4);
+				return false;
 			}
-		};
-
-		if (frame != vd1_reload_frame)
-		{
-			if (const u32 wait_us = vd1_rcb_wait_us(); wait_us && can_sample)
-			{
-				// 8 u32 across the last row
-				const u32 last_row = base_addr + (rows - 1) * rsx_pitch;
-				const u32 step = (native_pitch / 8) & ~3u;
-				std::array<u32, 8> now{};
-				const auto read_row = [&]()
-				{
-					for (u32 k = 0; k < 8; ++k)
-					{
-						now[k] = vd1_read_guest_u32(last_row + k * step);
-					}
-				};
-
-				read_row();
-				if (!vd1_wait_primed)
-				{
-					vd1_wait_samples = now;
-					vd1_wait_primed = true;
-				}
-
-				const auto start = std::chrono::steady_clock::now();
-				const auto limit = std::chrono::microseconds(wait_us);
-				bool changed = (now != vd1_wait_samples);
-				while (!changed && (std::chrono::steady_clock::now() - start) < limit)
-				{
-					std::this_thread::yield();
-					read_row();
-					changed = (now != vd1_wait_samples);
-				}
-
-				vd1_wait_samples = now;
-
-				static u32 s_changed = 0;
-				static u32 s_timed_out = 0;
-				if (changed)
-				{
-					s_changed++;
-				}
-				else
-				{
-					s_timed_out++;
-				}
-
-				if ((s_changed + s_timed_out) % 300 == 0)
-				{
-					rsx_log.notice("vanillad1: rcb reload 0x%x: %u changed, %u timed out (VANILLAD1_RCB_WAIT_US=%u)", base_addr, s_changed, s_timed_out, wait_us);
-				}
-			}
-
 			vd1_reload_frame = frame;
 			vd1_rcb_frame_reloads++;
-			if (can_sample)
-			{
-				read_band(vd1_band_samples);
-			}
 			return true;
 		}
 
-		if (!can_sample)
+		if (!vd1_seen_valid)
 		{
+			// the first access: a read takes the memory, a write only records it (the RSX overwrites it)
+			c.first++;
+			vd1_seen = now;
+			vd1_seen_valid = true;
+			vd1_why = "first";
+			if (!access.is_read())
+			{
+				return false;
+			}
+			vd1_reload_frame = frame;
+			vd1_rcb_frame_reloads++;
+			return true;
+		}
+
+		bool up = (now[0] != vd1_seen[0]);
+		bool lo = (now[1] != vd1_seen[1]);
+		if (!up && !lo)
+		{
+			c.same++;
+			vd1_why = "same";
 			return false;
 		}
 
-		std::array<u64, 16> band{};
-		read_band(band);
-		if (band == vd1_band_samples)
+		const u32 wait_us = vd1_rcb_wait_us();
+		const u32 settle_us = vd1_rcb_settle_us();
+		if ((wait_us && up != lo) || settle_us)
 		{
-			return false;
+			const auto start = std::chrono::steady_clock::now();
+			const auto limit = std::chrono::microseconds(wait_us ? wait_us : 4 * settle_us);
+
+			if (wait_us && up != lo)
+			{
+				// one half new, the other not yet: wait for the other half
+				while (!(up && lo) && (std::chrono::steady_clock::now() - start) < limit)
+				{
+					std::this_thread::yield();
+					vd1_rcb_bands(now);
+					up = (now[0] != vd1_seen[0]);
+					lo = (now[1] != vd1_seen[1]);
+				}
+				if (up && lo) c.wait_ok++;
+				else c.wait_to++;
+			}
+
+			if (settle_us)
+			{
+				// the memory holds still for settle_us (the SPUs done writing)
+				auto still = now;
+				auto still_since = std::chrono::steady_clock::now();
+				const auto settle = std::chrono::microseconds(settle_us);
+				bool settled = false;
+				while ((std::chrono::steady_clock::now() - start) < limit)
+				{
+					std::this_thread::yield();
+					vd1_rcb_bands(now);
+					const auto t = std::chrono::steady_clock::now();
+					if (now != still)
+					{
+						still = now;
+						still_since = t;
+					}
+					else if ((t - still_since) >= settle)
+					{
+						settled = true;
+						break;
+					}
+				}
+				if (settled) c.settled++;
+				else c.unsettled++;
+				up = (now[0] != vd1_seen[0]);
+				lo = (now[1] != vd1_seen[1]);
+			}
+
+			vd1_waited_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - start).count());
+			c.wait_us += vd1_waited_us;
+
+			if (!up && !lo)
+			{
+				c.same++;
+				vd1_why = "same";
+				return false;
+			}
 		}
 
-		vd1_band_samples = band;
-
-		if (++vd1_rcb_late_reloads % 300 == 1)
+		if (up && lo)
 		{
-			rsx_log.notice("vanillad1: rcb reload 0x%x: lower band changed after the frame's first reload (%u times, VANILLAD1_RCB_RANGE)", base_addr, vd1_rcb_late_reloads);
+			c.both++;
+			vd1_why = "both";
 		}
+		else if (up)
+		{
+			c.up++;
+			vd1_why = "up";
+		}
+		else
+		{
+			c.lo++;
+			vd1_why = "lo";
+		}
+
+		if (access.is_write())
+		{
+			c.wr_rl++;
+		}
+
+		if (frame == vd1_reload_frame)
+		{
+			c.again++;
+			vd1_rcb_late_reloads++;
+		}
+		else
+		{
+			vd1_rcb_frame_reloads++;
+		}
+
+		vd1_reload_frame = frame;
+		vd1_seen = now;
 		return true;
 	}
 
@@ -1088,17 +1207,21 @@ namespace vk
 		}
 
 		const bool is_depth = is_depth_surface();
-		// vanillad1: RCB range (P13): a colour surface in VANILLAD1_RCB_RANGE reads colour buffers back. A write never reloads
-		// it (the game overwrites it in full); a read reloads it once per frame whatever the memory tag says,
-		// and again when its lower band changed since (vd1_rcb_reload_due).
-		const bool vd1_rcb = !is_depth && rsx::vd1_rcb_covers(get_memory_range());
+		// vanillad1: RCB range (P13): a colour surface in VANILLAD1_RCB_RANGE reads colour buffers back.
+		// vanillad1: RCB changed (P13.2): a consuming read or a write reloads it when its memory changed since it last matched it
+		// (vd1_rcb_reload_due), not on the frame's first read; VANILLAD1_RCB_SIZE narrows it to one surface size.
+		const bool vd1_rcb = !is_depth && rsx::vd1_rcb_covers(get_memory_range()) && rsx::vd1_rcb_size_ok(surface_width, surface_height);
 		const bool read_buffers_config = is_depth ? !!g_cfg.video.read_depth_buffer : (!!g_cfg.video.read_color_buffers || vd1_rcb);
 		const bool should_read_buffers = (state_flags & rsx::surface_state_flags::force_data_load) || read_buffers_config;
 
 		if (vd1_rcb)
 		{
-			// vanillad1: RCB keep (P13.1): a write never reloads, but resyncs the memory tag so the surface store's lookup
-			// test() does not drop the surface (the blit overwrites it in full anyway)
+			// vanillad1: RCB changed (P13.2): the decision of this barrier, for VANILLAD1_RCB_TRACE
+			vd1_why = "-";
+			vd1_waited_us = 0;
+
+			// vanillad1: RCB keep (P13.1): a write resyncs the memory tag so the surface store's lookup test() does not
+			// drop the surface (P13.2: it reloads below only when the memory changed since it last matched it)
 			if (access.is_write())
 			{
 				sync_tag();
@@ -1123,7 +1246,9 @@ namespace vk
 				if (rsx::vd1_rcb_in_readback) s_readbacks++;
 				else s_housekeeping++;
 			}
-			else if (access.is_read() && last_use_tag && vd1_rcb_reload_due())
+			// vanillad1: RCB changed (P13.2): a consuming read or a write (not RPCS3's memory_write) reloads when the memory changed
+			else if ((access.is_read() || (access.is_write() && !(access == rsx::surface_access::memory_write))) &&
+				last_use_tag && vd1_rcb_reload_due(access))
 			{
 				state_flags |= rsx::surface_state_flags::erase_bkgnd;
 				rsx::g_vd1_rcb.reloads++; // vanillad1: RCB keep (P13.1)
@@ -1134,6 +1259,23 @@ namespace vk
 					rsx_log.notice("vanillad1: rcb stats: %u frame reloads, %u late, %u readbacks kept, %u housekeeping reads skipped",
 						vd1_rcb_frame_reloads, vd1_rcb_late_reloads, s_readbacks, s_housekeeping);
 				}
+			}
+
+			// vanillad1: RCB changed (P13.2): VANILLAD1_RCB_TRACE
+			if (const auto rsxthr = rsx::get_current_renderer(); rsxthr && vd1_rcb_tracing(rsxthr->int_flip_index))
+			{
+				const char* acc =
+					access == rsx::surface_access::shader_read ? "sr" :
+					access == rsx::surface_access::shader_write ? "sw" :
+					access == rsx::surface_access::transfer_read ? "tr" :
+					access == rsx::surface_access::transfer_write ? "tw" :
+					access == rsx::surface_access::memory_read ? "mr" :
+					access == rsx::surface_access::memory_write ? "mw" : "??";
+				rsx_log.notice("vanillad1: rcb trace f=%llu d=%u 0x%x %ux%u %s%s %s%s w=%u",
+					rsxthr->int_flip_index, rsxthr->get_stats().draw_calls, base_addr,
+					static_cast<u32>(surface_width), static_cast<u32>(surface_height),
+					acc, rsx::vd1_rcb_in_readback ? "(rb)" : "", vd1_why,
+					(state_flags & rsx::surface_state_flags::erase_bkgnd) ? " RELOAD" : "", vd1_waited_us);
 			}
 		}
 		else if (should_read_buffers)

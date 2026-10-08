@@ -66,6 +66,31 @@ namespace rsx
 	// VANILLAD1_RCB_RANGE (the SPUs have not lit the fresh blit yet).
 	inline thread_local bool vd1_rcb_in_readback = false;
 
+	// vanillad1: RCB changed (P13.2): VANILLAD1_RCB_SIZE=<w>x<h> (decimal, read once; unset = any size): under VANILLAD1_RCB_RANGE only
+	// colour surfaces of that size read colour buffers back (the hand-off buffers are 1024x624; in orbit
+	// other surfaces live in the same range).
+	inline bool vd1_rcb_size_ok(u32 w, u32 h)
+	{
+		static const std::pair<u32, u32> s_size = []()
+		{
+			std::pair<u32, u32> out{0u, 0u};
+			const char* env = std::getenv("VANILLAD1_RCB_SIZE");
+			if (!env || !*env) return out;
+			char* rest = nullptr;
+			out.first = static_cast<u32>(std::strtoul(env, &rest, 10));
+			out.second = (rest && (*rest == 'x' || *rest == 'X')) ? static_cast<u32>(std::strtoul(rest + 1, nullptr, 10)) : 0u;
+			if (!out.first || !out.second)
+			{
+				rsx_log.error("vanillad1: VANILLAD1_RCB_SIZE=%s not understood; any size", env);
+				out = {0u, 0u};
+				return out;
+			}
+			rsx_log.notice("vanillad1: colour buffers read back only for %ux%u surfaces (VANILLAD1_RCB_SIZE)", out.first, out.second);
+			return out;
+		}();
+		return !s_size.first || (w == s_size.first && h == s_size.second);
+	}
+
 	// vanillad1: RCB range (P13): VANILLAD1_RCB_MODE=any (read once): any read reloads, as build 8631bdf did (A/B only).
 	inline bool vd1_rcb_any_read()
 	{
@@ -86,8 +111,15 @@ namespace rsx
 	struct vd1_rcb_counters
 	{
 		std::atomic<u32> reads{0}, writes{0}, reloads{0}, rb_kept{0}, hk{0}, drops{0}, nul_kept{0}, forced{0}, tag0{0};
+		// vanillad1: RCB changed (P13.2): reloads by the half that changed, accesses that found nothing new, reloads again in a frame,
+		// reloads at a write, first accesses, unsampled surfaces, the band / settle waits
+		std::atomic<u32> up{0}, lo{0}, both{0}, same{0}, again{0}, wr_rl{0}, first{0}, nosamp{0};
+		std::atomic<u32> wait_ok{0}, wait_to{0}, settled{0}, unsettled{0}, wait_us{0};
 	};
 	inline vd1_rcb_counters g_vd1_rcb;
+
+	// vanillad1: RCB changed (P13.2): the flip index the VANILLAD1_RCB_TRACE window ends at (VKRenderTargets.cpp sets it, VKTextureCache.h reads it)
+	inline std::atomic<u64> g_vd1_rcb_trace_until{0};
 
 	inline void vd1_rcb_tick()
 	{
@@ -108,6 +140,11 @@ namespace rsx
 		rsx_log.notice("vanillad1: rcb 10s: reads=%u writes=%u reloads=%u rb_kept=%u hk=%u drops=%u nul_kept=%u forced=%u tag0=%u",
 			c.reads.exchange(0), c.writes.exchange(0), c.reloads.exchange(0), c.rb_kept.exchange(0), c.hk.exchange(0),
 			c.drops.exchange(0), c.nul_kept.exchange(0), c.forced.exchange(0), c.tag0.exchange(0));
+		rsx_log.notice("vanillad1: rcb 10s changed: up=%u lo=%u both=%u same=%u again=%u wr_rl=%u first=%u nosamp=%u", // vanillad1: RCB changed (P13.2)
+			c.up.exchange(0), c.lo.exchange(0), c.both.exchange(0), c.same.exchange(0), c.again.exchange(0),
+			c.wr_rl.exchange(0), c.first.exchange(0), c.nosamp.exchange(0));
+		rsx_log.notice("vanillad1: rcb 10s waits: wait_ok=%u wait_to=%u settled=%u unsettled=%u wait_ms=%u",
+			c.wait_ok.exchange(0), c.wait_to.exchange(0), c.settled.exchange(0), c.unsettled.exchange(0), c.wait_us.exchange(0) / 1000);
 	}
 
 	enum surface_state_flags : u32
@@ -472,7 +509,7 @@ namespace rsx
 
 			return is_depth_surface()
 				? !!g_cfg.video.read_depth_buffer
-				: (!!g_cfg.video.read_color_buffers || vd1_rcb_covers(get_memory_range())); // vanillad1: RCB range (P13)
+				: (!!g_cfg.video.read_color_buffers || (vd1_rcb_covers(get_memory_range()) && vd1_rcb_size_ok(surface_width, surface_height))); // vanillad1: RCB range (P13), size (vanillad1: RCB changed (P13.2))
 		}
 
 #if (ENABLE_SURFACE_CACHE_DEBUG)

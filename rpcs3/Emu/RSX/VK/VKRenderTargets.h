@@ -117,7 +117,13 @@ namespace vk
 		std::array<u64, 16> vd1_band_samples{}; // lower band, sampled at the last read reload
 		std::array<u32, 8> vd1_wait_samples{};  // last row, sampled at the end of the last band wait
 		bool vd1_wait_primed = false;
-		bool vd1_rcb_reload_due();
+		// vanillad1: RCB changed (P13.2): guest memory as the surface last matched it (a hash per half), the last decision for the trace
+		std::array<u64, 2> vd1_seen{};
+		bool vd1_seen_valid = false;
+		const char* vd1_why = "-";
+		u32 vd1_waited_us = 0;
+		bool vd1_rcb_bands(std::array<u64, 2>& out);
+		bool vd1_rcb_reload_due(rsx::surface_access access);
 
 		using drawable_surface_t::drawable_surface_t;
 

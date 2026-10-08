@@ -329,6 +329,13 @@ namespace vk
 				flush_length = std::min(max_content_size, available_tile_size);
 			}
 
+			// vanillad1: RCB changed (P13.2): VANILLAD1_RCB_TRACE: a readback flush into VANILLAD1_RCB_RANGE (which thread, which frame)
+			if (const auto rsxthr = rsx::get_current_renderer();
+				rsxthr && rsxthr->int_flip_index < rsx::g_vd1_rcb_trace_until.load() && rsx::vd1_rcb_covers(range))
+			{
+				rsx_log.notice("vanillad1: rcb trace f=%llu flush 0x%x+0x%x %s", rsxthr->int_flip_index, range.start, flush_length, thread_ctrl::get_name());
+			}
+
 			if (m_staged_range.valid()) // vanillad1: staged readbacks: exclusions apply
 			{
 				imp_flush_memcpy(m_staged_range.start, static_cast<u8*>(m_staging_map), m_staged_range.length());
