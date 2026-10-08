@@ -1097,6 +1097,22 @@ namespace vk
 
 		if (vd1_rcb)
 		{
+			// vanillad1: RCB keep (P13.1): a write never reloads, but resyncs the memory tag so the surface store's lookup
+			// test() does not drop the surface (the blit overwrites it in full anyway)
+			if (access.is_write())
+			{
+				sync_tag();
+				rsx::g_vd1_rcb.writes++;
+			}
+			else if (access.is_read())
+			{
+				rsx::g_vd1_rcb.reads++;
+				if (rsx::vd1_rcb_in_readback) rsx::g_vd1_rcb.rb_kept++;
+				else if (access == rsx::surface_access::memory_read) rsx::g_vd1_rcb.hk++;
+				if (!last_use_tag) rsx::g_vd1_rcb.tag0++;
+			}
+			rsx::vd1_rcb_tick();
+
 			// only a read that consumes the image reloads it: not the readback to guest memory, not
 			// RPCS3's housekeeping memory_read (unless VANILLAD1_RCB_MODE=any)
 			static u32 s_readbacks = 0, s_housekeeping = 0;
@@ -1110,6 +1126,7 @@ namespace vk
 			else if (access.is_read() && last_use_tag && vd1_rcb_reload_due())
 			{
 				state_flags |= rsx::surface_state_flags::erase_bkgnd;
+				rsx::g_vd1_rcb.reloads++; // vanillad1: RCB keep (P13.1)
 
 				static u32 s_reloads = 0;
 				if (++s_reloads % 600 == 0)

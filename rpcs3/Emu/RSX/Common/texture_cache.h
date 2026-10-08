@@ -2985,6 +2985,14 @@ namespace rsx
 		template <typename surface_store_type, typename RsxTextureType>
 		bool test_if_descriptor_expired(commandbuffer_type& cmd, surface_store_type& surface_cache, sampled_image_descriptor* descriptor, const RsxTextureType& tex)
 		{
+			// vanillad1: RCB keep (P13.1): a sampler over VANILLAD1_RCB_RANGE is re-resolved every draw, so the fetch always goes
+			// upload_texture -> get_merged_texture_memory_region -> memory_barrier(shader_read) (the P13 reload)
+			if (descriptor->ref_address && vd1_rcb_covers(utils::address_range32::start_length(descriptor->ref_address, 1)))
+			{
+				g_vd1_rcb.forced++;
+				return true;
+			}
+
 			auto result = descriptor->is_expired(surface_cache);
 			if (result.second && descriptor->is_cyclic_reference)
 			{
@@ -3520,7 +3528,14 @@ namespace rsx
 				// Surface only exists in main memory.
 				// Now we have a blit write into main memory. This really could be anything, so we need to be careful here.
 				// If we have a pitched write, or a suspiciously large transfer, we likely have a valid write.
-				if (use_null_region = (is_copy_op && !is_format_convert && !is_graphics2d); use_null_region)
+				// vanillad1: RCB keep (P13.1): a destination in VANILLAD1_RCB_RANGE stays a render target (never a dma nul section)
+				const bool vd1_keep = vd1_rcb_covers(utils::address_range32::start_length(dst_address, dst.pitch * dst_h));
+				if (vd1_keep && is_copy_op && !is_format_convert && !is_graphics2d)
+				{
+					g_vd1_rcb.nul_kept++;
+					vd1_rcb_tick();
+				}
+				if (use_null_region = (is_copy_op && !is_format_convert && !is_graphics2d && !vd1_keep); use_null_region)
 				{
 					// Invalidate surfaces in range. Sample tests should catch overlaps in theory.
 					// We only do this for non-2D sections though, since blit_dst targets now live in the surface cache always.

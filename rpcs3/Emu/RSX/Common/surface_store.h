@@ -1381,6 +1381,7 @@ namespace rsx
 					// Delay this as much as possible to avoid side-effects of spamming barrier
 					if (surface->memory_barrier(cmd, access); !surface->test())
 					{
+						if (!is_depth && vd1_rcb_covers(surface->get_memory_range())) g_vd1_rcb.drops++; // vanillad1: RCB keep (P13.1)
 						dirty.emplace_back(range.start, is_depth);
 						continue;
 					}

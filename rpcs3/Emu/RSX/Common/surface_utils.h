@@ -7,6 +7,8 @@
 #include "Emu/Memory/vm.h"
 #include "Emu/system_config.h"
 
+#include <atomic> // vanillad1: RCB keep (P13.1)
+#include <chrono>
 #include <cstdlib> // vanillad1: RCB range (P13)
 #include <string_view>
 #include <utility>
@@ -78,6 +80,34 @@ namespace rsx
 			return any;
 		}();
 		return s_any;
+	}
+
+	// vanillad1: RCB keep (P13.1): counters for the stats line every 10 s (VKRenderTargets.cpp, texture_cache.h, surface_store.h)
+	struct vd1_rcb_counters
+	{
+		std::atomic<u32> reads{0}, writes{0}, reloads{0}, rb_kept{0}, hk{0}, drops{0}, nul_kept{0}, forced{0}, tag0{0};
+	};
+	inline vd1_rcb_counters g_vd1_rcb;
+
+	inline void vd1_rcb_tick()
+	{
+		static std::atomic<s64> s_last{0};
+		const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		s64 last = s_last.load();
+		if (last == 0)
+		{
+			s_last.compare_exchange_strong(last, now);
+			return;
+		}
+		if (now - last < 10000 || !s_last.compare_exchange_strong(last, now))
+		{
+			return;
+		}
+		auto& c = g_vd1_rcb;
+		rsx_log.notice("vanillad1: rcb 10s: reads=%u writes=%u reloads=%u rb_kept=%u hk=%u drops=%u nul_kept=%u forced=%u tag0=%u",
+			c.reads.exchange(0), c.writes.exchange(0), c.reloads.exchange(0), c.rb_kept.exchange(0), c.hk.exchange(0),
+			c.drops.exchange(0), c.nul_kept.exchange(0), c.forced.exchange(0), c.tag0.exchange(0));
 	}
 
 	enum surface_state_flags : u32
