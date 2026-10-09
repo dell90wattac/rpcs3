@@ -61,6 +61,48 @@ namespace rsx
 		return false;
 	}
 
+	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[,<lo>-<hi>...] (hex, hi exclusive, read once). Colour surfaces
+	// overlapping a range follow stock Read Color Buffers (initialised from guest memory, reloaded when the
+	// 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
+	inline bool vd1_rcb_stock_covers(const rsx::address_range32& range)
+	{
+		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* env = std::getenv("VANILLAD1_RCB_STOCK");
+			if (!env || !*env) return out;
+			for (const char* p = env;;)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				u32 hi = 0;
+				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (hi <= lo)
+				{
+					rsx_log.error("vanillad1: VANILLAD1_RCB_STOCK=%s not understood; colour buffers read back as configured", env);
+					out.clear();
+					return out;
+				}
+				out.emplace_back(lo, hi);
+				if (!rest || *rest != ',') break;
+				p = rest + 1;
+			}
+			for (const auto& [lo, hi] : out)
+				rsx_log.notice("vanillad1: colour buffers read back as stock Read Color Buffers for 0x%x-0x%x (VANILLAD1_RCB_STOCK)", lo, hi);
+			return out;
+		}();
+
+		for (const auto& [lo, hi] : s_ranges)
+		{
+			if (range.start < hi && range.end >= lo)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	// vanillad1: RCB range (P13): set while the texture cache copies a surface out to guest memory (VKTextureCache.h
 	// copy_texture, the Write Color Buffers readback): that read must not reload a surface in
 	// VANILLAD1_RCB_RANGE (the SPUs have not lit the fresh blit yet).
@@ -115,6 +157,7 @@ namespace rsx
 		// reloads at a write, first accesses, unsampled surfaces, the band / settle waits
 		std::atomic<u32> up{0}, lo{0}, both{0}, same{0}, again{0}, wr_rl{0}, first{0}, nosamp{0};
 		std::atomic<u32> wait_ok{0}, wait_to{0}, settled{0}, unsettled{0}, wait_us{0};
+		std::atomic<u32> stock_rd{0}, stock_rl{0}; // vanillad1: RCB stock range (P13.2): barriers on VANILLAD1_RCB_STOCK surfaces, reloads
 	};
 	inline vd1_rcb_counters g_vd1_rcb;
 
@@ -143,8 +186,9 @@ namespace rsx
 		rsx_log.notice("vanillad1: rcb 10s changed: up=%u lo=%u both=%u same=%u again=%u wr_rl=%u first=%u nosamp=%u", // vanillad1: RCB changed (P13.2)
 			c.up.exchange(0), c.lo.exchange(0), c.both.exchange(0), c.same.exchange(0), c.again.exchange(0),
 			c.wr_rl.exchange(0), c.first.exchange(0), c.nosamp.exchange(0));
-		rsx_log.notice("vanillad1: rcb 10s waits: wait_ok=%u wait_to=%u settled=%u unsettled=%u wait_ms=%u",
-			c.wait_ok.exchange(0), c.wait_to.exchange(0), c.settled.exchange(0), c.unsettled.exchange(0), c.wait_us.exchange(0) / 1000);
+		rsx_log.notice("vanillad1: rcb 10s waits: wait_ok=%u wait_to=%u settled=%u unsettled=%u wait_ms=%u stock_rd=%u stock_rl=%u",
+			c.wait_ok.exchange(0), c.wait_to.exchange(0), c.settled.exchange(0), c.unsettled.exchange(0), c.wait_us.exchange(0) / 1000,
+			c.stock_rd.exchange(0), c.stock_rl.exchange(0)); // stock_*: vanillad1: RCB stock range (P13.2)
 	}
 
 	enum surface_state_flags : u32
@@ -509,7 +553,8 @@ namespace rsx
 
 			return is_depth_surface()
 				? !!g_cfg.video.read_depth_buffer
-				: (!!g_cfg.video.read_color_buffers || (vd1_rcb_covers(get_memory_range()) && vd1_rcb_size_ok(surface_width, surface_height))); // vanillad1: RCB range (P13), size (vanillad1: RCB changed (P13.2))
+				: (!!g_cfg.video.read_color_buffers || (vd1_rcb_covers(get_memory_range()) && vd1_rcb_size_ok(surface_width, surface_height)) || // vanillad1: RCB range (P13), size (vanillad1: RCB changed (P13.2))
+					vd1_rcb_stock_covers(get_memory_range())); // vanillad1: RCB stock range (P13.2)
 		}
 
 #if (ENABLE_SURFACE_CACHE_DEBUG)

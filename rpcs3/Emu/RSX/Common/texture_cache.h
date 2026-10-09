@@ -1574,7 +1574,8 @@ namespace rsx
 			// Confirms that an FBO-backed section is still locked/consistent before we treat it as a valid GPU source or target.
 			static bool validate_fbo_integrity(texture_cache* cache, const utils::address_range32& range, bool is_depth_texture)
 			{
-				const bool will_upload = is_depth_texture ? !!g_cfg.video.read_depth_buffer : !!g_cfg.video.read_color_buffers;
+				const bool will_upload = is_depth_texture ? !!g_cfg.video.read_depth_buffer :
+					(!!g_cfg.video.read_color_buffers || vd1_rcb_stock_covers(range)); // vanillad1: RCB stock range (P13.2)
 				if (!will_upload)
 				{
 					// Give a pass. The data is lost anyway.
