@@ -61,18 +61,23 @@ namespace rsx
 		return false;
 	}
 
-	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][,...] (hex range, hi exclusive,
-	// read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest memory,
-	// reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
-	// vanillad1: RCB stock size (P13.2): <w>x<h> = only surfaces of that size (w = 0: the caller has no size, e.g. validate_fbo_integrity: no
-	// match); init = the creation load only (barrier = true asks for the reload rule: no match).
+	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][:own][:keep][,...] (hex range, hi
+	// exclusive, read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest
+	// memory, reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
+	// vanillad1: RCB stock size (P13.2): <w>x<h> = only surfaces of that size (w = 0: the caller has no size, e.g.
+	// validate_fbo_integrity: no match); init = the creation load only (barrier = true asks for the reload rule: no match).
+	// vanillad1: RCB stock own (P13.3): own = no stock reload from a texture lookup of another address; keep = such a lookup leaves the
+	// surface out instead of invalidating it (vd1_rcb_stock_flags).
 	struct vd1_rcb_stock_entry
 	{
 		u32 lo, hi, w, h;
 		bool init_only;
+		bool own, keep; // vanillad1: RCB stock own (P13.3)
 	};
 
-	inline bool vd1_rcb_stock_covers(const rsx::address_range32& range, u32 w = 0, u32 h = 0, bool barrier = false)
+	enum : u32 { vd1_stock_own = 1, vd1_stock_keep = 2 }; // vanillad1: RCB stock own (P13.3)
+
+	inline const std::vector<vd1_rcb_stock_entry>& vd1_rcb_stock_entries()
 	{
 		static const std::vector<vd1_rcb_stock_entry> s_ranges = []()
 		{
@@ -90,12 +95,16 @@ namespace rsx
 					e.w = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
 					if (rest && (*rest == 'x' || *rest == 'X')) e.h = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
 				}
-				if (rest && std::string_view(rest).substr(0, 5) == ":init")
+				bool bad = false;
+				while (rest && *rest == ':') // vanillad1: RCB stock own (P13.3): the mode flags, any order
 				{
-					e.init_only = true;
-					rest += 5;
+					const std::string_view r(rest);
+					if (r.substr(0, 5) == ":init") { e.init_only = true; rest += 5; }
+					else if (r.substr(0, 4) == ":own") { e.own = true; rest += 4; }
+					else if (r.substr(0, 5) == ":keep") { e.keep = true; rest += 5; }
+					else { bad = true; break; }
 				}
-				if (e.hi <= e.lo || (e.w && !e.h))
+				if (bad || e.hi <= e.lo || (e.w && !e.h))
 				{
 					rsx_log.error("vanillad1: VANILLAD1_RCB_STOCK=%s not understood; colour buffers read back as configured", env);
 					out.clear();
@@ -106,12 +115,17 @@ namespace rsx
 				p = rest + 1;
 			}
 			for (const auto& e : out)
-				rsx_log.notice("vanillad1: colour buffers read back as stock Read Color Buffers for 0x%x-0x%x, size %ux%u (0 = any)%s (VANILLAD1_RCB_STOCK)",
-					e.lo, e.hi, e.w, e.h, e.init_only ? ", the creation load only" : "");
+				rsx_log.notice("vanillad1: colour buffers read back as stock Read Color Buffers for 0x%x-0x%x, size %ux%u (0 = any)%s%s%s (VANILLAD1_RCB_STOCK)",
+					e.lo, e.hi, e.w, e.h, e.init_only ? ", the creation load only" : "",
+					e.own ? ", no reload from another address's lookup" : "", e.keep ? ", kept (not dropped) by another address's lookup" : "");
 			return out;
 		}();
+		return s_ranges;
+	}
 
-		for (const auto& e : s_ranges)
+	inline bool vd1_rcb_stock_covers(const rsx::address_range32& range, u32 w = 0, u32 h = 0, bool barrier = false)
+	{
+		for (const auto& e : vd1_rcb_stock_entries())
 		{
 			if (!(range.start < e.hi && range.end >= e.lo)) continue;
 			if (e.w && (w != e.w || h != e.h)) continue;
@@ -121,6 +135,23 @@ namespace rsx
 
 		return false;
 	}
+
+	// vanillad1: RCB stock own (P13.3): the own / keep flags of the entries covering a surface (range + size)
+	inline u32 vd1_rcb_stock_flags(const rsx::address_range32& range, u32 w, u32 h)
+	{
+		u32 out = 0;
+		for (const auto& e : vd1_rcb_stock_entries())
+		{
+			if (!(range.start < e.hi && range.end >= e.lo)) continue;
+			if (e.w && (w != e.w || h != e.h)) continue;
+			if (e.own) out |= vd1_stock_own;
+			if (e.keep) out |= vd1_stock_keep;
+		}
+		return out;
+	}
+
+	// vanillad1: RCB stock own (P13.3): the address a texture lookup (surface_store.h get_merged_texture_memory_region) is resolving, 0 outside one
+	inline thread_local u32 vd1_lookup_addr = 0;
 
 	// vanillad1: RCB range (P13): set while the texture cache copies a surface out to guest memory (VKTextureCache.h
 	// copy_texture, the Write Color Buffers readback): that read must not reload a surface in
@@ -177,6 +208,7 @@ namespace rsx
 		std::atomic<u32> up{0}, lo{0}, both{0}, same{0}, again{0}, wr_rl{0}, first{0}, nosamp{0};
 		std::atomic<u32> wait_ok{0}, wait_to{0}, settled{0}, unsettled{0}, wait_us{0};
 		std::atomic<u32> stock_rd{0}, stock_rl{0}; // vanillad1: RCB stock range (P13.2): barriers on VANILLAD1_RCB_STOCK surfaces, reloads
+		std::atomic<u32> stock_fg{0}, stock_kept{0}; // vanillad1: RCB stock own (P13.3): foreign barriers that skipped the stock rule (own), surfaces left out (keep)
 	};
 	inline vd1_rcb_counters g_vd1_rcb;
 
@@ -205,9 +237,10 @@ namespace rsx
 		rsx_log.notice("vanillad1: rcb 10s changed: up=%u lo=%u both=%u same=%u again=%u wr_rl=%u first=%u nosamp=%u", // vanillad1: RCB changed (P13.2)
 			c.up.exchange(0), c.lo.exchange(0), c.both.exchange(0), c.same.exchange(0), c.again.exchange(0),
 			c.wr_rl.exchange(0), c.first.exchange(0), c.nosamp.exchange(0));
-		rsx_log.notice("vanillad1: rcb 10s waits: wait_ok=%u wait_to=%u settled=%u unsettled=%u wait_ms=%u stock_rd=%u stock_rl=%u",
+		rsx_log.notice("vanillad1: rcb 10s waits: wait_ok=%u wait_to=%u settled=%u unsettled=%u wait_ms=%u stock_rd=%u stock_rl=%u stock_fg=%u stock_kept=%u",
 			c.wait_ok.exchange(0), c.wait_to.exchange(0), c.settled.exchange(0), c.unsettled.exchange(0), c.wait_us.exchange(0) / 1000,
-			c.stock_rd.exchange(0), c.stock_rl.exchange(0)); // stock_*: vanillad1: RCB stock range (P13.2)
+			c.stock_rd.exchange(0), c.stock_rl.exchange(0), // stock_*: vanillad1: RCB stock range (P13.2)
+			c.stock_fg.exchange(0), c.stock_kept.exchange(0)); // vanillad1: RCB stock own (P13.3)
 	}
 
 	enum surface_state_flags : u32

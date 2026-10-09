@@ -1302,6 +1302,13 @@ namespace rsx
 
 			const auto test_range = utils::address_range32::start_length(texaddr, (required_pitch * required_height) - (required_pitch - required_width_in_bytes));
 
+			// vanillad1: RCB stock own (P13.3): the barriers below know which address this lookup resolves (VANILLAD1_RCB_STOCK :own)
+			struct vd1_lookup_scope
+			{
+				explicit vd1_lookup_scope(u32 a) { vd1_lookup_addr = a; }
+				~vd1_lookup_scope() { vd1_lookup_addr = 0; }
+			} vd1_scope(texaddr);
+
 			auto process_list_function = [&](surface_ranged_map& data, bool is_depth)
 			{
 				for (auto it = data.begin_range(test_range); it != data.end(); ++it)
@@ -1381,6 +1388,14 @@ namespace rsx
 					// Delay this as much as possible to avoid side-effects of spamming barrier
 					if (surface->memory_barrier(cmd, access); !surface->test())
 					{
+						// vanillad1: RCB stock own (P13.3): VANILLAD1_RCB_STOCK :keep: a lookup of another address leaves a changed surface out, not invalidated
+						if (!is_depth && range.start != texaddr &&
+							(vd1_rcb_stock_flags(range, surface->template get_surface_width<rsx::surface_metrics::pixels>(),
+								surface->template get_surface_height<rsx::surface_metrics::pixels>()) & vd1_stock_keep))
+						{
+							g_vd1_rcb.stock_kept++;
+							continue;
+						}
 						if (!is_depth && vd1_rcb_covers(surface->get_memory_range())) g_vd1_rcb.drops++; // vanillad1: RCB keep (P13.1)
 						dirty.emplace_back(range.start, is_depth);
 						continue;

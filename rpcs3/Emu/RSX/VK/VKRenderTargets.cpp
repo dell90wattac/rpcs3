@@ -1213,7 +1213,22 @@ namespace vk
 		// (vd1_rcb_reload_due), not on the frame's first read; VANILLAD1_RCB_SIZE narrows it to one surface size.
 		const bool vd1_rcb = !is_depth && rsx::vd1_rcb_covers(get_memory_range()) && rsx::vd1_rcb_size_ok(surface_width, surface_height);
 		// vanillad1: RCB stock range (P13.2): a colour surface in VANILLAD1_RCB_STOCK (and not in the range above) takes the stock branch below
-		const bool vd1_stock = !is_depth && !vd1_rcb && rsx::vd1_rcb_stock_covers(get_memory_range(), surface_width, surface_height, true); // size, init: vanillad1: RCB stock size (P13.2)
+		const bool vd1_stock_any = !is_depth && !vd1_rcb && rsx::vd1_rcb_stock_covers(get_memory_range(), surface_width, surface_height, true); // size, init: vanillad1: RCB stock size (P13.2)
+		// vanillad1: RCB stock own (P13.3): a texture lookup of another address touches this surface (the 512x312 post target in a lookup of G-buffer A);
+		// an entry with :own takes no stock reload from it
+		const bool vd1_foreign = rsx::vd1_lookup_addr && rsx::vd1_lookup_addr != base_addr;
+		const bool vd1_stock = vd1_stock_any &&
+			!(vd1_foreign && (rsx::vd1_rcb_stock_flags(get_memory_range(), surface_width, surface_height) & rsx::vd1_stock_own));
+		if (vd1_stock_any && !vd1_stock)
+		{
+			rsx::g_vd1_rcb.stock_fg++;
+			if (const auto rsxthr = rsx::get_current_renderer(); rsxthr && vd1_rcb_tracing(rsxthr->int_flip_index))
+			{
+				rsx_log.notice("vanillad1: rcb trace f=%llu d=%u 0x%x %ux%u stock own-skip (lookup 0x%x)",
+					rsxthr->int_flip_index, rsxthr->get_stats().draw_calls, base_addr,
+					static_cast<u32>(surface_width), static_cast<u32>(surface_height), rsx::vd1_lookup_addr);
+			}
+		}
 		const bool read_buffers_config = is_depth ? !!g_cfg.video.read_depth_buffer : (!!g_cfg.video.read_color_buffers || vd1_rcb || vd1_stock);
 		const bool should_read_buffers = (state_flags & rsx::surface_state_flags::force_data_load) || read_buffers_config;
 
@@ -1299,10 +1314,10 @@ namespace vk
 				if (state_flags & rsx::surface_state_flags::erase_bkgnd) rsx::g_vd1_rcb.stock_rl++;
 				if (const auto rsxthr = rsx::get_current_renderer(); rsxthr && vd1_rcb_tracing(rsxthr->int_flip_index))
 				{
-					rsx_log.notice("vanillad1: rcb trace f=%llu d=%u 0x%x %ux%u stock%s",
+					rsx_log.notice("vanillad1: rcb trace f=%llu d=%u 0x%x %ux%u stock%s%s", // foreign: vanillad1: RCB stock own (P13.3)
 						rsxthr->int_flip_index, rsxthr->get_stats().draw_calls, base_addr,
 						static_cast<u32>(surface_width), static_cast<u32>(surface_height),
-						(state_flags & rsx::surface_state_flags::erase_bkgnd) ? " RELOAD" : "");
+						(state_flags & rsx::surface_state_flags::erase_bkgnd) ? " RELOAD" : "", vd1_foreign ? " foreign" : "");
 				}
 			}
 		}
