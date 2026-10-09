@@ -68,7 +68,8 @@ jobs:
   Linux_Build:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage)
+    if: github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')
     strategy:
       fail-fast: false
       matrix:
@@ -162,7 +163,8 @@ jobs:
   Mac_Build:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage)
+    if: github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')
     strategy:
       fail-fast: false
       matrix:
@@ -381,7 +383,8 @@ jobs:
   Windows_Build_Test:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage)
+    if: github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')
     name: RPCS3 Windows Unit Test
     runs-on: windows-2025-vs2026
     env:
@@ -470,7 +473,8 @@ jobs:
   Windows_Build_Clang:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage)
+    if: github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')
     strategy:
       fail-fast: false
       matrix:
@@ -580,7 +584,8 @@ jobs:
   FreeBSD_Build:
       # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage)
+    if: github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')
     name: RPCS3 FreeBSD 
     runs-on: ubuntu-latest
     timeout-minutes: 60
