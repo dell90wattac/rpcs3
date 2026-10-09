@@ -61,43 +61,62 @@ namespace rsx
 		return false;
 	}
 
-	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[,<lo>-<hi>...] (hex, hi exclusive, read once). Colour surfaces
-	// overlapping a range follow stock Read Color Buffers (initialised from guest memory, reloaded when the
-	// 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
-	inline bool vd1_rcb_stock_covers(const rsx::address_range32& range)
+	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][,...] (hex range, hi exclusive,
+	// read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest memory,
+	// reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
+	// vanillad1: RCB stock size (P13.2): <w>x<h> = only surfaces of that size (w = 0: the caller has no size, e.g. validate_fbo_integrity: no
+	// match); init = the creation load only (barrier = true asks for the reload rule: no match).
+	struct vd1_rcb_stock_entry
 	{
-		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		u32 lo, hi, w, h;
+		bool init_only;
+	};
+
+	inline bool vd1_rcb_stock_covers(const rsx::address_range32& range, u32 w = 0, u32 h = 0, bool barrier = false)
+	{
+		static const std::vector<vd1_rcb_stock_entry> s_ranges = []()
 		{
-			std::vector<std::pair<u32, u32>> out;
+			std::vector<vd1_rcb_stock_entry> out;
 			const char* env = std::getenv("VANILLAD1_RCB_STOCK");
 			if (!env || !*env) return out;
 			for (const char* p = env;;)
 			{
 				char* rest = nullptr;
-				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
-				u32 hi = 0;
-				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
-				if (hi <= lo)
+				vd1_rcb_stock_entry e{};
+				e.lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				if (rest && *rest == '-') e.hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (rest && *rest == ':' && rest[1] >= '0' && rest[1] <= '9')
+				{
+					e.w = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
+					if (rest && (*rest == 'x' || *rest == 'X')) e.h = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
+				}
+				if (rest && std::string_view(rest).substr(0, 5) == ":init")
+				{
+					e.init_only = true;
+					rest += 5;
+				}
+				if (e.hi <= e.lo || (e.w && !e.h))
 				{
 					rsx_log.error("vanillad1: VANILLAD1_RCB_STOCK=%s not understood; colour buffers read back as configured", env);
 					out.clear();
 					return out;
 				}
-				out.emplace_back(lo, hi);
+				out.push_back(e);
 				if (!rest || *rest != ',') break;
 				p = rest + 1;
 			}
-			for (const auto& [lo, hi] : out)
-				rsx_log.notice("vanillad1: colour buffers read back as stock Read Color Buffers for 0x%x-0x%x (VANILLAD1_RCB_STOCK)", lo, hi);
+			for (const auto& e : out)
+				rsx_log.notice("vanillad1: colour buffers read back as stock Read Color Buffers for 0x%x-0x%x, size %ux%u (0 = any)%s (VANILLAD1_RCB_STOCK)",
+					e.lo, e.hi, e.w, e.h, e.init_only ? ", the creation load only" : "");
 			return out;
 		}();
 
-		for (const auto& [lo, hi] : s_ranges)
+		for (const auto& e : s_ranges)
 		{
-			if (range.start < hi && range.end >= lo)
-			{
-				return true;
-			}
+			if (!(range.start < e.hi && range.end >= e.lo)) continue;
+			if (e.w && (w != e.w || h != e.h)) continue;
+			if (barrier && e.init_only) continue;
+			return true;
 		}
 
 		return false;
@@ -554,7 +573,7 @@ namespace rsx
 			return is_depth_surface()
 				? !!g_cfg.video.read_depth_buffer
 				: (!!g_cfg.video.read_color_buffers || (vd1_rcb_covers(get_memory_range()) && vd1_rcb_size_ok(surface_width, surface_height)) || // vanillad1: RCB range (P13), size (vanillad1: RCB changed (P13.2))
-					vd1_rcb_stock_covers(get_memory_range())); // vanillad1: RCB stock range (P13.2)
+					vd1_rcb_stock_covers(get_memory_range(), surface_width, surface_height)); // vanillad1: RCB stock range (P13.2), size: vanillad1: RCB stock size (P13.2)
 		}
 
 #if (ENABLE_SURFACE_CACHE_DEBUG)
