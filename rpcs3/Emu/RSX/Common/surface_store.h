@@ -329,6 +329,19 @@ namespace rsx
 						continue;
 					}
 
+					// vanillad1: RCB stock noinherit (P13.3): a surface whose VANILLAD1_RCB_STOCK entry says :noinherit is not inherited at another address
+					if (!surface->is_depth_surface() && !new_surface->is_depth_surface())
+					{
+						const u32 fl = vd1_rcb_stock_flags(this_range, surface->template get_surface_width<rsx::surface_metrics::pixels>(),
+							surface->template get_surface_height<rsx::surface_metrics::pixels>());
+						if (fl & vd1_stock_noinherit)
+						{
+							g_vd1_rcb.stock_noinh++;
+							continue;
+						}
+						if (fl) g_vd1_rcb.stock_inh++;
+					}
+
 					result.push_back({ it->first, surface });
 					ensure(it->first == surface->base_addr);
 				}

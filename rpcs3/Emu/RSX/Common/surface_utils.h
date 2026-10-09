@@ -73,9 +73,10 @@ namespace rsx
 		u32 lo, hi, w, h;
 		bool init_only;
 		bool own, keep; // vanillad1: RCB stock own (P13.3)
+		bool noinherit; // vanillad1: RCB stock noinherit (P13.3)
 	};
 
-	enum : u32 { vd1_stock_own = 1, vd1_stock_keep = 2 }; // vanillad1: RCB stock own (P13.3)
+	enum : u32 { vd1_stock_own = 1, vd1_stock_keep = 2, vd1_stock_noinherit = 4 }; // vanillad1: RCB stock own (P13.3), noinherit: vanillad1: RCB stock noinherit (P13.3)
 
 	inline const std::vector<vd1_rcb_stock_entry>& vd1_rcb_stock_entries()
 	{
@@ -102,6 +103,7 @@ namespace rsx
 					if (r.substr(0, 5) == ":init") { e.init_only = true; rest += 5; }
 					else if (r.substr(0, 4) == ":own") { e.own = true; rest += 4; }
 					else if (r.substr(0, 5) == ":keep") { e.keep = true; rest += 5; }
+					else if (r.substr(0, 10) == ":noinherit") { e.noinherit = true; rest += 10; } // vanillad1: RCB stock noinherit (P13.3)
 					else { bad = true; break; }
 				}
 				if (bad || e.hi <= e.lo || (e.w && !e.h))
@@ -118,6 +120,8 @@ namespace rsx
 				rsx_log.notice("vanillad1: colour buffers read back as stock Read Color Buffers for 0x%x-0x%x, size %ux%u (0 = any)%s%s%s (VANILLAD1_RCB_STOCK)",
 					e.lo, e.hi, e.w, e.h, e.init_only ? ", the creation load only" : "",
 					e.own ? ", no reload from another address's lookup" : "", e.keep ? ", kept (not dropped) by another address's lookup" : "");
+			for (const auto& e : out) // vanillad1: RCB stock noinherit (P13.3)
+				if (e.noinherit) rsx_log.notice("vanillad1: 0x%x-0x%x %ux%u: surfaces at other addresses do not inherit its contents (VANILLAD1_RCB_STOCK :noinherit)", e.lo, e.hi, e.w, e.h);
 			return out;
 		}();
 		return s_ranges;
@@ -146,6 +150,7 @@ namespace rsx
 			if (e.w && (w != e.w || h != e.h)) continue;
 			if (e.own) out |= vd1_stock_own;
 			if (e.keep) out |= vd1_stock_keep;
+			if (e.noinherit) out |= vd1_stock_noinherit; // vanillad1: RCB stock noinherit (P13.3)
 		}
 		return out;
 	}
@@ -209,6 +214,7 @@ namespace rsx
 		std::atomic<u32> wait_ok{0}, wait_to{0}, settled{0}, unsettled{0}, wait_us{0};
 		std::atomic<u32> stock_rd{0}, stock_rl{0}; // vanillad1: RCB stock range (P13.2): barriers on VANILLAD1_RCB_STOCK surfaces, reloads
 		std::atomic<u32> stock_fg{0}, stock_kept{0}; // vanillad1: RCB stock own (P13.3): foreign barriers that skipped the stock rule (own), surfaces left out (keep)
+		std::atomic<u32> stock_inh{0}, stock_noinh{0}; // vanillad1: RCB stock noinherit (P13.3): inheritances from a flagged STOCK surface, those skipped
 	};
 	inline vd1_rcb_counters g_vd1_rcb;
 
@@ -241,6 +247,7 @@ namespace rsx
 			c.wait_ok.exchange(0), c.wait_to.exchange(0), c.settled.exchange(0), c.unsettled.exchange(0), c.wait_us.exchange(0) / 1000,
 			c.stock_rd.exchange(0), c.stock_rl.exchange(0), // stock_*: vanillad1: RCB stock range (P13.2)
 			c.stock_fg.exchange(0), c.stock_kept.exchange(0)); // vanillad1: RCB stock own (P13.3)
+		rsx_log.notice("vanillad1: rcb 10s stock: inh=%u noinh=%u", c.stock_inh.exchange(0), c.stock_noinh.exchange(0)); // vanillad1: RCB stock noinherit (P13.3)
 	}
 
 	enum surface_state_flags : u32
