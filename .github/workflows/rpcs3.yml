@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - master # Only trigger push event on 'master' branch
+      - 'p18-*' # vanillad1 (P18): a push builds (no dispatch form needed)
   pull_request:
   workflow_dispatch:
 
