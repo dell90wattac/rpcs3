@@ -22,6 +22,7 @@
 #include "SPUDisAsm.h"
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <optional>
 #include <unordered_set>
 
@@ -886,6 +887,12 @@ void spu_cache::initialize(bool build_existing_cache)
 	auto data_list = g_fxo->get<spu_cache>().precompile_funcs.pop_all();
 	g_fxo->get<spu_cache>().collect_funcs_to_precompile = false;
 
+	// vanillad1 (P18): the selection's program image (before the cache workers start)
+	for (auto& sec : data_list)
+	{
+		spu_recompiler_base::vd1_sel_image(sec.vaddr, sec.inst_data);
+	}
+
 	usz total_precompile = 0;
 
 	for (auto& sec : data_list)
@@ -1085,6 +1092,11 @@ void spu_cache::initialize(bool build_existing_cache)
 					spu_log.notice("[0x%05x] Function: %s", func.entry_point, log);
 					logged_error++;
 				}
+			}
+			else if (compiler->m_vd1_sel = spu_recompiler_base::vd1_sel_program(func2), compiler->m_vd1_sel == 0xff)
+			{
+				// vanillad1 (P18): maybe the selected program: compiled on its first dispatch (with its LS)
+				compiler->m_vd1_sel = 0;
 			}
 			else if (!compile_program(std::move(func2)))
 			{
@@ -2954,8 +2966,206 @@ struct block_reg_info
 	}
 };
 
+// vanillad1 (P18): route chosen SPU functions to another decoder or xfloat mode. Env (read once):
+//   VANILLAD1_SPU_SEL=asmjit|approximate|accurate|relaxed   what the chosen functions get (unset = off)
+//   VANILLAD1_SPU_SEL_RANGE=<lo>-<hi>[,...]                 entry points in [lo, hi) (hex LS; default all)
+//   VANILLAD1_SPU_SEL_SIG=<addr>=<word>[,...]               only while the LS holds these words (hex)
+// The cached functions (no LS at boot) are matched against the precompile section holding the signature
+// (the SPU ELF in the PPU image); without one, those in range compile on their first dispatch instead.
+namespace
+{
+	struct vd1_spu_sel_cfg
+	{
+		u8 mode = 0;
+		std::vector<std::pair<u32, u32>> ranges;
+		std::vector<std::pair<u32, u32>> sig;
+		u32 img_base = 0;
+		std::vector<u32> img; // set once before the cache workers start, read-only after
+
+		static std::vector<std::pair<u32, u32>> parse_pairs(const char* env, char sep)
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* s = std::getenv(env);
+
+			while (s && *s)
+			{
+				char* end = nullptr;
+				const u32 a = static_cast<u32>(std::strtoul(s, &end, 16));
+
+				if (!end || *end != sep)
+				{
+					break;
+				}
+
+				const u32 b = static_cast<u32>(std::strtoul(end + 1, &end, 16));
+				out.emplace_back(a, b);
+				s = (end && *end == ',') ? end + 1 : nullptr;
+			}
+
+			return out;
+		}
+
+		vd1_spu_sel_cfg()
+		{
+			const char* m = std::getenv("VANILLAD1_SPU_SEL");
+
+			if (!m || !*m)
+			{
+				return;
+			}
+
+			const std::string_view mv(m);
+
+			if (mv == "asmjit") mode = 1;
+			else if (mv == "approximate") mode = 2;
+			else if (mv == "accurate") mode = 3;
+			else if (mv == "relaxed") mode = 4;
+			else
+			{
+				spu_log.error("vanillad1: VANILLAD1_SPU_SEL='%s' unknown (asmjit, approximate, accurate, relaxed)", m);
+				return;
+			}
+
+#ifndef ARCH_X64
+			if (mode == 1)
+			{
+				mode = 0;
+				return;
+			}
+#endif
+			ranges = parse_pairs("VANILLAD1_SPU_SEL_RANGE", '-');
+			sig = parse_pairs("VANILLAD1_SPU_SEL_SIG", '=');
+
+			if (ranges.empty())
+			{
+				ranges.emplace_back(0, SPU_LS_SIZE);
+			}
+
+			std::string text;
+
+			for (const auto& [lo, hi] : ranges)
+			{
+				fmt::append(text, " 0x%05x-0x%05x", lo, hi);
+			}
+
+			spu_log.notice("vanillad1: SPU selection: %s for entries in%s, %u signature word(s)", m, text, sig.size());
+		}
+
+		bool in_range(u32 entry) const
+		{
+			for (const auto& [lo, hi] : ranges)
+			{
+				if (entry >= lo && entry < hi)
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+	};
+
+	vd1_spu_sel_cfg& vd1_sel_cfg()
+	{
+		static vd1_spu_sel_cfg s_cfg;
+		return s_cfg;
+	}
+}
+
+u8 spu_recompiler_base::vd1_sel_ls(const be_t<u32>* ls, u32 entry_point)
+{
+	const auto& c = vd1_sel_cfg();
+
+	if (!c.mode || !ls || !c.in_range(entry_point))
+	{
+		return 0;
+	}
+
+	for (const auto& [addr, word] : c.sig)
+	{
+		if (ls[(addr % SPU_LS_SIZE) / 4] != word)
+		{
+			return 0;
+		}
+	}
+
+	return c.mode;
+}
+
+u8 spu_recompiler_base::vd1_sel_program(const spu_program& prog)
+{
+	const auto& c = vd1_sel_cfg();
+
+	if (!c.mode || !c.in_range(prog.entry_point))
+	{
+		return 0;
+	}
+
+	if (c.sig.empty())
+	{
+		return c.mode;
+	}
+
+	if (c.img.empty())
+	{
+		return 0xff;
+	}
+
+	if (prog.lower_bound < c.img_base || prog.entry_point < prog.lower_bound || (prog.lower_bound - c.img_base) / 4 + prog.data.size() > c.img.size())
+	{
+		return 0;
+	}
+
+	// Jump tables are stored rewritten in the program data: most words, and the entry's, must match
+	const usz off = (prog.lower_bound - c.img_base) / 4;
+	usz nonzero = 0, same = 0;
+
+	for (usz i = 0; i < prog.data.size(); i++)
+	{
+		if (prog.data[i])
+		{
+			nonzero++;
+			same += prog.data[i] == c.img[off + i];
+		}
+	}
+
+	const usz ei = (prog.entry_point - prog.lower_bound) / 4;
+
+	if (ei >= prog.data.size() || prog.data[ei] != c.img[off + ei] || same * 4 < nonzero * 3)
+	{
+		return 0;
+	}
+
+	return c.mode;
+}
+
+void spu_recompiler_base::vd1_sel_image(u32 vaddr, const std::vector<u32>& words)
+{
+	auto& c = vd1_sel_cfg();
+
+	if (!c.mode || c.sig.empty() || !c.img.empty())
+	{
+		return;
+	}
+
+	for (const auto& [addr, word] : c.sig)
+	{
+		if (addr < vaddr || (addr - vaddr) / 4 >= words.size() || std::bit_cast<be_t<u32>>(words[(addr - vaddr) / 4]) != word)
+		{
+			return;
+		}
+	}
+
+	c.img_base = vaddr;
+	c.img = words;
+	spu_log.notice("vanillad1: SPU selection: the signature's program found in the precompile data at 0x%05x (%u words)", vaddr, words.size());
+}
+
 spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, std::map<u32, std::vector<u32>>* out_target_list)
 {
+	// vanillad1 (P18): the selection for the next compile()
+	m_vd1_sel = vd1_sel_ls(ls, entry_point);
+
 	// Result: addr + raw instruction data
 	spu_program result;
 	result.data.reserve(10000);
@@ -9108,6 +9318,9 @@ struct spu_llvm_worker
 			}
 			else
 			{
+				// vanillad1 (P18): the selection spu_fast saw with the real LS (the fake LS has no signature)
+				compiler->m_vd1_sel = func.vd1_sel;
+
 #ifdef ARCH_ARM64
 				const auto target = compile_spu_llvm_with_retry(compiler, func2);
 #else
@@ -9388,6 +9601,9 @@ struct spu_fast : public spu_recompiler_base
 #ifndef ARCH_X64
 		fmt::throw_exception("Fast LLVM recompiler is unimplemented for architectures other than X86-64");
 #endif
+
+		// vanillad1 (P18): carry the selection made with the real LS to the LLVM worker
+		_func.vd1_sel = static_cast<u8>(std::exchange(m_vd1_sel, u8{0}) % 0xff);
 
 		const auto add_loc = m_spurt->add_empty(std::move(_func));
 

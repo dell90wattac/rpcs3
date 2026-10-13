@@ -61,6 +61,9 @@ struct spu_program
 	// Program data with intentionally wrong endianness (on LE platform opcode values are swapped)
 	std::vector<u32> data;
 
+	// vanillad1 (P18): the selection seen by spu_fast with the real LS, for the LLVM worker (not compared)
+	u8 vd1_sel = 0;
+
 	bool operator==(const spu_program& rhs) const noexcept;
 
 	bool operator<(const spu_program& rhs) const noexcept;
@@ -880,6 +883,23 @@ public:
 
 	// Get the function data at specified address
 	spu_program analyse(const be_t<u32>* ls, u32 entry_point, std::map<u32, std::vector<u32>>* out_target_list = nullptr);
+
+	// vanillad1 (P18): route chosen SPU functions to another decoder or xfloat mode (VANILLAD1_SPU_SEL*).
+	// Set by analyse() from the LS (entry range + LS signature), consumed by the next compile().
+	// 0 = default, 1 = ASMJIT, 2 = LLVM approximate xfloat, 3 = accurate, 4 = relaxed, 0xff = defer (cache loop).
+	u8 m_vd1_sel = 0;
+
+	// vanillad1 (P18): install over an existing function (spu_fast's) instead of returning it (ASMJIT)
+	bool m_vd1_replace = false;
+
+	// The mode for an entry point in this LS (0 when off, outside the ranges or the signature differs)
+	static u8 vd1_sel_ls(const be_t<u32>* ls, u32 entry_point);
+
+	// The mode for a cached program without its LS: by the image found in the precompile data, else 0xff (defer)
+	static u8 vd1_sel_program(const spu_program& prog);
+
+	// Remember the precompile section that holds the signature (the program's image for vd1_sel_program)
+	static void vd1_sel_image(u32 vaddr, const std::vector<u32>& words);
 
 	// Print analyser internal state
 	void dump(const spu_program& result, std::string& out, u32 block_min = 0, u32 block_max = SPU_LS_SIZE);

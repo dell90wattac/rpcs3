@@ -53,7 +53,7 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
 		return nullptr;
 	}
 
-	if (add_loc->compiled)
+	if (add_loc->compiled && !m_vd1_replace)
 	{
 		return add_loc->compiled;
 	}
@@ -901,7 +901,18 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
 	}
 
 	// Install compiled function pointer
-	const bool added = !add_loc->compiled && add_loc->compiled.compare_and_swap_test(nullptr, fn);
+	// vanillad1 (P18): routed from the LLVM recompiler, replace spu_fast's function like LLVM does
+	bool added = false;
+
+	if (m_vd1_replace && fn)
+	{
+		add_loc->compiled = fn;
+		added = true;
+	}
+	else
+	{
+		added = !add_loc->compiled && add_loc->compiled.compare_and_swap_test(nullptr, fn);
+	}
 
 	// Rebuild trampoline if necessary
 	if (!m_spurt->rebuild_ubertrampoline(func.data[0]))
