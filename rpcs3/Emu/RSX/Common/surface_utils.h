@@ -94,7 +94,11 @@ namespace rsx
 				if (rest && *rest == ':' && rest[1] >= '0' && rest[1] <= '9')
 				{
 					e.w = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
-					if (rest && (*rest == 'x' || *rest == 'X')) e.h = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
+					if (rest && (*rest == 'x' || *rest == 'X'))
+					{
+						if (rest[1] == '*') { e.h = ~0u; rest += 2; } // vanillad1: RCB any height (X242.1): <w>x* = that width, any height
+						else e.h = static_cast<u32>(std::strtoul(rest + 1, &rest, 10));
+					}
 				}
 				bool bad = false;
 				while (rest && *rest == ':') // vanillad1: RCB stock own (P13.3): the mode flags, any order
@@ -132,7 +136,7 @@ namespace rsx
 		for (const auto& e : vd1_rcb_stock_entries())
 		{
 			if (!(range.start < e.hi && range.end >= e.lo)) continue;
-			if (e.w && (w != e.w || h != e.h)) continue;
+			if (e.w && (w != e.w || (e.h != ~0u && h != e.h))) continue; // vanillad1: RCB any height (X242.1)
 			if (barrier && e.init_only) continue;
 			return true;
 		}
@@ -147,7 +151,7 @@ namespace rsx
 		for (const auto& e : vd1_rcb_stock_entries())
 		{
 			if (!(range.start < e.hi && range.end >= e.lo)) continue;
-			if (e.w && (w != e.w || h != e.h)) continue;
+			if (e.w && (w != e.w || (e.h != ~0u && h != e.h))) continue; // vanillad1: RCB any height (X242.1)
 			if (e.own) out |= vd1_stock_own;
 			if (e.keep) out |= vd1_stock_keep;
 			if (e.noinherit) out |= vd1_stock_noinherit; // vanillad1: RCB stock noinherit (P13.3)
@@ -175,7 +179,8 @@ namespace rsx
 			if (!env || !*env) return out;
 			char* rest = nullptr;
 			out.first = static_cast<u32>(std::strtoul(env, &rest, 10));
-			out.second = (rest && (*rest == 'x' || *rest == 'X')) ? static_cast<u32>(std::strtoul(rest + 1, nullptr, 10)) : 0u;
+			out.second = (rest && (*rest == 'x' || *rest == 'X')) ?
+				(rest[1] == '*' ? ~0u : static_cast<u32>(std::strtoul(rest + 1, nullptr, 10))) : 0u; // vanillad1: RCB any height (X242.1): <w>x* = any height
 			if (!out.first || !out.second)
 			{
 				rsx_log.error("vanillad1: VANILLAD1_RCB_SIZE=%s not understood; any size", env);
@@ -185,7 +190,7 @@ namespace rsx
 			rsx_log.notice("vanillad1: colour buffers read back only for %ux%u surfaces (VANILLAD1_RCB_SIZE)", out.first, out.second);
 			return out;
 		}();
-		return !s_size.first || (w == s_size.first && h == s_size.second);
+		return !s_size.first || (w == s_size.first && (s_size.second == ~0u || h == s_size.second)); // vanillad1: RCB any height (X242.1)
 	}
 
 	// vanillad1: RCB range (P13): VANILLAD1_RCB_MODE=any (read once): any read reloads, as build 8631bdf did (A/B only).
