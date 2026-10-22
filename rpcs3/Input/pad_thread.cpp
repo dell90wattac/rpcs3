@@ -24,6 +24,7 @@
 #include "Emu/Io/pad_config.h"
 #include "Emu/System.h"
 #include "Emu/system_config.h"
+#include "Emu/system_utils.hpp" // vanillad1: pad reload flag (X234)
 #include "Emu/RSX/Overlays/HomeMenu/overlay_home_menu.h"
 #include "Emu/RSX/Overlays/overlay_message.h"
 #include "Emu/Cell/lv2/sys_usbd.h"
@@ -560,6 +561,24 @@ void pad_thread::operator()()
 			m_mask_start_press_to_resume = 0;
 			thread_ctrl::wait_for(30'000);
 			continue;
+		}
+
+		// vanillad1: pad reload flag (X234): <config>/input_configs/reload.flag (checked twice a second): delete it and reload the input
+		// configuration as the Pads dialog does (tools/padmode.ps1 -Live writes the profile, then the flag)
+		{
+			static u64 s_vd1_flag_check = 0;
+			const u64 vd1_now = get_system_time();
+			if (vd1_now - s_vd1_flag_check >= 500'000)
+			{
+				s_vd1_flag_check = vd1_now;
+				const std::string vd1_flag = rpcs3::utils::get_input_config_dir() + "reload.flag";
+				if (fs::is_file(vd1_flag))
+				{
+					fs::remove_file(vd1_flag);
+					input_log.success("vanillad1: %s found: reloading the input configuration (pad::reset)", vd1_flag);
+					pad::reset(Emu.GetTitleID());
+				}
+			}
 		}
 
 		// Update variables
