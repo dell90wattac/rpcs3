@@ -24,6 +24,7 @@
 #include "Emu/Io/pad_config.h"
 #include "Emu/System.h"
 #include "Emu/system_config.h"
+#include "Emu/RSX/RSXThread.h" // vanillad1: virtual pad (P17)
 #include "Emu/system_utils.hpp" // vanillad1: pad reload flag (X234)
 #include "Emu/RSX/Overlays/HomeMenu/overlay_home_menu.h"
 #include "Emu/RSX/Overlays/overlay_message.h"
@@ -293,6 +294,103 @@ void pad_thread::SetIntercepted(bool intercepted)
 	}
 }
 
+// vanillad1: virtual pad (P17): VANILLAD1_VPAD=<name>: Player 1's virtual pad, a shared-memory block written by tools/vpad.py
+// (docs in tools/rpcs3/src_patches/pad_vpad.py)
+struct vd1_vpad_block
+{
+	u32 magic, version;
+	u64 flip, polls;
+	u32 buttons;
+	u8 lx, ly, rx, ry;
+	u32 sticks, seq;
+	u64 until_flip;
+	u32 ack_seq, reserved;
+	u64 ack_flip;
+};
+static_assert(sizeof(vd1_vpad_block) == 64);
+constexpr u32 vd1_vpad_magic = 0x31445056;
+
+static vd1_vpad_block* vd1_vpad()
+{
+	static vd1_vpad_block* s_block = []() -> vd1_vpad_block*
+	{
+		const char* env = std::getenv("VANILLAD1_VPAD");
+		if (!env || !*env) return nullptr;
+#ifdef _WIN32
+		const std::string name = std::string("Local\\vanillad1_vpad_") + env;
+		const HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(vd1_vpad_block), name.c_str());
+		if (!h)
+		{
+			input_log.error("vanillad1: VANILLAD1_VPAD: CreateFileMapping(%s) failed (%u)", name, static_cast<u32>(GetLastError()));
+			return nullptr;
+		}
+		auto* b = static_cast<vd1_vpad_block*>(MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(vd1_vpad_block)));
+		if (!b)
+		{
+			input_log.error("vanillad1: VANILLAD1_VPAD: MapViewOfFile(%s) failed (%u)", name, static_cast<u32>(GetLastError()));
+			return nullptr;
+		}
+		if (b->magic != vd1_vpad_magic)
+		{
+			std::memset(b, 0, sizeof(vd1_vpad_block));
+			b->lx = b->ly = b->rx = b->ry = 128;
+			b->version = 1;
+			b->magic = vd1_vpad_magic;
+		}
+		input_log.success("vanillad1: virtual pad on Player 1: shared memory %s (VANILLAD1_VPAD)", name);
+		return b;
+#else
+		input_log.error("vanillad1: VANILLAD1_VPAD=%s: the virtual pad is Windows only", env);
+		return nullptr;
+#endif
+	}();
+	return s_block;
+}
+
+static void vd1_vpad_apply(Pad& pad)
+{
+	vd1_vpad_block* b = vd1_vpad();
+	if (!b) return;
+	volatile vd1_vpad_block* vb = b;
+
+	const auto rsxthr = rsx::get_current_renderer();
+	const u64 flip = rsxthr ? rsxthr->int_flip_index : 0;
+	vb->flip = flip;
+	vb->polls = vb->polls + 1;
+
+	const u32 seq = vb->seq;
+	const u64 until = vb->until_flip;
+	if (!seq || flip >= until) return;
+
+	const u32 buttons = vb->buttons;
+	const u32 sticks = vb->sticks;
+	const u8 lx = vb->lx, ly = vb->ly, rx = vb->rx, ry = vb->ry;
+	if (vb->ack_seq != seq)
+	{
+		vb->ack_flip = flip;
+		vb->ack_seq = seq;
+	}
+
+	for (ButtonExternal& button : pad.m_buttons_external)
+	{
+		const u32 mask = button.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL2 ? (buttons & 0xff)
+			: button.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL1 ? ((buttons >> 8) & 0x1ff) : 0u;
+		if (mask & button.m_outKeyCode)
+		{
+			button.m_pressed = true;
+			button.m_value = 255;
+		}
+	}
+
+	for (AnalogStickExternal& stick : pad.m_sticks_external)
+	{
+		if ((sticks & 1) && stick.m_offset == CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X) stick.m_value = lx;
+		if ((sticks & 1) && stick.m_offset == CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y) stick.m_value = ly;
+		if ((sticks & 2) && stick.m_offset == CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X) stick.m_value = rx;
+		if ((sticks & 2) && stick.m_offset == CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y) stick.m_value = ry;
+	}
+}
+
 void pad_thread::apply_copilots()
 {
 	const auto normalize = [](s32 value)
@@ -390,6 +488,12 @@ void pad_thread::apply_copilots()
 
 			stick.m_value = static_cast<u16>(std::round(std::clamp(accumulated_value * 127.0f + 128.0f, 0.0f, 255.0f)));
 		}
+	}
+
+	// vanillad1: virtual pad (P17): Player 1 takes the virtual pad's buttons and sticks on top
+	if (m_pads[0] && m_pads[0]->is_connected())
+	{
+		vd1_vpad_apply(*m_pads[0]);
 	}
 }
 
