@@ -452,6 +452,8 @@ namespace rsx
 		 * Returns false to tell the HW decoder to perform the operation on the CPU as a fallback when the operation cannot be safely accelerated.
 		 */
 		virtual bool scaled_image_from_memory(const blit_src_info& /*src_info*/, const blit_dst_info& /*dst_info*/, bool /*interpolate*/) { return false; }
+		// vanillad1: GPU lighting (X300.2): NV308A is about to write 0x60606060 to a lighting slot's "G-buffer ready" word
+		virtual void vd1_gpu_light_ready(u32 /*ready_word_ea*/) {}
 
 
 		// Program public "get" handlers

@@ -83,6 +83,13 @@ namespace rsx
 					return;
 				}
 
+				// vanillad1: GPU lighting (X300.2): Destiny's "G-buffer ready" word (one inline word 0x60606060 into main
+				// memory): the backend may light the frame on the GPU and retire the SPU job before the word lands
+				if (count == 1 && fifo_span[0] == 0x60606060u) // the backend checks the address (a slot's ready word)
+				{
+					RSX(ctx)->vd1_gpu_light_ready(dst_address);
+				}
+
 				const auto dst = vm::_ptr<u8>(dst_address);
 				const auto src = reinterpret_cast<const u8*>(fifo_span.data());
 

@@ -311,6 +311,11 @@ protected:
 
 	void do_local_task(rsx::FIFO::state state) override;
 	bool scaled_image_from_memory(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate) override;
+	// vanillad1: GPU lighting (X300.2): VANILLAD1_GPU_LIGHT (VKGSRender.cpp)
+	void vd1_gpu_light_ready(u32 ready_word_ea) override;
+	std::unique_ptr<vk::buffer> m_vd1_gl_readback;
+	std::string m_vd1_gl_spu_file;   // a dump waiting for the SPU's result (written at the next ready word)
+	u32 m_vd1_gl_spu_ea[4]{};        // light target, its pitch, G-buffer A, w | h << 16
 	void notify_tile_unbound(u32 tile) override;
 
 	bool on_access_violation(u32 address, bool is_writing) override;

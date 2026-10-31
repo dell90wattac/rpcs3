@@ -10,6 +10,7 @@
 #include <atomic> // vanillad1: RCB keep (P13.1)
 #include <chrono>
 #include <cstdlib> // vanillad1: RCB range (P13)
+#include <cstring> // vanillad1: GPU lighting (X300.2)
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -22,6 +23,14 @@ namespace rsx
 	// surfaces overlapping a range read colour buffers back whatever Read Color Buffers says: a read
 	// reloads them from guest memory once per frame (VKRenderTargets.cpp) and views converted from
 	// them are never cached (texture_cache.h). Unset / empty / unparsable = false (stock).
+	// vanillad1: GPU lighting (X300.2): with VANILLAD1_GPU_LIGHT set, Destiny's G-buffer A hand-off (0x44813A80, 1024 x 624 x 4)
+	// stays a render target when blitted (the compute pass reads it from the surface cache)
+	inline bool vd1_gpu_light_keep(const rsx::address_range32& range)
+	{
+		static const bool s_on = []() { const char* env = std::getenv("VANILLAD1_GPU_LIGHT"); return env && *env && std::strcmp(env, "0") != 0; }();
+		return s_on && range.overlaps(rsx::address_range32::start_length(0x44813A80u, 4096u * 624u));
+	}
+
 	inline bool vd1_rcb_covers(const rsx::address_range32& range)
 	{
 		static const std::vector<std::pair<u32, u32>> s_ranges = []()

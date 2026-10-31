@@ -3583,7 +3583,8 @@ namespace rsx
 				// Now we have a blit write into main memory. This really could be anything, so we need to be careful here.
 				// If we have a pitched write, or a suspiciously large transfer, we likely have a valid write.
 				// vanillad1: RCB keep (P13.1): a destination in VANILLAD1_RCB_RANGE stays a render target (never a dma nul section)
-				const bool vd1_keep = vd1_rcb_covers(utils::address_range32::start_length(dst_address, dst.pitch * dst_h));
+				const bool vd1_keep = vd1_rcb_covers(utils::address_range32::start_length(dst_address, dst.pitch * dst_h)) ||
+					vd1_gpu_light_keep(utils::address_range32::start_length(dst_address, dst.pitch * dst_h)); // vanillad1: GPU lighting (X300.2)
 				if (vd1_keep && is_copy_op && !is_format_convert && !is_graphics2d)
 				{
 					g_vd1_rcb.nul_kept++;

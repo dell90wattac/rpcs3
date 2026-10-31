@@ -20,6 +20,10 @@
 #include "Emu/RSX/Host/RSXDMAWriter.h"
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 #include "Emu/Memory/vm_locking.h"
+#include "Emu/RSX/Core/RSXReservationLock.hpp" // vanillad1: GPU lighting (X300.2)
+#include "Emu/Cell/timers.hpp" // vanillad1: GPU lighting (X300.2)
+#include <cmath>
+#include <cstring>
 
 #include "../Program/SPIRVCommon.h"
 
@@ -849,6 +853,7 @@ VKGSRender::~VKGSRender()
 
 	// Fallback bindables
 	null_buffer.reset();
+	m_vd1_gl_readback.reset(); // vanillad1: GPU lighting (X300.2)
 	null_buffer_view.reset();
 
 	if (m_current_frame == &m_aux_frame_context)
@@ -3170,4 +3175,374 @@ void VKGSRender::begin_conditional_rendering(const std::vector<rsx::reports::occ
 void VKGSRender::end_conditional_rendering()
 {
 	thread::end_conditional_rendering();
+}
+
+// vanillad1: GPU lighting (X300.2) ---------------------------------------------------------------------------------
+// Destiny's deferred lighting SPU job (spu_deferred_lighting_job, docs/findings/spu_lighting.md) as one Vulkan compute
+// pass, recorded where the RSX writes the frame slot's "G-buffer ready" word (nv308a.cpp).
+// VANILLAD1_GPU_LIGHT: unset / 0 = off (the SPU path); probe = log the slots and surfaces, change nothing;
+// shadow = run the pass into scratch memory only (its GPU cost; the SPUs still light the frame); 1 = the swap: the pass
+// writes the light target (0xCEB60000) and G-buffer A's write-back pair (0x44813A80), and the SPU job is retired
+// (its tile counter set to 831, so the six instances find no tile). A frame that fails a check stays on the SPUs.
+// <config>/vd1_gpu_light_dump.flag (shadow / 1): that frame is lit by the SPUs too; its inputs and the GPU result go to
+// <config>/vd1_gpu_light_<n>.bin, the SPU's light target to <n>_spu.bin at the next ready word (tools/gpulight.py).
+namespace vk
+{
+	struct cs_vd1_gpu_light : compute_task
+	{
+		const vk::buffer* m_buf = nullptr;
+		u32 m_len = 0;
+		std::array<u32, 12> m_pc{};
+
+		cs_vd1_gpu_light()
+		{
+			ssbo_count = 1;
+			use_push_constants = true;
+			push_constants_size = 48;
+
+			create();
+
+			m_src =
+			#include "../Program/GLSLSnippets/VD1GpuLight.glsl"
+			;
+
+			// <config>/vd1_gpu_light.glsl (the same file, R"( )" optional) replaces the built-in shader: no rebuild to try a fix
+			std::string dir = fs::get_config_dir();
+			if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+			if (fs::file f{ dir + "vd1_gpu_light.glsl" })
+			{
+				std::string text = f.to_string();
+				const usz o1 = text.find("R\"(");
+				const usz o2 = text.rfind(")\"");
+				if (o1 != umax && o2 != umax && o2 > o1) text = text.substr(o1 + 3, o2 - o1 - 3);
+				rsx_log.success("vanillad1: gpu light: the shader from %svd1_gpu_light.glsl (%u bytes)", dir, ::size32(text));
+				m_src = std::move(text);
+			}
+
+			const std::pair<std::string_view, std::string> syntax_replace[] =
+			{
+				{ "%vk", "1" },
+			};
+
+			m_src = fmt::replace_all(m_src, syntax_replace);
+		}
+
+		void bind_resources(const vk::command_buffer& cmd) override
+		{
+			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, m_pc.data());
+			m_program->bind_uniform({ *m_buf, 0, m_len }, 0, 0);
+		}
+	};
+}
+
+namespace
+{
+	enum class vd1_gl_mode { off, probe, shadow, on };
+
+	vd1_gl_mode vd1_gl_get_mode()
+	{
+		static const vd1_gl_mode s_mode = []()
+		{
+			const char* env = std::getenv("VANILLAD1_GPU_LIGHT");
+			vd1_gl_mode m = vd1_gl_mode::on;
+			if (!env || !*env || !std::strcmp(env, "0")) m = vd1_gl_mode::off;
+			else if (!std::strcmp(env, "probe")) m = vd1_gl_mode::probe;
+			else if (!std::strcmp(env, "shadow")) m = vd1_gl_mode::shadow;
+			if (m != vd1_gl_mode::off) rsx_log.success("vanillad1: VANILLAD1_GPU_LIGHT=%s: GPU lighting %s", env,
+				m == vd1_gl_mode::probe ? "probe (no change)" : m == vd1_gl_mode::shadow ? "shadow (the GPU pass into scratch, the SPUs light)" : "on (the GPU lights, the SPU job retired)");
+			return m;
+		}();
+		return s_mode;
+	}
+
+	struct vd1_gl_counters
+	{
+		u32 calls = 0, lit = 0, shadow = 0, slot = 0, unfilled = 0, nosurf = 0, badsurf = 0, taken = 0, dumps = 0;
+		u64 last_ms = 0;
+	} s_vd1_gl;
+
+	void vd1_gl_tick()
+	{
+		const u64 now = get_system_time() / 1000;
+		auto& c = s_vd1_gl;
+		if (!c.last_ms) { c.last_ms = now; return; }
+		if (now - c.last_ms < 10000) return;
+		c.last_ms = now;
+		rsx_log.notice("vanillad1: gpu light 10s: ready=%u lit=%u shadow=%u declined: slot=%u unfilled=%u nosurf=%u badsurf=%u taken=%u; dumps=%u",
+			c.calls, c.lit, c.shadow, c.slot, c.unfilled, c.nosurf, c.badsurf, c.taken, c.dumps);
+		c = {}; c.last_ms = now;
+	}
+
+	u32 vd1_be32(u32 ea) { return *vm::get_super_ptr<u32>(ea); }
+	std::string vd1_gl_dir()
+	{
+		std::string dir = fs::get_config_dir();
+		if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+		return dir;
+	}
+	u32 vd1_align(u32 v) { return (v + 255u) & ~255u; }
+}
+
+void VKGSRender::vd1_gpu_light_ready(u32 ea)
+{
+	const vd1_gl_mode mode = vd1_gl_get_mode();
+	if (mode == vd1_gl_mode::off)
+	{
+		return;
+	}
+
+	auto& c = s_vd1_gl;
+	c.calls++;
+	vd1_gl_tick();
+
+	// A dump waiting for the SPU's result: the previous frame's job is done by now (the PPU waited for it before the
+	// draws that sample the target; this frame's job waits for this word)
+	if (!m_vd1_gl_spu_file.empty())
+	{
+		const u32 lt = m_vd1_gl_spu_ea[0], pitch = m_vd1_gl_spu_ea[1], gb = m_vd1_gl_spu_ea[2];
+		const u32 w = m_vd1_gl_spu_ea[3] & 0xffff, h = m_vd1_gl_spu_ea[3] >> 16;
+		fs::file f(m_vd1_gl_spu_file, fs::rewrite);
+		for (u32 y = 0; y < h; y++) f.write(vm::get_super_ptr<u8>(lt + y * pitch), w * 8);
+		f.write(vm::get_super_ptr<u8>(gb), w * h * 4);
+		rsx_log.notice("vanillad1: gpu light: the SPU's result for the dump -> %s", m_vd1_gl_spu_file);
+		m_vd1_gl_spu_file.clear();
+	}
+
+	// The slot: three 0x280-B parameter blocks at 0x019562f0, their ready words at 0x44126c80 + 4k
+	if (ea < 0x44126c80u || ea >= 0x44126c80u + 12 || (ea & 3))
+	{
+		c.slot++;
+		return;
+	}
+	const u32 slot = (ea - 0x44126c80u) / 4;
+	const u32 P = 0x019562f0u + slot * 0x280u;
+	if (vd1_be32(P + 0x48) != ea)
+	{
+		c.slot++;
+		return;
+	}
+	const u32 n = vd1_be32(P + 0x0c), lights_ea = vd1_be32(P + 0x04);
+	const u32 gb_ea = vd1_be32(P + 0x4c), mk_ea = vd1_be32(P + 0x50), z_ea = vd1_be32(P + 0x54), lt_ea = vd1_be32(P + 0x58);
+	const u32 w = vd1_be32(P + 0x64), h = vd1_be32(P + 0x68), lt_pitch = vd1_be32(P + 0x6c);
+	const u32 ctr_ea = vd1_be32(P + 0x70), tab_ea = vd1_be32(P + 0x7c);
+
+	// lighting_params_fill resets the tile counter to -1 for the frame; anything else = not filled yet, or taken
+	if (n == 0 || n > 200 || w != 1024 || h == 0 || h > 624 || (h % 24) || lt_pitch != 8192 || vd1_be32(ctr_ea) != 0xffffffffu)
+	{
+		c.unfilled++;
+		return;
+	}
+
+	static u32 s_probe_logs = 0;
+	const bool log_now = (mode == vd1_gl_mode::probe) && (s_probe_logs < 12 || (c.calls % 600) == 0);
+	if (log_now) s_probe_logs++;
+
+	auto find = [&](u32 addr, u32 pitch, VkFormat fmt, const char* what) -> vk::render_target*
+	{
+		vk::render_target* s = m_rtts.get_surface_at(addr);
+		if (!s)
+		{
+			if (log_now) rsx_log.notice("vanillad1: gpu light probe: slot %u %s 0x%x: no surface", slot, what, addr);
+			c.nosurf++;
+			return nullptr;
+		}
+		const bool ok = !s->is_depth_surface() && s->samples() == 1 && s->format() == fmt &&
+			s->get_surface_width<rsx::surface_metrics::pixels>() == w && s->get_surface_height<rsx::surface_metrics::pixels>() >= h &&
+			s->width() == w && s->height() >= h && s->get_rsx_pitch() == pitch;
+		if (log_now || !ok)
+		{
+			static u32 s_bad_logs = 0;
+			if (log_now || s_bad_logs++ < 20)
+				rsx_log.notice("vanillad1: gpu light %s: slot %u %s 0x%x: %ux%u (image %ux%u) pitch %u fmt %d samples %u depth %d dirty %d -> %s",
+					ok ? "probe" : "surface", slot, what, addr, s->get_surface_width<rsx::surface_metrics::pixels>(), s->get_surface_height<rsx::surface_metrics::pixels>(),
+					s->width(), s->height(), s->get_rsx_pitch(), static_cast<int>(s->format()), s->samples(), s->is_depth_surface(), s->dirty(), ok ? "ok" : "unusable");
+		}
+		if (!ok)
+		{
+			c.badsurf++;
+			return nullptr;
+		}
+		return s;
+	};
+	vk::render_target* zs = find(z_ea, w * 4, VK_FORMAT_B8G8R8A8_UNORM, "depth");
+	vk::render_target* gs = find(gb_ea, w * 4, VK_FORMAT_B8G8R8A8_UNORM, "gbuffer");
+	vk::render_target* ls = find(lt_ea, lt_pitch, VK_FORMAT_R16G16B16A16_SFLOAT, "light");
+	if (!zs || !gs || !ls || mode == vd1_gl_mode::probe)
+	{
+		return;
+	}
+
+	bool dump = false;
+	static u32 s_flag_check = 0;
+	if ((s_flag_check++ % 30) == 0)
+	{
+		const std::string flag = vd1_gl_dir() + "vd1_gpu_light_dump.flag";
+		if (fs::is_file(flag))
+		{
+			fs::remove_file(flag);
+			dump = true;
+		}
+	}
+	const bool swap = (mode == vd1_gl_mode::on) && !dump;
+
+	// The swap: the six SPU instances take tile 832 first and exit (the PPU's waits complete as usual)
+	if (swap)
+	{
+		rsx::reservation_lock<true> lock(ctr_ea, 4);
+		auto& ctr = *vm::get_super_ptr<u32>(ctr_ea);
+		if (ctr != 0xffffffffu)
+		{
+			c.taken++;
+			return;
+		}
+		ctr = 831u;
+	}
+
+	// The scratch layout (bytes): depth, G-buffer A, the 8-bit buffer, the light target, P, lights, table, LUT, [G-buffer A in]
+	const u32 px = w * h;
+	const u32 O_Z = 0, O_G = vd1_align(O_Z + px * 4), O_M = vd1_align(O_G + px * 4), O_L = vd1_align(O_M + px);
+	const u32 O_P = vd1_align(O_L + px * 8), O_LT = vd1_align(O_P + 0x280), O_T = vd1_align(O_LT + n * 240), O_LUT = vd1_align(O_T + 0x9350);
+	const u32 O_G0 = vd1_align(O_LUT + 2048), total = dump ? vd1_align(O_G0 + px * 4) : O_G0;
+
+	auto* cmd = m_current_command_buffer;
+	for (vk::render_target* s : { zs, gs, ls })
+	{
+		s->read_barrier(*cmd);
+	}
+
+	vk::buffer* sb = vk::get_scratch_buffer(*cmd, total, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	auto region = [&](vk::render_target* s, u32 off)
+	{
+		VkBufferImageCopy r{};
+		r.bufferOffset = off;
+		r.bufferRowLength = w;
+		r.bufferImageHeight = h;
+		r.imageSubresource = { s->aspect(), 0, 0, 1 };
+		r.imageExtent = { w, h, 1 };
+		return r;
+	};
+	for (auto [s, off] : { std::pair{ zs, O_Z }, std::pair{ gs, O_G }, std::pair{ ls, O_L } })
+	{
+		s->push_layout(*cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		vk::copy_image_to_buffer(*cmd, s, sb, region(s, off));
+		s->pop_layout(*cmd);
+	}
+
+	// Guest memory through the unprotected view: P, the lights, the static table (byte-swapped to host words), the 8-bit
+	// buffer (bytes; the RSX wrote it with NV0039 earlier in this FIFO), the LUT the job builds from P+0x16c / +0x1cc
+	auto& up = *vk::get_upload_heap();
+	const u32 U_P = 0, U_LT = vd1_align(0x280), U_T = vd1_align(U_LT + n * 240), U_LUT = vd1_align(U_T + 0x9350), U_M = vd1_align(U_LUT + 2048);
+	const u32 up_len = U_M + px;
+	const usz up_off = up.alloc<256>(up_len);
+	u8* dst = up.map<u8>(up_off, up_len);
+	auto swap_words = [&](u32 to, u32 from, u32 bytes)
+	{
+		const auto* src = vm::get_super_ptr<u32>(from);
+		u32* out = reinterpret_cast<u32*>(dst + to);
+		for (u32 i = 0; i < bytes / 4; i++) out[i] = src[i];
+	};
+	swap_words(U_P, P, 0x280);
+	swap_words(U_LT, lights_ea, n * 240);
+	swap_words(U_T, tab_ea, 0x9350);
+	{
+		const auto* pf = vm::get_super_ptr<f32>(P);
+		const f32 p16c = pf[0x16c / 4], p1cc = pf[0x1cc / 4];
+		f32* lut = reinterpret_cast<f32*>(dst + U_LUT);
+		for (u32 i = 0; i < 256; i++)
+		{
+			const f32 v = static_cast<f32>(i) / 255.f;
+			const f32 s = std::max(v * v, 1e-4f);
+			lut[i * 2] = std::pow(s, p1cc);
+			lut[i * 2 + 1] = std::pow(s, p16c);
+		}
+	}
+	std::memcpy(dst + U_M, vm::get_super_ptr<u8>(mk_ea), px);
+	up.unmap();
+	if (up.is_dirty())
+	{
+		up.sync(*cmd);
+	}
+	const VkBufferCopy copies[] =
+	{
+		{ up_off + U_P, O_P, 0x280 }, { up_off + U_LT, O_LT, n * 240 }, { up_off + U_T, O_T, 0x9350 },
+		{ up_off + U_LUT, O_LUT, 2048 }, { up_off + U_M, O_M, px },
+	};
+	vkCmdCopyBuffer(*cmd, up.heap->value, sb->value, 5, copies);
+	vk::insert_buffer_memory_barrier(*cmd, sb->value, 0, total, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+	if (dump)
+	{
+		const VkBufferCopy keep_in = { O_G, O_G0, px * 4 };
+		vkCmdCopyBuffer(*cmd, sb->value, sb->value, 1, &keep_in);
+		vk::insert_buffer_memory_barrier(*cmd, sb->value, O_G0, px * 4, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	}
+
+	auto* job = vk::get_compute_task<vk::cs_vd1_gpu_light>();
+	job->m_buf = sb;
+	job->m_len = O_G0;
+	job->m_pc = { O_Z / 4, O_G / 4, O_M / 4, O_L / 4, O_P / 4, O_LT / 4, O_T / 4, n, 3u, O_LUT / 4, 0u, 0u };
+	job->run(*cmd, w / 32, h / 24, 1);
+	vk::insert_buffer_memory_barrier(*cmd, sb->value, 0, total, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+	if (swap)
+	{
+		// The results into the surfaces themselves; marked current so the texture cache samples them with no reload
+		for (auto [s, off] : { std::pair{ gs, O_G }, std::pair{ ls, O_L } })
+		{
+			m_rtts.prepare_transfer_target(*cmd, s, rsx::surface_access::transfer_write);
+			s->push_layout(*cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			vk::copy_buffer_to_image(*cmd, sb, s, region(s, off));
+			s->pop_layout(*cmd);
+			s->on_write(rsx::get_shared_tag());
+			m_texture_cache.notify_surface_changed(s->get_memory_range());
+			std::array<u64, 2> bands{};
+			if (s->vd1_rcb_bands(bands))
+			{
+				s->vd1_seen = bands;   // guest memory is not going to change: the RCB rule must not reload over this
+				s->vd1_seen_valid = true;
+			}
+		}
+		m_samplers_dirty.store(true);
+		c.lit++;
+	}
+	else
+	{
+		c.shadow++;
+	}
+
+	if (dump)
+	{
+		const u32 sizes[] = { px * 4, px * 4, px * 8 };          // depth, G-buffer A out, the light target out
+		const u32 offs[] = { O_Z, O_G, O_L };
+		const u32 dump_len = px * 4 * 2 + px * 8 + px * 4;      // + G-buffer A in
+		if (!m_vd1_gl_readback || m_vd1_gl_readback->size() < dump_len)
+		{
+			m_vd1_gl_readback = std::make_unique<vk::buffer>(*m_device, dump_len, m_device->get_memory_mapping().host_visible_coherent,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
+		}
+		VkBufferCopy rb[4];
+		u32 at = 0;
+		for (int i = 0; i < 3; i++) { rb[i] = { offs[i], at, sizes[i] }; at += sizes[i]; }
+		rb[3] = { O_G0, at, px * 4 };
+		vkCmdCopyBuffer(*cmd, sb->value, m_vd1_gl_readback->value, 4, rb);
+		flush_command_queue(true);
+
+		static u32 s_dump_n = 0;
+		const std::string name = fmt::format("%svd1_gpu_light_%u", vd1_gl_dir(), s_dump_n++);
+		fs::file f(name + ".bin", fs::rewrite);
+		const u32 hdr[16] = { 0x4c314456u /* VD1L */, 1u, w, h, n, slot, static_cast<u32>(int_flip_index), 0x280u, n * 240u, px, px * 4, px * 4, px * 8, px * 4, 0, 0 };
+		f.write(hdr, sizeof(hdr));
+		f.write(vm::get_super_ptr<u8>(P), 0x280);
+		f.write(vm::get_super_ptr<u8>(lights_ea), n * 240);
+		f.write(vm::get_super_ptr<u8>(mk_ea), px);
+		const u8* mapped = static_cast<const u8*>(m_vd1_gl_readback->map(0, dump_len));
+		f.write(mapped, dump_len);   // depth, G-buffer A out, light out, G-buffer A in (host words)
+		m_vd1_gl_readback->unmap();
+		m_vd1_gl_spu_file = name + "_spu.bin";
+		m_vd1_gl_spu_ea[0] = lt_ea; m_vd1_gl_spu_ea[1] = lt_pitch; m_vd1_gl_spu_ea[2] = gb_ea; m_vd1_gl_spu_ea[3] = w | (h << 16);
+		rsx_log.success("vanillad1: gpu light: dump -> %s.bin (slot %u, %u lights, %ux%u)", name, slot, n, w, h);
+		c.dumps++;
+	}
 }
