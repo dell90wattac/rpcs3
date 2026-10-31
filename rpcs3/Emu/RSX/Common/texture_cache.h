@@ -2277,8 +2277,33 @@ namespace rsx
 			if (dimensions_mismatch != nullptr)
 			{
 				auto &tex = *dimensions_mismatch;
-				rsx_log.warning("Cached object for address 0x%X was found, but it does not match stored parameters (width=%d vs %d; height=%d vs %d; depth=%d vs %d; mipmaps=%d vs %d)",
-					range.start, attr.width, tex.get_width(), attr.height, tex.get_height(), attr.depth, tex.get_depth(), attr.mipmaps, tex.get_mipmaps());
+
+				// vanillad1 (X300.3): VANILLAD1_TC_WARN_EVERY=<n> (decimal, read once; unset / 0 / 1 = stock, every time): this
+				// warning only every <n>-th time, with the running count. At the plaza two textures flip size every frame (~51
+				// lines a second): 5 % of the RSX thread, in the logger's heap calls, once the RSX thread paces the frame.
+				static const u32 s_vd1_warn_every = []() -> u32
+				{
+					const char* env = std::getenv("VANILLAD1_TC_WARN_EVERY");
+					const u32 n = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+					if (n > 1) rsx_log.notice("vanillad1: the texture cache's size-mismatch warning every %u times (VANILLAD1_TC_WARN_EVERY)", n);
+					return n;
+				}();
+
+				if (s_vd1_warn_every <= 1)
+				{
+					rsx_log.warning("Cached object for address 0x%X was found, but it does not match stored parameters (width=%d vs %d; height=%d vs %d; depth=%d vs %d; mipmaps=%d vs %d)",
+						range.start, attr.width, tex.get_width(), attr.height, tex.get_height(), attr.depth, tex.get_depth(), attr.mipmaps, tex.get_mipmaps());
+				}
+				else
+				{
+					static atomic_t<u64> s_vd1_warn_count{0};
+
+					if (const u64 vd1_n = s_vd1_warn_count++; vd1_n % s_vd1_warn_every == 0)
+					{
+						rsx_log.warning("Cached object for address 0x%X was found, but it does not match stored parameters (width=%d vs %d; height=%d vs %d; depth=%d vs %d; mipmaps=%d vs %d) (vanillad1: %llu so far)",
+							range.start, attr.width, tex.get_width(), attr.height, tex.get_height(), attr.depth, tex.get_depth(), attr.mipmaps, tex.get_mipmaps(), vd1_n + 1);
+					}
+				}
 			}
 
 			if (!create_if_not_found)
