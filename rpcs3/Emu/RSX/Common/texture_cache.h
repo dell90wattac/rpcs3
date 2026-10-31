@@ -165,6 +165,21 @@ namespace rsx
 		return s_on;
 	}
 
+	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_EAGER=1 (read once): VANILLAD1_FAULT_FAST's ranges are read
+	// back at every speculative point without the predictor and the per-frame cap (and _WB writes those copies back);
+	// unset, the fast path uses the copies stock speculation makes
+	inline bool vd1_fault_fast_eager()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_FAULT_FAST_EAGER");
+			const bool on = env && *env == '1';
+			if (on) rsx_log.notice("vanillad1: eager readback in the VANILLAD1_FAULT_FAST ranges (VANILLAD1_FAULT_FAST_EAGER=1)");
+			return on;
+		}();
+		return s_on;
+	}
+
 	// vanillad1: fault fast path (X300.3): sections the RSX thread wrote back itself (VANILLAD1_FAULT_FAST_WB)
 	inline atomic_t<u64> g_vd1_fault_rsx_wb{0};
 
@@ -2705,7 +2720,9 @@ namespace rsx
 
 			// vanillad1: fault fast path (X300.3): a target in VANILLAD1_FAULT_FAST is read back here regardless of the
 			// predictor and of the per-frame cap, so the CPU access that follows finds a finished copy
-			const bool vd1_eager = vd1_fault_fast_covers(range);
+			// (X300.3: only with VANILLAD1_FAULT_FAST_EAGER=1 too: stock speculation already held a copy for 97 % of the
+			// faults, and the eager copies cost the RSX thread 4.5 % FPS at the plaza)
+			const bool vd1_eager = vd1_fault_fast_eager() && vd1_fault_fast_covers(range);
 
 			if (cur_flushes_this_frame > m_predict_max_flushes_per_frame && !vd1_eager)
 				return false;
