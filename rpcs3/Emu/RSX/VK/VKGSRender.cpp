@@ -907,8 +907,197 @@ VKGSRender::~VKGSRender()
 #endif
 }
 
+// vanillad1: fault stats (X300.3): VANILLAD1_FAULT_STATS=<seconds> (texture_cache.h vd1_fault_stats_secs). Every fault the
+// handler below sees is timed (TSC) and counted by its section (the base; "blk" = the 64 KB block of the address when the
+// texture cache had no section there), access, thread class and job (the SPU profiler's program hash in
+// cpu_thread::block_hash, else "pc" = the SPU's / PPU's pc). Every <seconds> the RSX thread (do_local_task) logs the
+// totals and the 12 rows with the most time as rsx_log warnings "vanillad1 faults: ..." and starts over. Off: one
+// predictable branch per fault and per do_local_task.
+namespace vd1_fault
+{
+	struct key
+	{
+		u32 base;  // section base, or the 64 KB block of the address (flags bit 3)
+		u32 flags; // bit 0 write, bits 1-2 thread (0 other, 1 PPU, 2 SPU, 3 RSX), bit 3 no section
+		u64 job;   // block_hash, else bit 63 | pc (SPU, PPU); 0 for other threads
+
+		bool operator==(const key&) const = default;
+	};
+
+	struct key_hash
+	{
+		usz operator()(const key& k) const noexcept
+		{
+			return static_cast<usz>((k.job * 0x9e3779b97f4a7c15ull) ^ (u64{k.base} << 4) ^ k.flags);
+		}
+	};
+
+	struct value
+	{
+		u64 n = 0, ticks = 0, max_ticks = 0, frames = 0, last_flip = umax;
+		u64 n_flush = 0, hs_ticks = 0, fl_ticks = 0;
+		u64 n_sync = 0, n_bound = 0, n_retag = 0, n_fast = 0, xfers = 0, wbs = 0;
+		u32 size = 0, fmt = 0, w = 0, h = 0, ctx = 0, nsec = 0;
+	};
+
+	static shared_mutex s_mtx;
+	static std::unordered_map<key, value, key_hash> s_map;
+	static atomic_t<u64> s_next{0};
+	static u64 s_last_flip = 0; // RSX thread only
+
+	// The faulting thread, on its way out of VKGSRender::on_access_violation
+	static void record(u32 address, bool is_writing, const vk::texture_cache::thrashed_set& r, bool flushing, bool fast,
+		u64 ticks, u64 hs, u64 fl, u64 flip)
+	{
+		key k{};
+		k.flags = is_writing ? 1u : 0u;
+
+		if (const auto cpu = get_current_cpu_thread())
+		{
+			const thread_class c = cpu->get_class();
+			k.flags |= (c == thread_class::ppu ? 1u : c == thread_class::spu ? 2u : c == thread_class::rsx ? 3u : 0u) << 1;
+
+			if (c == thread_class::spu || c == thread_class::ppu)
+			{
+				k.job = cpu->block_hash ? cpu->block_hash : (1ull << 63) | (cpu->get_pc() & (c == thread_class::spu ? 0x3ffffu : ~0u));
+			}
+		}
+
+		if (r.vd1_base)
+		{
+			k.base = r.vd1_base;
+		}
+		else
+		{
+			k.base = address & ~0xffffu;
+			k.flags |= 1u << 3;
+		}
+
+		std::lock_guard lock(s_mtx);
+		auto& v = s_map[k];
+		v.n++;
+		v.ticks += ticks;
+		v.max_ticks = std::max(v.max_ticks, ticks);
+		v.frames += v.last_flip != flip;
+		v.last_flip = flip;
+		v.n_flush += flushing;
+		v.hs_ticks += hs;
+		v.fl_ticks += fl;
+		v.n_sync += r.vd1_sync;
+		v.n_bound += r.vd1_bound;
+		v.n_retag += r.vd1_retag;
+		v.n_fast += fast;
+		v.xfers += r.vd1_xfer;
+		v.wbs += r.vd1_wb;
+
+		if (r.vd1_base)
+		{
+			v.size = r.vd1_size;
+			v.fmt = r.vd1_fmt;
+			v.w = r.vd1_w;
+			v.h = r.vd1_h;
+			v.ctx = r.vd1_ctx;
+		}
+
+		v.nsec = std::max<u32>(v.nsec, r.vd1_nsec);
+	}
+
+	static const char* ctx_name(u32 ctx)
+	{
+		switch (ctx)
+		{
+		case rsx::texture_upload_context::shader_read: return "shader_read";
+		case rsx::texture_upload_context::blit_engine_src: return "blit_src";
+		case rsx::texture_upload_context::blit_engine_dst: return "blit_dst";
+		case rsx::texture_upload_context::framebuffer_storage: return "fbo";
+		case rsx::texture_upload_context::dma: return "dma";
+		default: return "-";
+		}
+	}
+
+	// The RSX thread (VKGSRender::do_local_task)
+	static void maybe_dump(u64 flip)
+	{
+		const u64 freq = utils::get_tsc_freq() ? utils::get_tsc_freq() : 1'000'000'000;
+		const u64 now = utils::get_tsc();
+		const u64 next = s_next.load();
+
+		if (!next || now < next)
+		{
+			if (!next)
+			{
+				s_next.store(now + freq * rsx::vd1_fault_stats_secs());
+				s_last_flip = flip;
+			}
+
+			return;
+		}
+
+		s_next.store(now + freq * rsx::vd1_fault_stats_secs());
+
+		std::vector<std::pair<key, value>> rows;
+		{
+			std::lock_guard lock(s_mtx);
+			rows.assign(s_map.begin(), s_map.end());
+			s_map.clear();
+		}
+
+		std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+
+		value tot{};
+
+		for (const auto& [k, v] : rows)
+		{
+			tot.n += v.n;
+			tot.ticks += v.ticks;
+			tot.n_flush += v.n_flush;
+			tot.hs_ticks += v.hs_ticks;
+			tot.fl_ticks += v.fl_ticks;
+			tot.n_fast += v.n_fast;
+		}
+
+		// do_update's re-locks (texture_cache.h), the four sections re-locked most
+		std::vector<std::pair<u32, u32>> rearms(rsx::g_vd1_fault_rearm_bases.begin(), rsx::g_vd1_fault_rearm_bases.end());
+		rsx::g_vd1_fault_rearm_bases.clear();
+		std::sort(rearms.begin(), rearms.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::string rearm_top;
+
+		for (usz i = 0; i < rearms.size() && i < 4; i++)
+		{
+			fmt::append(rearm_top, " 0x%08x x%u", rearms[i].first, rearms[i].second);
+		}
+
+		const u64 frames = flip - s_last_flip;
+		s_last_flip = flip;
+		const double ms = 1000.0 / static_cast<double>(freq);
+
+		rsx_log.warning("vanillad1 faults: %u s, %llu frames: %llu faults (%llu flushing, %llu fast), %.1f ms in the handler (handshake %.1f ms, flush %.1f ms); %llu re-locks%s; %u rows",
+			rsx::vd1_fault_stats_secs(), frames, tot.n, tot.n_flush, tot.n_fast, static_cast<double>(tot.ticks) * ms,
+			static_cast<double>(tot.hs_ticks) * ms, static_cast<double>(tot.fl_ticks) * ms, rsx::g_vd1_fault_rearms.exchange(0), rearm_top, ::size32(rows));
+
+		static constexpr const char* s_class[] = { "other", "PPU", "SPU", "RSX" };
+
+		for (usz i = 0; i < rows.size() && i < 12; i++)
+		{
+			const auto& [k, v] = rows[i];
+			const std::string job = !k.job ? std::string("-") : (k.job >> 63) ? fmt::format("pc 0x%05x", k.job & 0xffffffffu) : fmt::format("job %016x", k.job);
+
+			rsx_log.warning("vanillad1 faults: %s 0x%08x %s %s %s: %llu in %llu frames, %.2f ms (max %.0f us); flushing %llu (handshake %.2f ms, flush %.2f ms, "
+				"GPU copies %llu, written back %llu, cache changed %llu), had a copy %llu, bound %llu, fast %llu | %s %ux%u fmt 0x%x size 0x%x, sections <= %u",
+				(k.flags & 8) ? "blk" : "sec", k.base, (k.flags & 1) ? "write" : "read", s_class[(k.flags >> 1) & 3], job,
+				v.n, v.frames, static_cast<double>(v.ticks) * ms, static_cast<double>(v.max_ticks) * ms * 1000.0,
+				v.n_flush, static_cast<double>(v.hs_ticks) * ms, static_cast<double>(v.fl_ticks) * ms, v.xfers, v.wbs, v.n_retag,
+				v.n_sync, v.n_bound, v.n_fast, ctx_name(v.ctx), v.w, v.h, v.fmt, v.size, v.nsec);
+		}
+	}
+}
+
 bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 {
+	// vanillad1: fault stats (X300.3): VANILLAD1_FAULT_STATS (vd1_fault above), the time from here to each return
+	const bool vd1_stats = rsx::vd1_fault_stats_secs() != 0;
+	const u64 vd1_t0 = vd1_stats ? utils::get_tsc() : 0;
+
 	rsx::mm_flush(address);
 
 	vk::texture_cache::thrashed_set result;
@@ -916,6 +1105,29 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 		const rsx::invalidation_cause cause = is_writing ? rsx::invalidation_cause::deferred_write : rsx::invalidation_cause::deferred_read;
 		result = m_texture_cache.invalidate_address(*m_secondary_cb_list.get(), address, cause);
 	}
+
+	// vanillad1: fault stats (X300.3): declared after result, so it records before result goes out of scope
+	struct vd1_scope_t
+	{
+		const vk::texture_cache::thrashed_set* r;
+		bool on;
+		u32 address;
+		bool is_writing;
+		bool flushing;
+		u64 t0;
+		u64 flip;
+		u64 hs = 0;
+		u64 fl = 0;
+		bool fast = false;
+
+		~vd1_scope_t()
+		{
+			if (on) [[unlikely]]
+			{
+				vd1_fault::record(address, is_writing, *r, flushing, fast, utils::get_tsc() - t0, hs, fl, flip);
+			}
+		}
+	} vd1_scope{ &result, vd1_stats, address, is_writing, result.num_flushable > 0, vd1_t0, int_flip_index };
 
 	if (result.invalidate_samplers)
 	{
@@ -948,12 +1160,18 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 				utils::pause();
 			}
 
+			if (vd1_stats) // vanillad1: fault stats (X300.3)
+			{
+				vd1_scope.hs = utils::get_tsc() - vd1_t0;
+			}
+
 			g_fxo->get<rsx::dma_manager>().clear_mem_fault_flag();
 			return true;
 		}
 
 		bool has_queue_ref = false;
 		std::function<void()> data_transfer_completed_callback{};
+		const u64 vd1_t1 = vd1_stats ? utils::get_tsc() : 0; // vanillad1: fault stats (X300.3): the handshake from here
 
 		if (!is_current_thread()) [[likely]]
 		{
@@ -989,7 +1207,14 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			};
 		}
 
+		const u64 vd1_t2 = vd1_stats ? utils::get_tsc() : 0; // vanillad1: fault stats (X300.3): the flush from here
 		m_texture_cache.flush_all(*m_secondary_cb_list.next(), result, data_transfer_completed_callback);
+
+		if (vd1_stats) // vanillad1: fault stats (X300.3)
+		{
+			vd1_scope.hs = vd1_t2 - vd1_t1;
+			vd1_scope.fl = utils::get_tsc() - vd1_t2;
+		}
 
 		if (has_queue_ref)
 		{
@@ -1828,6 +2053,11 @@ void VKGSRender::sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_hi
 
 void VKGSRender::do_local_task(rsx::FIFO::state state)
 {
+	if (rsx::vd1_fault_stats_secs()) [[unlikely]] // vanillad1: fault stats (X300.3)
+	{
+		vd1_fault::maybe_dump(int_flip_index);
+	}
+
 	if (m_queue_status & flush_queue_state::deadlock)
 	{
 		// Clear offloader deadlock

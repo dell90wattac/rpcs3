@@ -63,6 +63,28 @@ namespace rsx
 		return false;
 	}
 
+	// vanillad1: fault stats (X300.3): VANILLAD1_FAULT_STATS=<seconds> (decimal, 1-600, read once; unset / 0 = off). Every
+	// fault VKGSRender::on_access_violation sees is timed and counted by section (VKGSRender.cpp vd1_fault); the RSX thread
+	// logs the totals and the top rows every <seconds> as rsx_log warnings "vanillad1 faults: ...". Here:
+	// invalidate_range_impl_base notes the first section hit (thrashed_set vd1_*), flush_set its GPU copies and
+	// write-backs, flush_all whether the cache changed under the fault, do_update its re-locks of bound targets.
+	inline u32 vd1_fault_stats_secs()
+	{
+		static const u32 s_secs = []() -> u32
+		{
+			const char* env = std::getenv("VANILLAD1_FAULT_STATS");
+			const u32 n = (env && *env) ? std::min<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 600) : 0u;
+			if (n) rsx_log.notice("vanillad1: texture cache fault stats every %u s (VANILLAD1_FAULT_STATS)", n);
+			return n;
+		}();
+		return s_secs;
+	}
+
+	// vanillad1: fault stats (X300.3): do_update's re-locks of bound render targets that lost their protection (a CPU
+	// access flushed them); the count, and per section base (RSX thread only, like the dump that reads it)
+	inline atomic_t<u64> g_vd1_fault_rearms{0};
+	inline std::unordered_map<u32, u32> g_vd1_fault_rearm_bases;
+
 	// vanillad1: WCB only range (P5): VANILLAD1_WCB_ONLY=<lo>-<hi>[,<lo>-<hi>...] (hex, read once). With Write Color
 	// Buffers on, only colour targets overlapping a range are locked and written back; the rest
 	// behave as with WCB off. Unset / unparsable = true for every range (stock). log: RSX thread only.
@@ -169,6 +191,20 @@ namespace rsx
 
 			address_range32 fault_range;
 			address_range32 invalidate_range;
+
+			// vanillad1: fault stats (X300.3): the first section hit and what the flush did (filled with VANILLAD1_FAULT_STATS only)
+			u32 vd1_base = 0;
+			u32 vd1_size = 0;
+			u32 vd1_fmt = 0;
+			u16 vd1_w = 0;
+			u16 vd1_h = 0;
+			u8 vd1_ctx = 0;          // rsx::texture_upload_context of that section
+			u8 vd1_nsec = 0;         // sections to flush + sections to unprotect
+			u8 vd1_xfer = 0;         // GPU copies flush_set recorded (a section with no copy yet)
+			u8 vd1_wb = 0;           // sections whose flush wrote GPU data to guest memory (new data since the lock)
+			bool vd1_sync = false;   // every section to flush already held a readback copy (speculative)
+			bool vd1_bound = false;  // a section to flush is flush_always (a bound render target)
+			bool vd1_retag = false;  // flush_all found the cache changed since the fault and invalidated again
 
 			void clear_sections()
 			{
@@ -951,6 +987,13 @@ namespace rsx
 				}
 			}
 
+			// vanillad1: fault stats (X300.3)
+			const bool vd1_stats = vd1_fault_stats_secs() != 0;
+			if (vd1_stats) [[unlikely]]
+			{
+				data.vd1_xfer = static_cast<u8>(std::min<usz>(255, data.vd1_xfer + sections_to_transfer.size()));
+			}
+
 			if (!sections_to_transfer.empty())
 			{
 				// Batch all hard faults together
@@ -971,6 +1014,12 @@ namespace rsx
 
 			for (auto &surface : data.sections_to_flush)
 			{
+				// vanillad1: fault stats (X300.3): the flush below writes the surface to guest memory (new GPU data since the lock)
+				if (vd1_stats && !surface->is_flushed() && surface->should_flush() && data.vd1_wb < 255) [[unlikely]]
+				{
+					data.vd1_wb++;
+				}
+
 				surface->flush();
 
 				// Exclude this region when flushing other sections that should not trample it
@@ -1453,6 +1502,31 @@ namespace rsx
 			// Check that result makes sense
 			result.check_pre_sanity();
 #endif // TEXTURE_CACHE_DEBUG
+
+			// vanillad1: fault stats (X300.3): the first section this invalidation hit (a flushable one first)
+			if (vd1_fault_stats_secs()) [[unlikely]]
+			{
+				const auto& vd1_v = result.sections_to_flush.empty() ? result.sections_to_unprotect : result.sections_to_flush;
+				if (!vd1_v.empty())
+				{
+					const section_storage_type& vd1_s = *vd1_v.front();
+					result.vd1_base = vd1_s.get_section_base();
+					result.vd1_size = vd1_s.get_section_size();
+					result.vd1_fmt = vd1_s.get_gcm_format();
+					result.vd1_w = vd1_s.get_width();
+					result.vd1_h = vd1_s.get_height();
+					result.vd1_ctx = static_cast<u8>(vd1_s.get_context());
+				}
+
+				result.vd1_nsec = static_cast<u8>(std::min<usz>(255, result.sections_to_flush.size() + result.sections_to_unprotect.size()));
+				result.vd1_sync = !result.sections_to_flush.empty();
+
+				for (const auto* vd1_t : result.sections_to_flush)
+				{
+					result.vd1_sync = result.vd1_sync && vd1_t->is_synchronized();
+					result.vd1_bound = result.vd1_bound || vd1_t->get_memory_read_flags() == memory_read_flags::flush_always;
+				}
+			}
 
 			const bool has_flushables = !result.sections_to_flush.empty();
 			const bool has_unprotectables = !result.sections_to_unprotect.empty();
@@ -2318,7 +2392,12 @@ namespace rsx
 			else
 			{
 				// The cache contents have changed between the two readings. This means the data held is useless
-				invalidate_range_impl_base(cmd, data.fault_range, data.cause.undefer(), on_data_transfer_completed, std::forward<Args>(extras)...);
+				const auto vd1_again = invalidate_range_impl_base(cmd, data.fault_range, data.cause.undefer(), on_data_transfer_completed, std::forward<Args>(extras)...);
+
+				// vanillad1: fault stats (X300.3): what the second reading flushed
+				data.vd1_retag = true;
+				data.vd1_xfer = vd1_again.vd1_xfer;
+				data.vd1_wb = vd1_again.vd1_wb;
 			}
 
 			return true;
@@ -4047,6 +4126,13 @@ namespace rsx
 				ensure(section.exists());
 				AUDIT(section.get_context() == texture_upload_context::framebuffer_storage);
 				AUDIT(section.get_memory_read_flags() == memory_read_flags::flush_always);
+
+				// vanillad1: fault stats (X300.3): a bound target re-locked after something (a CPU fault's flush) unprotected it
+				if (vd1_fault_stats_secs()) [[unlikely]]
+				{
+					g_vd1_fault_rearms++;
+					g_vd1_fault_rearm_bases[section.get_section_base()]++;
+				}
 
 				section.reprotect(utils::protection::no);
 				update_tag = true;
