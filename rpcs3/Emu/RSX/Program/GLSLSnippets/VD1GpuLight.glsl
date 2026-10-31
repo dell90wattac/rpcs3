@@ -55,6 +55,24 @@ vec4 lut8(float k)
 	return LUT8[min(i + 1, 7)] * fr + (1.0 - fr) * LUT8[i];
 }
 
+// 0x08120's pow for the 8-bit buffer's lookup (bit-exact in f32): log2 by a polynomial in the mantissa, then e^x by
+// its Taylor series after an integer split that biases negative exponents by -4 (so ~1 % below pow() at the far end)
+float spu_pow(float s, float p)
+{
+	const int xi = floatBitsToInt(max(s, uintBitsToFloat(0x38d1b717u)));
+	const int e = ((xi >> 23) & 255) - 127;
+	const float f = intBitsToFloat(xi - (e << 23)) - 1.0;
+	const float r34 = f * (f * uintBitsToFloat(0x3ef5162du) + uintBitsToFloat(0xbf389e54u)) + uintBitsToFloat(0x3fb8aa10u);
+	const float r10 = f * (f * (f * (f * uintBitsToFloat(0xbc188b0du) + uintBitsToFloat(0x3d5541c9u)) + uintBitsToFloat(0xbe0cd4fdu))
+		+ uintBitsToFloat(0x3e77adbdu)) + uintBitsToFloat(0xbeb1d206u);
+	const float y = p * (((f * f) * (f * f) * r10 + f * r34) + float(e));
+	const int ei = int(y + (y < 0.0 ? -4.0 : 0.0));
+	const float t = (float(ei) - y) * uintBitsToFloat(0x3f317218u);
+	const float a = t * (t * (t * uintBitsToFloat(0xbe2aaa4fu) + uintBitsToFloat(0x3efffffdu)) - 1.0) + 1.0;
+	const float b = t * (t * (t * uintBitsToFloat(0xb9142e40u) + uintBitsToFloat(0x3aae4f6fu)) + uintBitsToFloat(0xbc08026du)) + uintBitsToFloat(0x3d2aa0e5u);
+	return ldexp((t * t) * (t * t) * b + a, ei);
+}
+
 // 0x0a780 / 0x09588's shared terms: H = normalize(L + V); Cv over sqrt(1 - N.H); Tb from the table; inv = 1/(|L+V|^2 + 0.3)
 void brdf(vec3 N, vec3 V, vec3 L, uint mat, float a, float b, out float Cv, out float Tb, out float inv)
 {
@@ -164,7 +182,8 @@ void main()
 	const float sb = (15.0 - a * 15.0) * TB(8961u + mat * 2u) + TB(8960u + mat * 2u);
 	const float b = sb * sb;
 	const uint mk = (data[o_m + (pix >> 2)] >> (8u * (pix & 3u))) & 255u;
-	const float c = uintBitsToFloat(data[o_lut + mk * 2u]), d = uintBitsToFloat(data[o_lut + mk * 2u + 1u]);
+	const float sm = (float(mk) / 255.0) * (float(mk) / 255.0);
+	const float c = spu_pow(sm, P(0x1ccu)), d = spu_pow(sm, P(0x16cu));   // (o_lut, the CPU's table: no longer read)
 
 	// ---- hemisphere ambient (0x08410) and the sun pair's quad gate
 	const vec3 D = P3(0x1c0u);
