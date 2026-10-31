@@ -30,6 +30,9 @@
 #include <thread>
 #include <shared_mutex>
 #include <span>
+#include <mutex>
+#include <optional>
+#include <bit>
 #include "util/vm.hpp"
 #include "util/asm.hpp"
 #include "util/v128.hpp"
@@ -2827,9 +2830,260 @@ bool spu_thread::do_dma_check(const spu_mfc_cmd& args)
 	return true;
 }
 
+// vanillad1 (X300.3): MFC list statistics and a prefetch for GET lists (both read once, inert unset).
+//   VANILLAD1_DMA_STATS=<seconds>    the list shapes (per job, command, element size, layout), logged every
+//                                    <seconds> as spu_log warnings "vanillad1 dma: ..."; the job is the SPU
+//                                    profiler's program hash (SPU Profiler on), else "pc" = the SPU's pc
+//   VANILLAD1_DMA_PREFETCH=<n>       GET / PUT lists: prefetch each element's source (GET) or destination (PUT,
+//                                    for writing) <n> elements ahead (1-64)
+namespace vd1_dma
+{
+	static u32 env_u32(const char* name, u32 lo, u32 hi)
+	{
+		const char* env = std::getenv(name);
+
+		if (!env || !*env)
+		{
+			return 0;
+		}
+
+		return std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 0)), lo, hi);
+	}
+
+	static const u32 s_stats_secs = env_u32("VANILLAD1_DMA_STATS", 1, 600);
+	static const u32 s_prefetch = env_u32("VANILLAD1_DMA_PREFETCH", 1, 64);
+
+	// shape: bits 0-1 command (1 GET, 2 PUT, 3 other), 2-3 region (1 main, 2 RSX local, 3 mixed or MMIO),
+	// 4-5 layout (0 one element, 1 contiguous, 2 constant stride, 3 other), 6 sizes equal, 7 upstream's
+	// six-element GET fast path applies, 8-23 the element size (the largest when they differ), 24-31 bit
+	// width of the element count, 32-63 the stride (constant-stride lists)
+	struct key
+	{
+		u64 job;
+		u64 shape;
+
+		bool operator==(const key&) const = default;
+	};
+
+	struct key_hash
+	{
+		usz operator()(const key& k) const noexcept
+		{
+			return static_cast<usz>((k.job * 0x9e3779b97f4a7c15ull) ^ k.shape ^ (k.shape >> 29));
+		}
+	};
+
+	struct value
+	{
+		u64 calls = 0, elems = 0, bytes = 0, ticks = 0, stalls = 0;
+	};
+
+	struct table
+	{
+		std::mutex mtx;
+		std::unordered_map<key, value, key_hash> map;
+	};
+
+	static std::mutex s_reg_mtx;
+	static std::vector<std::shared_ptr<table>> s_tables;
+	static atomic_t<u64> s_next_dump{0};
+
+	static table& local_table()
+	{
+		thread_local const std::shared_ptr<table> t = []()
+		{
+			auto p = std::make_shared<table>();
+			std::lock_guard lock(s_reg_mtx);
+			s_tables.push_back(p);
+			return p;
+		}();
+
+		return *t;
+	}
+
+	static void maybe_dump(u64 now)
+	{
+		const u64 freq = utils::get_tsc_freq() ? utils::get_tsc_freq() : 1'000'000'000;
+		const u64 period = freq * s_stats_secs;
+		const u64 next = s_next_dump.load();
+
+		if (!next)
+		{
+			s_next_dump.compare_and_swap(0, now + period);
+			return;
+		}
+
+		if (now < next || !s_next_dump.compare_and_swap_test(next, now + period))
+		{
+			return;
+		}
+
+		std::unordered_map<key, value, key_hash> all;
+		{
+			std::lock_guard lock(s_reg_mtx);
+
+			for (const auto& t : s_tables)
+			{
+				std::lock_guard lock2(t->mtx);
+
+				for (const auto& [k, v] : t->map)
+				{
+					auto& a = all[k];
+					a.calls += v.calls;
+					a.elems += v.elems;
+					a.bytes += v.bytes;
+					a.ticks += v.ticks;
+					a.stalls += v.stalls;
+				}
+
+				t->map.clear();
+			}
+		}
+
+		std::vector<std::pair<key, value>> rows(all.begin(), all.end());
+		std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+
+		value tot;
+
+		for (const auto& [k, v] : rows)
+		{
+			tot.calls += v.calls;
+			tot.elems += v.elems;
+			tot.bytes += v.bytes;
+			tot.ticks += v.ticks;
+		}
+
+		const double ms = 1000.0 / static_cast<double>(freq);
+		spu_log.warning("vanillad1 dma: %u s: %llu lists, %llu elements, %llu KB, %.1f ms in do_list_transfer (%u shapes)",
+			s_stats_secs, tot.calls, tot.elems, tot.bytes / 1024, static_cast<double>(tot.ticks) * ms, static_cast<u32>(rows.size()));
+
+		static constexpr const char* s_cmd[] = {"?", "GET", "PUT", "other"};
+		static constexpr const char* s_region[] = {"?", "main", "local", "mixed"};
+		static constexpr const char* s_layout[] = {"single", "contig", "stride", "scatter"};
+
+		for (usz i = 0; i < rows.size() && i < 16; i++)
+		{
+			const auto& [k, v] = rows[i];
+			const u64 s = k.shape;
+			const bool is_pc = !!(k.job >> 63);
+
+			spu_log.warning("vanillad1 dma: %s %s %s %s %s n<%u %s%u stride 0x%x%s: %llu lists %llu elems %llu KB %.2f ms (%.2f us/list) stalls %llu",
+				is_pc ? "pc" : "job", is_pc ? fmt::format("0x%05x", k.job & 0x3ffff) : fmt::format("%016x", k.job),
+				s_cmd[s & 3], s_region[(s >> 2) & 3], s_layout[(s >> 4) & 3], 1u << ((s >> 24) & 0x1f), (s >> 6) & 1 ? "size " : "max ",
+				static_cast<u32>((s >> 8) & 0xffff), static_cast<u32>(s >> 32), (s >> 7) & 1 ? " fast6" : "", v.calls, v.elems, v.bytes / 1024,
+				static_cast<double>(v.ticks) * ms, static_cast<double>(v.ticks) * ms * 1000.0 / static_cast<double>(std::max<u64>(v.calls, 1)), v.stalls);
+		}
+	}
+
+	// Scans the list (the part this call will run: up to and including the first stall-and-notify element)
+	// on entry and records the time on exit
+	struct recorder
+	{
+		key k{};
+		u64 elems = 0, bytes = 0, stalls = 0, t0 = 0;
+
+		recorder(const spu_thread& spu, const spu_mfc_cmd& args)
+		{
+			const u32 base = args.eal & 0x3fff8;
+			const u32 n_all = std::min<u32>(args.size / 8, (SPU_LS_SIZE - base) / 8);
+			const u8* it = spu.ls + base;
+
+			u32 max_s = 0, first_s = 0, stride = 0, prev_ea = 0, prev_ts = 0;
+			bool eq = true, contig = true, const_stride = true, main = false, local = false, other = false;
+			u32 n = 0;
+
+			for (u32 i = 0; i < n_all; i++)
+			{
+				be_t<u16> ts_be;
+				be_t<u32> ea_be;
+				std::memcpy(&ts_be, it + i * 8 + 2, 2);
+				std::memcpy(&ea_be, it + i * 8 + 4, 4);
+				const u32 ts = ts_be & 0x7fff;
+				const u32 ea = ea_be;
+
+				if (i == 0)
+				{
+					first_s = ts;
+				}
+				else
+				{
+					eq = eq && ts == first_s;
+					contig = contig && ea == prev_ea + prev_ts;
+
+					if (i == 1)
+					{
+						stride = ea - prev_ea;
+					}
+					else
+					{
+						const_stride = const_stride && ea - prev_ea == stride;
+					}
+				}
+
+				max_s = std::max(max_s, ts);
+				(ea >= RAW_SPU_BASE_ADDR ? other : ea >> 28 == rsx::constants::local_mem_base >> 28 ? local : main) = true;
+				bytes += ts;
+				prev_ea = ea;
+				prev_ts = ts;
+				n++;
+
+				if (it[i * 8] & 0x80)
+				{
+					stalls++;
+					break;
+				}
+			}
+
+			elems = n;
+
+			const u32 cmd = args.cmd & ~0xf;
+			const u64 c = cmd == MFC_GET_CMD ? 1 : cmd == MFC_PUT_CMD ? 2 : 3;
+			const u64 region = other || (main && local) ? 3 : local ? 2 : 1;
+			const u64 layout = n <= 1 ? 0 : contig ? 1 : const_stride ? 2 : 3;
+			// upstream's sizes: 0, 1, 2, 4, 8, 16, 32, 48, 64, 128, 256, 512
+			const bool fast_size = first_s <= 128 ? (first_s & (first_s - 1)) == 0 || first_s == 48 : first_s == 256 || first_s == 512;
+			const bool fast6 = c == 1 && eq && !stalls && !other && n >= 6 && fast_size;
+
+			k.job = spu.block_hash ? spu.block_hash : (1ull << 63) | (spu.pc & 0x3ffff);
+			k.shape = c | region << 2 | layout << 4 | u64{eq} << 6 | u64{fast6} << 7 | u64{max_s & 0xffff} << 8 |
+				u64{static_cast<u8>(std::bit_width(n))} << 24 | (layout == 2 ? u64{stride} << 32 : 0);
+			t0 = utils::get_tsc();
+		}
+
+		~recorder()
+		{
+			const u64 t1 = utils::get_tsc();
+			auto& t = local_table();
+			{
+				std::lock_guard lock(t.mtx);
+				auto& v = t.map[k];
+				v.calls++;
+				v.elems += elems;
+				v.bytes += bytes;
+				v.ticks += t1 - t0;
+				v.stalls += stalls;
+			}
+
+			maybe_dump(t1);
+		}
+	};
+}
+
 bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 {
 	perf_meter<"MFC_LIST"_u64> perf0;
+
+	// vanillad1 (X300.3): VANILLAD1_DMA_STATS
+	std::optional<vd1_dma::recorder> vd1_rec;
+
+	if (vd1_dma::s_stats_secs) [[unlikely]]
+	{
+		vd1_rec.emplace(*this, args);
+	}
+
+	// vanillad1 (X300.3): VANILLAD1_DMA_PREFETCH: the first fetch prefetches elements [0, n + 6), each later one
+	// [n, n + 6) ahead of the six it loads, so every element is prefetched once
+	bool vd1_first_fetch = true;
 
 	// Amount of elements to fetch in one go
 	constexpr u32 fetch_size = 6;
@@ -2881,6 +3135,39 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 0], &data0, sizeof(v128));
 			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 1], &data1, sizeof(v128));
 			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 2], &data2, sizeof(v128));
+
+			// vanillad1 (X300.3): VANILLAD1_DMA_PREFETCH
+			if (vd1_dma::s_prefetch && optimization_compatible) [[unlikely]]
+			{
+				const u32 left = arg_size / 8;
+				const u32 end = std::min<u32>(left, vd1_dma::s_prefetch + fetch_size);
+				const bool put = optimization_compatible == MFC_PUT_CMD;
+
+				for (u32 k = vd1_first_fetch ? 0 : vd1_dma::s_prefetch; k < end; k++)
+				{
+					const u32 ea = item_ptr[k].ea;
+
+					if (ea < RAW_SPU_BASE_ADDR)
+					{
+						// a prefetch never faults: a protected or unmapped page is skipped by the CPU
+						const u8* p = vm::_ptr<u8>(ea);
+						const bool two = (ea & 63) + (item_ptr[k].ts & ts_mask) > 64;
+
+						if (put)
+						{
+							utils::prefetch_write(p);
+							if (two) utils::prefetch_write(p + 64);
+						}
+						else
+						{
+							utils::prefetch_read(p);
+							if (two) utils::prefetch_read(p + 64);
+						}
+					}
+				}
+
+				vd1_first_fetch = false;
+			}
 
 			u32 s_size = data0._u32[0];
 
