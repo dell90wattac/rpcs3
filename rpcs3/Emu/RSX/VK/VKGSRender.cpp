@@ -3183,7 +3183,8 @@ void VKGSRender::end_conditional_rendering()
 // VANILLAD1_GPU_LIGHT: unset / 0 = off (the SPU path); probe = log the slots and surfaces, change nothing;
 // shadow = run the pass into scratch memory only (its GPU cost; the SPUs still light the frame); 1 = the swap: the pass
 // writes the light target (0xCEB60000) and G-buffer A's write-back pair (0x44813A80), and the SPU job is retired
-// (its tile counter set to 831, so the six instances find no tile). A frame that fails a check stays on the SPUs.
+// (its tile counter set to the last tile, (w/32)*(h/24)-1: 831 at 1024x624, 639 in a 1024x480 cutscene, so the six
+// instances find no tile; 831 at 480 rows never completed the job: a 2 s RSX self-jump a frame). A frame that fails a check stays on the SPUs.
 // <config>/vd1_gpu_light_dump.flag (shadow / 1): that frame is lit by the SPUs too; its inputs and the GPU result go to
 // <config>/vd1_gpu_light_<n>.bin, the SPU's light target to <n>_spu.bin at the next ready word (tools/gpulight.py).
 namespace vk
@@ -3385,7 +3386,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 	}
 	const bool swap = (mode == vd1_gl_mode::on) && !dump;
 
-	// The swap: the six SPU instances take tile 832 first and exit (the PPU's waits complete as usual)
+	// The swap: the six SPU instances take the tile past the last first and exit (the PPU's waits complete as usual)
 	if (swap)
 	{
 		rsx::reservation_lock<true> lock(ctr_ea, 4);
@@ -3395,7 +3396,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			c.taken++;
 			return;
 		}
-		ctr = 831u;
+		ctr = (w / 32u) * (h / 24u) - 1u;
 	}
 
 	// The scratch layout (bytes): depth, G-buffer A, the 8-bit buffer, the light target, P, lights, table, LUT, [G-buffer A in]
