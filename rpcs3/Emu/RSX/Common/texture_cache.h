@@ -2513,8 +2513,36 @@ namespace rsx
 			AUDIT(data.cause.deferred_flush());
 			AUDIT(!data.flushed);
 
-			if (m_cache_update_tag.load() != data.cache_tag || data.sections_to_flush.empty())
+			if (data.sections_to_flush.empty())
 			{
+				return false;
+			}
+
+			if (m_cache_update_tag.load() != data.cache_tag)
+			{
+				// The SPUs fault together on one surface: another thread's flush got here first (X300.3's stats: 1198 of
+				// 1238 faults). Classify again under the lock: with a deferred cause and nothing flushable left (it was
+				// written back and unprotected), invalidate_range_impl_base unprotects what remains itself and the fault
+				// is handled with no flush request. Something flushable again: hand the fresh classification to the stock path.
+				thrashed_set again = invalidate_range_impl_base(cmd, data.fault_range, data.cause, {}, std::forward<Args>(extras)...);
+
+				if (again.num_flushable == 0)
+				{
+					data.vd1_retag = true;
+					return true;
+				}
+
+				again.vd1_base = data.vd1_base;
+				again.vd1_size = data.vd1_size;
+				again.vd1_fmt = data.vd1_fmt;
+				again.vd1_w = data.vd1_w;
+				again.vd1_h = data.vd1_h;
+				again.vd1_ctx = data.vd1_ctx;
+				again.vd1_nsec = data.vd1_nsec;
+				again.vd1_sync = data.vd1_sync;
+				again.vd1_bound = data.vd1_bound;
+				again.vd1_retag = true;
+				data = std::move(again);
 				return false;
 			}
 
