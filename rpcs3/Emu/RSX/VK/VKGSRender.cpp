@@ -1071,9 +1071,10 @@ namespace vd1_fault
 		s_last_flip = flip;
 		const double ms = 1000.0 / static_cast<double>(freq);
 
-		rsx_log.warning("vanillad1 faults: %u s, %llu frames: %llu faults (%llu flushing, %llu fast), %.1f ms in the handler (handshake %.1f ms, flush %.1f ms); %llu re-locks%s; %u rows",
+		rsx_log.warning("vanillad1 faults: %u s, %llu frames: %llu faults (%llu flushing, %llu fast), %.1f ms in the handler (handshake %.1f ms, flush %.1f ms); %llu re-locks%s; %llu written back by the RSX thread; %u rows",
 			rsx::vd1_fault_stats_secs(), frames, tot.n, tot.n_flush, tot.n_fast, static_cast<double>(tot.ticks) * ms,
-			static_cast<double>(tot.hs_ticks) * ms, static_cast<double>(tot.fl_ticks) * ms, rsx::g_vd1_fault_rearms.exchange(0), rearm_top, ::size32(rows));
+			static_cast<double>(tot.hs_ticks) * ms, static_cast<double>(tot.fl_ticks) * ms, rsx::g_vd1_fault_rearms.exchange(0), rearm_top,
+			rsx::g_vd1_fault_rsx_wb.exchange(0), ::size32(rows));
 
 		static constexpr const char* s_class[] = { "other", "PPU", "SPU", "RSX" };
 
@@ -1167,6 +1168,28 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 
 			g_fxo->get<rsx::dma_manager>().clear_mem_fault_flag();
 			return true;
+		}
+
+		// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST. Every section to flush already holds a readback copy (the
+		// eager copy at unbind) that the GPU has finished, or finishes within VANILLAD1_FAULT_FAST_WAIT_US once submitted:
+		// nothing needs the GPU, so this thread writes it back and unprotects it alone. No flush request: the RSX thread is
+		// neither waited for nor parked, and its command buffer is not submitted early. Anything else: the stock path below.
+		if (!is_current_thread() && rsx::vd1_fault_fast_covers(utils::address_range32::start_length(address, 1)))
+		{
+			const u64 vd1_wait = rsx::vd1_fault_fast_wait_us();
+			const u64 vd1_tf = vd1_stats ? utils::get_tsc() : 0;
+
+			if (m_texture_cache.vd1_flush_all_ready(*m_secondary_cb_list.get(), result,
+				[vd1_wait](vk::cached_texture_section& section) { return section.vd1_copy_done(vd1_wait); }))
+			{
+				if (vd1_stats)
+				{
+					vd1_scope.fl = utils::get_tsc() - vd1_tf;
+				}
+
+				vd1_scope.fast = true;
+				return true;
+			}
 		}
 
 		bool has_queue_ref = false;
@@ -2095,6 +2118,18 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 			//Only call when there are no waiters
 			m_texture_cache.do_update();
 			m_graphics_state.clear(rsx::pipeline_state::framebuffer_reads_dirty);
+		}
+
+		// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WB: eager copies the GPU has finished go to guest memory
+		// now (no flush request is pending here), so the CPU's first access to them does not fault
+		if (rsx::vd1_fault_fast_wb()) [[unlikely]]
+		{
+			if (m_texture_cache.vd1_writeback_ready(*m_current_command_buffer,
+				[](vk::cached_texture_section& section) { return section.vd1_copy_done(0); }))
+			{
+				std::lock_guard lock(m_sampler_mutex);
+				m_samplers_dirty.store(true);
+			}
 		}
 	}
 
@@ -3728,6 +3763,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			s->pop_layout(*cmd);
 			s->on_write(rsx::get_shared_tag());
 			m_texture_cache.notify_surface_changed(s->get_memory_range());
+			m_texture_cache.vd1_drop_copies(s->get_memory_range()); // vanillad1: fault fast path (X300.3): an eager copy is stale now
 			std::array<u64, 2> bands{};
 			if (s->vd1_rcb_bands(bands))
 			{

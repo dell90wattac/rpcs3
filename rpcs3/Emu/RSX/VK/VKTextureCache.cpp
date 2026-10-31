@@ -440,6 +440,7 @@ namespace vk
 
 		synchronized = true;
 		sync_timestamp = rsx::get_shared_tag();
+		m_vd1_copy_eid = vk::current_event_id() + 1; // vanillad1: fault fast path (X300.3): submitted once the counter gets here
 
 		if (staged) // vanillad1: staged readbacks: at most one notice per second, with the running count
 		{

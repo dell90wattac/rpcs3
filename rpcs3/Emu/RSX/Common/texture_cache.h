@@ -85,6 +85,98 @@ namespace rsx
 	inline atomic_t<u64> g_vd1_fault_rearms{0};
 	inline std::unordered_map<u32, u32> g_vd1_fault_rearm_bases;
 
+	// vanillad1: fault fast path (X300.3): a "<lo>-<hi>[,<lo>-<hi>...]" list (hex, hi exclusive) from the environment, read once
+	// by its caller's static; empty when unset or unparsable
+	inline std::vector<std::pair<u32, u32>> vd1_env_ranges(const char* name, const char* what)
+	{
+		std::vector<std::pair<u32, u32>> out;
+		const char* env = std::getenv(name);
+		if (!env || !*env) return out;
+		for (const char* p = env;;)
+		{
+			char* rest = nullptr;
+			const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+			u32 hi = 0;
+			if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+			if (hi <= lo)
+			{
+				rsx_log.error("vanillad1: %s=%s not understood; off", name, env);
+				out.clear();
+				return out;
+			}
+			out.emplace_back(lo, hi);
+			if (!rest || *rest != ',') break;
+			p = rest + 1;
+		}
+		for (const auto& [lo, hi] : out)
+			rsx_log.notice("vanillad1: %s for 0x%x-0x%x (%s)", what, lo, hi, name);
+		return out;
+	}
+
+	inline bool vd1_ranges_overlap(const std::vector<std::pair<u32, u32>>& ranges, const utils::address_range32& range)
+	{
+		for (const auto& [lo, hi] : ranges)
+		{
+			if (range.start < hi && range.end >= lo)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST=<lo>-<hi>[,...]. A flushable section overlapping a range is
+	// read back at every speculative point (unbind in prepare_rtts, after a blit) without the predictor, a GPU write the
+	// cache does not see as a bind drops that copy (a blit into the locked target, the X300.2 lighting pass), and a CPU
+	// fault there whose sections all hold a finished copy is flushed by the faulting thread itself: no flush request, the
+	// RSX thread neither waited for nor parked (VKGSRender::on_access_violation). Unset / unparsable = stock.
+	inline bool vd1_fault_fast_covers(const utils::address_range32& range)
+	{
+		static const auto s_ranges = vd1_env_ranges("VANILLAD1_FAULT_FAST", "eager readback, faults flushed without the RSX thread");
+		return !s_ranges.empty() && vd1_ranges_overlap(s_ranges, range);
+	}
+
+	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WAIT_US=<n> (decimal, read once; default 1000, 0 = never wait):
+	// how long a fault waits for a copy whose command buffer was submitted but has not finished on the GPU, before it falls
+	// back to the stock flush request
+	inline u64 vd1_fault_fast_wait_us()
+	{
+		static const u64 s_us = []() -> u64
+		{
+			const char* env = std::getenv("VANILLAD1_FAULT_FAST_WAIT_US");
+			return (env && *env) ? std::strtoull(env, nullptr, 10) : 1000;
+		}();
+		return s_us;
+	}
+
+	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WB=1 (read once): the RSX thread itself writes an eager copy
+	// in VANILLAD1_FAULT_FAST back to guest memory and unprotects the section once the GPU has finished it, so the CPU
+	// access that follows does not fault at all (VKGSRender::do_local_task)
+	inline bool vd1_fault_fast_wb()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_FAULT_FAST_WB");
+			const bool on = env && *env == '1';
+			if (on) rsx_log.notice("vanillad1: the RSX thread writes finished eager copies back (VANILLAD1_FAULT_FAST_WB=1)");
+			return on;
+		}();
+		return s_on;
+	}
+
+	// vanillad1: fault fast path (X300.3): sections the RSX thread wrote back itself (VANILLAD1_FAULT_FAST_WB)
+	inline atomic_t<u64> g_vd1_fault_rsx_wb{0};
+
+	// vanillad1: no re-lock (X300.3): VANILLAD1_FAULT_NOREARM=<lo>-<hi>[,...]. do_update does not re-lock a bound render
+	// target overlapping a range after a CPU access flushed it (the next draw would otherwise re-arm the fault and the
+	// CPU's next access flush it again); binding it again (prepare_rtts) or a blit locks it as usual. Unset = stock.
+	inline bool vd1_fault_norearm_covers(const utils::address_range32& range)
+	{
+		static const auto s_ranges = vd1_env_ranges("VANILLAD1_FAULT_NOREARM", "bound render targets not re-locked after a CPU flush");
+		return !s_ranges.empty() && vd1_ranges_overlap(s_ranges, range);
+	}
+
 	// vanillad1: WCB only range (P5): VANILLAD1_WCB_ONLY=<lo>-<hi>[,<lo>-<hi>...] (hex, read once). With Write Color
 	// Buffers on, only colour targets overlapping a range are locked and written back; the rest
 	// behave as with WCB off. Unset / unparsable = true for every range (stock). log: RSX thread only.
@@ -836,6 +928,10 @@ namespace rsx
 		//Store of all objects in a flush_always state. A lazy readback is attempted every draw call
 		std::unordered_map<address_range32, section_storage_type*> m_flush_always_cache;
 		u64 m_flush_always_update_timestamp = 0;
+
+		// vanillad1: fault fast path (X300.3): eager copies the RSX thread writes back once done (VANILLAD1_FAULT_FAST_WB);
+		// touched under the exclusive m_cache_mutex, on the RSX thread only
+		std::vector<section_storage_type*> m_vd1_wb_pending;
 
 		//Memory usage
 		const u32 m_max_zombie_objects = 64; //Limit on how many texture objects to keep around for reuse after they are invalidated
@@ -2403,12 +2499,162 @@ namespace rsx
 			return true;
 		}
 
+		// vanillad1: fault fast path (X300.3): flush_all without the RSX thread (VANILLAD1_FAULT_FAST). Taken only when the
+		// cache is as the fault read it and every section to flush already holds a readback copy (synchronized) of an
+		// unbound target (flush_once) in the configured ranges, and no excluded render target needs a resync: then flush_set
+		// records no GPU work, so the RSX thread need not submit its command buffer or park. ready(section) says the copy has
+		// finished on the GPU (it may wait a bounded time for one already submitted). false = nothing done: the stock path.
+		template <typename Ready, typename ...Args>
+		bool vd1_flush_all_ready(commandbuffer_type& cmd, thrashed_set& data, Ready&& ready, Args&&... extras)
+		{
+			vd1_wait_cache_mutex(true);
+			std::lock_guard lock(m_cache_mutex);
+
+			AUDIT(data.cause.deferred_flush());
+			AUDIT(!data.flushed);
+
+			if (m_cache_update_tag.load() != data.cache_tag || data.sections_to_flush.empty())
+			{
+				return false;
+			}
+
+			for (const auto* surface : data.sections_to_flush)
+			{
+				// flush_always: a draw since the copy needs a new one (flush_set would record it); stock path
+				if (!surface->is_synchronized() || surface->get_memory_read_flags() == memory_read_flags::flush_always ||
+					!vd1_fault_fast_covers(surface->get_section_range()))
+				{
+					return false;
+				}
+			}
+
+			for (const auto* excluded : data.sections_to_exclude)
+			{
+				// flush_set would resync this render target from the flushed ones (the surface cache's state): stock path
+				if (excluded->get_context() == texture_upload_context::framebuffer_storage)
+				{
+					return false;
+				}
+			}
+
+			for (auto* surface : data.sections_to_flush)
+			{
+				if (!ready(*surface))
+				{
+					return false;
+				}
+			}
+
+			// No transfer below (every section is synchronized and flush_once): the write-back to guest memory and the unprotect
+			flush_set(cmd, data, {}, std::forward<Args>(extras)...);
+			unprotect_set(data);
+			return true;
+		}
+
+		// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WB. The RSX thread (do_local_task) writes back the eager
+		// copies the GPU has finished and unprotects them, before a CPU access faults on them. Only a section nothing else
+		// overlaps (one section to flush, nothing to transfer, exclude or resync); anything else is left to its fault.
+		// Returns whether samplers must be invalidated.
+		template <typename Ready, typename ...Args>
+		bool vd1_writeback_ready(commandbuffer_type& cmd, Ready&& ready, Args&&... extras)
+		{
+			if (m_vd1_wb_pending.empty())
+			{
+				return false;
+			}
+
+			vd1_wait_cache_mutex(true);
+			std::lock_guard lock(m_cache_mutex);
+
+			bool invalidate_samplers = false;
+
+			for (usz i = 0; i < m_vd1_wb_pending.size();)
+			{
+				section_storage_type& section = *m_vd1_wb_pending[i];
+				const bool live = section.is_locked() && section.is_flushable() && section.is_synchronized() && !section.is_dirty() &&
+					section.get_memory_read_flags() != memory_read_flags::flush_always && vd1_fault_fast_covers(section.get_section_range());
+
+				if (live && !ready(section))
+				{
+					// Still on the GPU: look again at the next local task
+					i++;
+					continue;
+				}
+
+				m_vd1_wb_pending.erase(m_vd1_wb_pending.begin() + i);
+
+				if (!live)
+				{
+					continue;
+				}
+
+				const auto range = section.get_section_range();
+				bool alone = true;
+
+				for (auto It = m_storage.range_begin(range.to_page_range(), locked_range, true); It != m_storage.range_end(); ++It)
+				{
+					if (&(*It) != &section)
+					{
+						alone = false;
+						break;
+					}
+				}
+
+				if (!alone)
+				{
+					continue;
+				}
+
+				// The fault's own path: a deferred read classifies (this section only), flush_set writes it back (no transfer:
+				// synchronized), unprotect_set releases the pages
+				thrashed_set data = invalidate_range_impl_base(cmd, range, invalidation_cause::deferred_read, {}, std::forward<Args>(extras)...);
+
+				if (data.num_flushable > 0)
+				{
+					flush_set(cmd, data, {}, std::forward<Args>(extras)...);
+					unprotect_set(data);
+					invalidate_samplers = invalidate_samplers || data.invalidate_samplers;
+					g_vd1_fault_rsx_wb++;
+				}
+			}
+
+			return invalidate_samplers;
+		}
+
+		// vanillad1: fault fast path (X300.3): a GPU write into a surface that the texture cache does not see as a bind (the
+		// X300.2 lighting pass) makes a readback copy of its locked section stale: drop the copy (the next access reads the
+		// surface again). Not under m_cache_mutex already (the blit path drops its copy inline).
+		void vd1_drop_copies(const address_range32& range)
+		{
+			if (!vd1_fault_fast_covers(range))
+			{
+				return;
+			}
+
+			vd1_wait_cache_mutex(true);
+			std::lock_guard lock(m_cache_mutex);
+
+			for (auto It = m_storage.range_begin(range.to_page_range(), locked_range, true); It != m_storage.range_end(); ++It)
+			{
+				auto& section = *It;
+
+				if (section.is_flushable() && section.is_synchronized())
+				{
+					section.reprotect(utils::protection::no);
+				}
+			}
+		}
+
 		template <typename ...Args>
 		bool flush_if_cache_miss_likely(commandbuffer_type& cmd, const address_range32 &range, Args&&... extras)
 		{
 			u32 cur_flushes_this_frame = (m_flushes_this_frame + m_speculations_this_frame);
 
-			if (cur_flushes_this_frame > m_predict_max_flushes_per_frame)
+			// vanillad1: fault fast path (X300.3): a target in VANILLAD1_FAULT_FAST is read back here regardless of the
+			// predictor and of the per-frame cap, so the CPU access that follows finds a finished copy
+			const bool vd1_eager = vd1_fault_fast_covers(range);
+
+			if (cur_flushes_this_frame > m_predict_max_flushes_per_frame && !vd1_eager)
 				return false;
 
 			auto& block = m_storage.block_for(range);
@@ -2440,19 +2686,38 @@ namespace rsx
 					continue;
 				}
 
-				if (!region.tracked_by_predictor())
-					continue;
+				if (vd1_eager) // vanillad1: fault fast path (X300.3): no predictor; a bound target (flush_always) would be stale at its next draw
+				{
+					if (region.get_memory_read_flags() == memory_read_flags::flush_always)
+						continue;
+				}
+				else
+				{
+					if (!region.tracked_by_predictor())
+						continue;
 
-				if (!m_predictor.predict(region))
-					continue;
+					if (!m_predictor.predict(region))
+						continue;
+				}
 
 				lock.upgrade();
+
+				// vanillad1: fault fast path (X300.3): the upgrade may have let a fault's flush in (copy_texture asserts !synchronized)
+				if (vd1_eager && (region.is_dirty() || region.is_synchronized() || !region.is_flushable()))
+					continue;
 
 				region.copy_texture(cmd, false, std::forward<Args>(extras)...);
 				result = true;
 
+				// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WB: the RSX thread writes it back once the GPU is done
+				if (vd1_eager && vd1_fault_fast_wb() && m_vd1_wb_pending.size() < 16 &&
+					std::find(m_vd1_wb_pending.begin(), m_vd1_wb_pending.end(), &region) == m_vd1_wb_pending.end())
+				{
+					m_vd1_wb_pending.push_back(&region);
+				}
+
 				cur_flushes_this_frame++;
-				if (cur_flushes_this_frame > m_predict_max_flushes_per_frame)
+				if (cur_flushes_this_frame > m_predict_max_flushes_per_frame && !vd1_eager)
 					return result;
 			}
 
@@ -3968,6 +4233,13 @@ namespace rsx
 
 					if (section.matches(test_range))
 					{
+						// vanillad1: fault fast path (X300.3): this blit makes a readback copy of the locked target stale (stock
+						// keeps it: the next CPU read would skip the transfer); drop it in VANILLAD1_FAULT_FAST ranges
+						if (section.is_synchronized() && vd1_fault_fast_covers(section.get_section_range()))
+						{
+							section.reprotect(utils::protection::no);
+						}
+
 						section.touch(m_cache_update_tag);
 						update_cache_tag();
 
@@ -4119,6 +4391,13 @@ namespace rsx
 			{
 				auto& section = *(It.second);
 				if (section.get_protection() == utils::protection::no)
+				{
+					continue;
+				}
+
+				// vanillad1: no re-lock (X300.3): VANILLAD1_FAULT_NOREARM: a CPU access flushed this bound target; it stays
+				// unlocked until it is bound again (prepare_rtts locks it then)
+				if (section.is_flushed() && vd1_fault_norearm_covers(section.get_section_range()))
 				{
 					continue;
 				}

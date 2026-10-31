@@ -10,6 +10,8 @@
 #include "../Common/tiled_dma_copy.hpp"
 #include "../Utils/image_utils.hpp"
 
+#include "util/asm.hpp" // vanillad1: fault fast path (X300.3): utils::get_tsc, utils::pause
+
 #include <memory>
 #include <vector>
 
@@ -46,6 +48,10 @@ namespace vk
 		utils::address_range32 m_staged_range{};
 		vk::render_device* m_device = nullptr;
 		vk::viewable_image* vram_texture = nullptr;
+		// vanillad1: fault fast path (X300.3): vk::current_event_id() + 1 when the readback copy was recorded. The primary
+		// command buffer is tagged (get_event_id) right before its submit and nothing else advances the counter, so once
+		// current_event_id() reaches this, a copy recorded into the primary command buffer has been submitted
+		u64 m_vd1_copy_eid = 0;
 
 	public:
 		using baseclass::cached_texture_section;
@@ -217,6 +223,43 @@ namespace vk
 		{
 			//This memory section was flushable, but a flush has already removed protection
 			return flushed;
+		}
+
+		// vanillad1: fault fast path (X300.3): the readback copy has finished on the GPU (its event is set). With wait_us, a
+		// copy whose command buffer has been submitted is waited for up to wait_us; one not submitted yet is not (only the
+		// RSX thread's flush would submit it: the caller takes the stock flush request). Under the texture cache's lock.
+		bool vd1_copy_done(u64 wait_us) const
+		{
+			if (!synchronized || !dma_fence)
+			{
+				return false;
+			}
+
+			if (dma_fence->status() == VK_EVENT_SET)
+			{
+				return true;
+			}
+
+			if (!wait_us || !m_vd1_copy_eid || vk::current_event_id() < m_vd1_copy_eid)
+			{
+				return false;
+			}
+
+			const u64 freq = utils::get_tsc_freq();
+			const u64 limit = freq ? wait_us * (freq / 1'000'000) : wait_us * 3'000;
+			const u64 t0 = utils::get_tsc();
+
+			while (dma_fence->status() != VK_EVENT_SET)
+			{
+				if (utils::get_tsc() - t0 > limit)
+				{
+					return false;
+				}
+
+				utils::pause();
+			}
+
+			return true;
 		}
 
 		void dma_transfer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, const utils::address_range32& valid_range, u32 pitch);
