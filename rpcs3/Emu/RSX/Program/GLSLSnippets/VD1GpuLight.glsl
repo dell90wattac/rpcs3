@@ -138,10 +138,10 @@ void main()
 	if (li < n_lights)
 	{
 		const uint t = data[o_lt + li * 60u + 51u] >> 24;
-		const float sx = P(0x80u), sy = P(0x94u);
+		const float sx = P(0x80u), sy = P(0x94u), ox = P(0xa0u), oy = P(0xa4u);   // + the projection's off-centre terms
 		const float c0 = float(gl_WorkGroupID.x * 32u), r0 = float(gl_WorkGroupID.y * 24u);
-		const float X0 = ((c0 / float(w)) * 2.0 - 1.0) / sx, X1 = (((c0 + 32.0) / float(w)) * 2.0 - 1.0) / sx;
-		const float Y0 = -(((r0 + 24.0) / float(hh)) * 2.0 - 1.0) / sy, Y1 = -((r0 / float(hh)) * 2.0 - 1.0) / sy;
+		const float X0 = (((c0 / float(w)) * 2.0 - 1.0) + ox) / sx, X1 = ((((c0 + 32.0) / float(w)) * 2.0 - 1.0) + ox) / sx;
+		const float Y0 = (oy - (((r0 + 24.0) / float(hh)) * 2.0 - 1.0)) / sy, Y1 = (oy - ((r0 / float(hh)) * 2.0 - 1.0)) / sy;
 		if (handled(t) && visible(li, t, X0, X1, Y0, Y1, zmin, zmax)) atomicOr(s_vis[li >> 5], 1u << (li & 31u));
 	}
 
@@ -266,6 +266,7 @@ void main()
 		if ((cd & 2u) != 0u) fill_lobe(N, V, mat, a, b, att, l, 28u, kx, ky, acc);
 	}
 
+	if (mat == 9u) { acc.a = 0.0; lo = 0.0; }   // material 9: no specular (every lit dump pixel: the SPU writes 0 in A and the pair's low half)
 	if ((flags & 1u) != 0u)
 	{
 		data[o_l + pix * 2u] = packHalf2x16(vec2(acc.r * 0.25, acc.g * 0.25));
