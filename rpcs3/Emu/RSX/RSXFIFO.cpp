@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 
 #include "Emu/System.h"
 #include "RSXFIFO.h"
@@ -776,6 +777,18 @@ namespace rsx
 
 	void thread::run_FIFO()
 	{
+		// vanillad1: live switch B7 (X302): 0 = the config's accuracy, 1 = Fast, 2 = Atomic. Only with no packet open (the fast
+		// read needs the args pointer read() set); the fetch cache is dropped, and each SPU lock decides on its own.
+		static u32 s_vd1_fifo_live = 0;
+		static rsx_fifo_mode s_vd1_fifo_boot = rsx_fifo_mode::atomic;
+		if (const u32 want = vd1::live(vd1::lf::B7); want != s_vd1_fifo_live && !fifo_ctrl->get_remaining_args_count())
+		{
+			if (!s_vd1_fifo_live) s_vd1_fifo_boot = g_cfg.core.rsx_fifo_accuracy.get();
+			g_cfg.core.rsx_fifo_accuracy.set(want == 1 ? rsx_fifo_mode::fast : want == 2 ? rsx_fifo_mode::atomic : s_vd1_fifo_boot);
+			fifo_ctrl->invalidate_cache();
+			s_vd1_fifo_live = want;
+		}
+
 		FIFO::register_pair command;
 		fifo_ctrl->read(command);
 		const auto cmd = command.reg;
@@ -898,6 +911,12 @@ namespace rsx
 			{
 			case FIFO::FIFO_NOP:
 			{
+				// vanillad1: live switch E27 (X302): on = no timestamp for the game's padding NOPs, which were never idle time
+				if (vd1::live(vd1::lf::E27))
+				{
+					return;
+				}
+
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();

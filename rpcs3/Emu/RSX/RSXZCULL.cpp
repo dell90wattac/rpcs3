@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "Core/RSXEngLock.hpp"
 #include "Core/RSXReservationLock.hpp"
 #include "Host/MM.h"
@@ -429,7 +430,7 @@ namespace rsx
 				return;
 			}
 
-			if (g_cfg.video.relaxed_zcull_sync)
+			if (g_cfg.video.relaxed_zcull_sync || vd1::live(vd1::lf::B1)) // vanillad1: live switch B1 (X302)
 			{
 				update(ptimer, 0, true);
 				return;
@@ -571,7 +572,7 @@ namespace rsx
 					m_next_tsc = m_tsc + min_zcull_tick_us;
 
 					// Schedule a queue flush if needed
-					if (!g_cfg.video.relaxed_zcull_sync && m_critical_reports_in_flight &&
+					if (!g_cfg.video.relaxed_zcull_sync && !vd1::live(vd1::lf::B1) && m_critical_reports_in_flight && // vanillad1: live switch B1 (X302)
 						front.query && front.query->num_draws && front.query->sync_tag > m_sync_tag)
 					{
 						const auto elapsed = m_tsc - front.query->timestamp;

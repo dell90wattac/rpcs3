@@ -949,6 +949,48 @@ namespace vk
 		return result;
 	}
 
+	// vanillad1: LUT on the GPU (X302): an image -> buffer -> image round trip, tightly packed both ways, so the surface's bytes
+	// are read back as the texture's: byte(x, y, z) = (z * h + y) * w + x, in texels. No guest memory, no flush, no wait.
+	vk::image_view* texture_cache::generate_reinterpreted_from_surface(vk::command_buffer& cmd, const deferred_subresource& desc)
+	{
+		vk::image* src = desc.external_handle;
+		auto result = create_temporary_subresource_view_impl(cmd, src, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D,
+			desc.gcm_format, desc.width, desc.height, desc.depth, 1, desc.remap);
+
+		if (!result)
+		{
+			// Failed to create temporary object, bail
+			return nullptr;
+		}
+
+		const auto image = result->image();
+		const u32 texel = vk::get_format_texel_width(src->format());
+		const u32 length = src->width() * src->height() * texel;
+		ensure(texel == vk::get_format_texel_width(image->format()));
+		ensure(length == u32{desc.width} * desc.height * desc.depth * texel);
+
+		auto scratch = vk::get_scratch_buffer(cmd, length, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+		src->push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		VkBufferImageCopy in{};
+		in.imageExtent = { src->width(), src->height(), 1 };
+		in.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		vk::copy_image_to_buffer(cmd, src, scratch, in);
+		src->pop_layout(cmd);
+
+		vk::insert_buffer_memory_barrier(cmd, scratch->value, 0, length, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+		const VkImageSubresourceRange dst_range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		vk::change_image_layout(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dst_range);
+		VkBufferImageCopy out{};
+		out.imageExtent = { desc.width, desc.height, desc.depth };
+		out.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		vk::copy_buffer_to_image(cmd, scratch, image, out);
+		vk::change_image_layout(cmd, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dst_range);
+		return result;
+	}
+
 	vk::image_view* texture_cache::generate_atlas_from_images(vk::command_buffer& cmd, const deferred_subresource& desc)
 	{
 		const auto& sections_to_copy = desc.sections_to_copy;

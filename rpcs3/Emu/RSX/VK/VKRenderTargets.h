@@ -84,6 +84,14 @@ namespace vk
 		// Memory spilling support
 		std::unique_ptr<vk::buffer> m_spilled_mem;
 
+		// vanillad1: cached RCB test (X302): memory_barrier's two range tests for this surface's range and size
+		struct vd1_rcb_memo_t
+		{
+			u32 start = 0, end = 0, w = 0, h = 0;
+			bool rcb = false, stock_any = false;
+		}
+		m_vd1_rcb_memo;
+
 		// MSAA support:
 		// Get the linear resolve target bound to this surface. Initialize if none exists
 		vk::viewable_image* get_resolve_target_safe(vk::command_buffer& cmd);

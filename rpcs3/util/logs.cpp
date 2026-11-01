@@ -1,4 +1,5 @@
 #include "util/logs.hpp"
+#include "Emu/vd1_live.h"
 #include "Utilities/File.h"
 #include "Utilities/mutex.h"
 #include "Utilities/Thread.h"
@@ -816,7 +817,10 @@ void logs::file_listener::log(u64 stamp, const logs::message& msg, std::string_v
 
 	thread_local tls_buffer tls;
 	std::string local_text;
-	std::string& text = tls_destroyed ? local_text : tls.text;
+	// vanillad1: live switch E1 (X302): off = the old 50 KB block per line, so the fix can be measured
+	const bool vd1_tls = vd1::live(vd1::lf::E1) && !tls_destroyed;
+	if (!vd1_tls) local_text.reserve(50000);
+	std::string& text = vd1_tls ? tls.text : local_text;
 	text.clear();
 
 	// Used character: U+00B7 (Middle Dot)

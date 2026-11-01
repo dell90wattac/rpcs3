@@ -85,6 +85,16 @@ namespace vk
 		}
 		access_hint = flush_only;
 
+		// vanillad1: dynamic state cache (X302): the last stencil and blend values recorded (VKDraw.cpp update_draw_state)
+		struct vd1_dynamic_state_t
+		{
+			bool stencil_valid = false;
+			bool blend_valid = false;
+			u32 stencil[6]{}; // front write, compare, reference; back write, compare, reference
+			f32 blend[4]{};
+		}
+		vd1_dyn;
+
 		enum command_buffer_data_flag : u32
 		{
 			cb_has_occlusion_task = 0x01,

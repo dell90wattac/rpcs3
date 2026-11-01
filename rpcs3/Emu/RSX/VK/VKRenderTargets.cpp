@@ -1,4 +1,5 @@
 #include "vkutils/data_heap.h"
+#include "Emu/vd1_live.h"
 #include "VKFramebuffer.h"
 #include "VKRenderTargets.h"
 #include "VKResourceManager.h"
@@ -1211,9 +1212,26 @@ namespace vk
 		// vanillad1: RCB range (P13): a colour surface in VANILLAD1_RCB_RANGE reads colour buffers back.
 		// vanillad1: RCB changed (P13.2): a consuming read or a write reloads it when its memory changed since it last matched it
 		// (vd1_rcb_reload_due), not on the frame's first read; VANILLAD1_RCB_SIZE narrows it to one surface size.
-		const bool vd1_rcb = !is_depth && rsx::vd1_rcb_covers(get_memory_range()) && rsx::vd1_rcb_size_ok(surface_width, surface_height);
+		// vanillad1: cached RCB test (X302): the env ranges never change, so these hold while the surface's range and size do
+		bool vd1_rcb = false;
+		bool vd1_stock_any = false;
+		if (!is_depth)
+		{
+			const auto vd1_range = get_memory_range();
+			auto& memo = m_vd1_rcb_memo;
+			if (!vd1::live(vd1::lf::E3B) || memo.start != vd1_range.start || memo.end != vd1_range.end || memo.w != surface_width || memo.h != surface_height)
+			{
+				memo.start = vd1_range.start;
+				memo.end = vd1_range.end;
+				memo.w = surface_width;
+				memo.h = surface_height;
+				memo.rcb = rsx::vd1_rcb_covers(vd1_range) && rsx::vd1_rcb_size_ok(surface_width, surface_height);
+				memo.stock_any = !memo.rcb && rsx::vd1_rcb_stock_covers(vd1_range, surface_width, surface_height, true); // size, init: vanillad1: RCB stock size (P13.2)
+			}
+			vd1_rcb = memo.rcb;
+			vd1_stock_any = memo.stock_any;
+		}
 		// vanillad1: RCB stock range (P13.2): a colour surface in VANILLAD1_RCB_STOCK (and not in the range above) takes the stock branch below
-		const bool vd1_stock_any = !is_depth && !vd1_rcb && rsx::vd1_rcb_stock_covers(get_memory_range(), surface_width, surface_height, true); // size, init: vanillad1: RCB stock size (P13.2)
 		// vanillad1: RCB stock own (P13.3): a texture lookup of another address touches this surface (the 512x312 post target in a lookup of G-buffer A);
 		// an entry with :own takes no stock reload from it
 		const bool vd1_foreign = rsx::vd1_lookup_addr && rsx::vd1_lookup_addr != base_addr;

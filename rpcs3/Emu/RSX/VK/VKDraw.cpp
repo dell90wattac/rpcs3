@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "../Common/BufferUtils.h"
 #include "../Program/GLSLCommon.h"
 #include "../rsx_methods.h"
@@ -175,11 +176,27 @@ void VKGSRender::update_draw_state()
 		vkCmdSetLineWidth(*m_current_command_buffer, actual_line_width);
 	}
 
+	// vanillad1: dynamic state cache (X302): stencil and blend calls only when a value changed. Anything that clobbers dynamic
+	// state sets cb_reload_dynamic_state, a new command buffer clears the cache (clear_state_cache), and the off path
+	// leaves it invalid so a later flip on can't trust old values.
+	auto& vd1_dyn = m_current_command_buffer->vd1_dyn;
+	const bool vd1_dyn_on = vd1::live(vd1::lf::E24) != 0;
+	if (!vd1_dyn_on || (m_current_command_buffer->flags & vk::command_buffer::cb_reload_dynamic_state))
+	{
+		vd1_dyn.stencil_valid = false;
+		vd1_dyn.blend_valid = false;
+	}
+
 	if (rsx::method_registers.blend_enabled_mask())
 	{
 		// Update blend constants
 		auto blend_colors = rsx::get_constant_blend_colors();
-		vkCmdSetBlendConstants(*m_current_command_buffer, blend_colors.data());
+		if (!vd1_dyn.blend_valid || std::memcmp(vd1_dyn.blend, blend_colors.data(), sizeof(vd1_dyn.blend)) != 0)
+		{
+			vkCmdSetBlendConstants(*m_current_command_buffer, blend_colors.data());
+			std::memcpy(vd1_dyn.blend, blend_colors.data(), sizeof(vd1_dyn.blend));
+			vd1_dyn.blend_valid = vd1_dyn_on;
+		}
 	}
 
 	if (rsx::method_registers.stencil_test_enabled())
@@ -187,15 +204,32 @@ void VKGSRender::update_draw_state()
 		const bool two_sided_stencil = rsx::method_registers.two_sided_stencil_test_enabled();
 		VkStencilFaceFlags face_flag = (two_sided_stencil) ? VK_STENCIL_FACE_FRONT_BIT : VK_STENCIL_FRONT_AND_BACK;
 
-		vkCmdSetStencilWriteMask(*m_current_command_buffer, face_flag, rsx::method_registers.stencil_mask());
-		vkCmdSetStencilCompareMask(*m_current_command_buffer, face_flag, rsx::method_registers.stencil_func_mask());
-		vkCmdSetStencilReference(*m_current_command_buffer, face_flag, rsx::method_registers.stencil_func_ref());
-
-		if (two_sided_stencil)
+		// One-sided calls set both faces, so the six values below are the state either way
+		const u32 vd1_stencil[6] =
 		{
-			vkCmdSetStencilWriteMask(*m_current_command_buffer, VK_STENCIL_FACE_BACK_BIT, rsx::method_registers.back_stencil_mask());
-			vkCmdSetStencilCompareMask(*m_current_command_buffer, VK_STENCIL_FACE_BACK_BIT, rsx::method_registers.back_stencil_func_mask());
-			vkCmdSetStencilReference(*m_current_command_buffer, VK_STENCIL_FACE_BACK_BIT, rsx::method_registers.back_stencil_func_ref());
+			rsx::method_registers.stencil_mask(),
+			rsx::method_registers.stencil_func_mask(),
+			rsx::method_registers.stencil_func_ref(),
+			two_sided_stencil ? rsx::method_registers.back_stencil_mask() : rsx::method_registers.stencil_mask(),
+			two_sided_stencil ? rsx::method_registers.back_stencil_func_mask() : rsx::method_registers.stencil_func_mask(),
+			two_sided_stencil ? rsx::method_registers.back_stencil_func_ref() : rsx::method_registers.stencil_func_ref(),
+		};
+
+		if (!vd1_dyn.stencil_valid || std::memcmp(vd1_dyn.stencil, vd1_stencil, sizeof(vd1_stencil)) != 0)
+		{
+			vkCmdSetStencilWriteMask(*m_current_command_buffer, face_flag, rsx::method_registers.stencil_mask());
+			vkCmdSetStencilCompareMask(*m_current_command_buffer, face_flag, rsx::method_registers.stencil_func_mask());
+			vkCmdSetStencilReference(*m_current_command_buffer, face_flag, rsx::method_registers.stencil_func_ref());
+
+			if (two_sided_stencil)
+			{
+				vkCmdSetStencilWriteMask(*m_current_command_buffer, VK_STENCIL_FACE_BACK_BIT, rsx::method_registers.back_stencil_mask());
+				vkCmdSetStencilCompareMask(*m_current_command_buffer, VK_STENCIL_FACE_BACK_BIT, rsx::method_registers.back_stencil_func_mask());
+				vkCmdSetStencilReference(*m_current_command_buffer, VK_STENCIL_FACE_BACK_BIT, rsx::method_registers.back_stencil_func_ref());
+			}
+
+			std::memcpy(vd1_dyn.stencil, vd1_stencil, sizeof(vd1_stencil));
+			vd1_dyn.stencil_valid = vd1_dyn_on;
 		}
 	}
 

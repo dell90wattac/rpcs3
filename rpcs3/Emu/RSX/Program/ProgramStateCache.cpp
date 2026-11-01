@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "ProgramStateCache.h"
 #include "Emu/system_config.h"
 #include "Emu/RSX/Core/RSXDriverState.h"
@@ -842,12 +843,16 @@ namespace rsx
 
 	void program_cache_hint_t::invalidate(u32 flags)
 	{
-		if (flags & rsx::vertex_program_dirty)
+		// vanillad1: live switch E22 (X302): on = only the ucode bits drop the hint; a state-only change is caught by
+		// invalidate_*_program(p), which compares exactly the properties cache_*_program stored
+		const bool vd1_keep = vd1::live(vd1::lf::E22) != 0;
+
+		if (flags & (vd1_keep ? rsx::vertex_program_ucode_dirty : rsx::vertex_program_dirty))
 		{
 			m_cached_vertex_program = nullptr;
 		}
 
-		if (flags & rsx::fragment_program_dirty)
+		if (flags & (vd1_keep ? rsx::fragment_program_ucode_dirty : rsx::fragment_program_dirty))
 		{
 			m_cached_fragment_program = nullptr;
 		}

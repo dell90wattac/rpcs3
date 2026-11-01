@@ -1,4 +1,5 @@
 #include "Emu/RSX/VK/vkutils/descriptors.h"
+#include "Emu/vd1_live.h"
 #include "stdafx.h"
 #include "../Overlays/overlay_compile_notification.h"
 #include "../Overlays/Shaders/shader_loading_dialog_native.h"
@@ -1849,6 +1850,7 @@ static u32 vd1_label_batch_n()
 		if (n) rsx_log.notice("vanillad1: host labels in batches (VANILLAD1_LABEL_BATCH=%u)", n);
 		return n;
 	}();
+	if (const u32 live_n = vd1::live(vd1::lf::LABEL)) return live_n; // vanillad1: live switch (X302): non-zero overrides the env
 	return s_n;
 }
 
@@ -1919,7 +1921,6 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	}
 
 	// vanillad1: label batching (P9): the label id is taken below, after the batch has been flushed for a primary-path label
-	vk::insert_global_memory_barrier(*m_current_command_buffer);
 
 	// vanillad1: host label order (L20.2.1): only a texture-read release may overtake the draws
 	// still in the primary command buffer; any other label is written behind them.
@@ -1936,6 +1937,12 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	const u64 vd1_released = m_vd1_label_cb ? host_ctx->last_label_acquire_event : host_ctx->last_label_release2_event;
 	const bool vd1_primary = !vd1_texread_batched && (host_ctx->texture_load_request_event > vd1_released ||
 		(s_label_order && type != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE));
+	// vanillad1: label barrier (X302): E25 on: no barrier for a batched label. Its write goes into a command buffer submitted
+	// before the primary, so the barrier orders nothing there and only ends the open render pass.
+	if (!(vd1::live(vd1::lf::E25) && vd1_n && !vd1_primary))
+	{
+		vk::insert_global_memory_barrier(*m_current_command_buffer);
+	}
 	if (vd1_primary)
 	{
 		vd1_label_flush(); // the primary submit writes commands_complete_event for this label: older ids go first
@@ -3683,7 +3690,8 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 
 	bool dump = false;
 	static u32 s_flag_check = 0;
-	if ((s_flag_check++ % 30) == 0)
+	// vanillad1: live switch E14 (X302): on = no file check; flip it off to take a dump
+	if (!vd1::live(vd1::lf::E14) && (s_flag_check++ % 30) == 0)
 	{
 		const std::string flag = vd1_gl_dir() + "vd1_gpu_light_dump.flag";
 		if (fs::is_file(flag))

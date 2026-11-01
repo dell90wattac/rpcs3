@@ -44,6 +44,7 @@ namespace rsx
 		_3d_unwrap,               // One large texture provided to be partitioned into a 3D array
 		mipmap_gather,            // Provided list of sections to be reassembled as mipmap levels of the same texture
 		blit_image_static,        // Variant of the copy command that does scaling instead of copying
+		linear_reinterpret,       // vanillad1: LUT on the GPU (X302): one unpadded surface whose bytes are re-read as a 3D texture
 	};
 
 	struct blit_op_result

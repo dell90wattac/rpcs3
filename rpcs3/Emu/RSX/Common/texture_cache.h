@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Emu/RSX/Common/simple_array.hpp"
+#include "Emu/vd1_live.h"
 #include "Emu/RSX/Core/RSXContext.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/Utils/algorithm.hpp"
@@ -126,6 +127,43 @@ namespace rsx
 		return false;
 	}
 
+	// vanillad1: CPU uploads by address (X302): while UPLOADS is on, the direct uploads by (address, shape, format), printed
+	// every 2000 uploads (a few hundred frames). RSX thread only.
+	inline void vd1_upload_note(u32 addr, u32 w, u32 h, u32 d, u32 pitch, u32 format)
+	{
+		struct entry { u32 addr, w, h, d, pitch, format, count; };
+		static entry s_table[64]{};
+		static u32 s_used = 0;
+		static u32 s_total = 0;
+
+		u32 i = 0;
+		for (; i < s_used; i++)
+		{
+			const auto& e = s_table[i];
+			if (e.addr == addr && e.w == w && e.h == h && e.d == d && e.pitch == pitch && e.format == format) break;
+		}
+
+		if (i < s_used)
+		{
+			s_table[i].count++;
+		}
+		else if (s_used < 64)
+		{
+			s_table[s_used++] = { addr, w, h, d, pitch, format, 1 };
+		}
+
+		if (++s_total < 2000) return;
+
+		rsx_log.notice("vanillad1: CPU uploads: %u in this window, %u kinds", s_total, s_used);
+		for (u32 n = 0; n < s_used; n++)
+		{
+			const auto& e = s_table[n];
+			rsx_log.notice("vanillad1: CPU upload 0x%08x %ux%ux%u pitch %u format 0x%x: %u", e.addr, e.w, e.h, e.d, e.pitch, e.format, e.count);
+		}
+		s_used = 0;
+		s_total = 0;
+	}
+
 	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST=<lo>-<hi>[,...]. A flushable section overlapping a range is
 	// read back at every speculative point (unbind in prepare_rtts, after a blit) without the predictor, a GPU write the
 	// cache does not see as a bind drops that copy (a blit into the locked target, the X300.2 lighting pass), and a CPU
@@ -134,7 +172,7 @@ namespace rsx
 	inline bool vd1_fault_fast_covers(const utils::address_range32& range)
 	{
 		static const auto s_ranges = vd1_env_ranges("VANILLAD1_FAULT_FAST", "eager readback, faults flushed without the RSX thread");
-		return !s_ranges.empty() && vd1_ranges_overlap(s_ranges, range);
+		return !s_ranges.empty() && vd1::live(vd1::lf::A1) && vd1_ranges_overlap(s_ranges, range); // vanillad1: live switch A1 (X302): on at boot when the env is set
 	}
 
 	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WAIT_US=<n> (decimal, read once; default 1000, 0 = never wait):
@@ -223,7 +261,7 @@ namespace rsx
 			return out;
 		}();
 
-		if (s_ranges.empty()) return true;
+		if (s_ranges.empty() || !vd1::live(vd1::lf::B3)) return true; // vanillad1: live switch B3 (X302): on at boot when the env is set
 
 		bool covered = false;
 		for (const auto& [lo, hi] : s_ranges)
@@ -982,6 +1020,7 @@ namespace rsx
 		virtual void insert_texture_barrier(commandbuffer_type&, image_storage_type* tex, bool strong_ordering = true) = 0;
 		virtual image_view_type generate_cubemap_from_images(commandbuffer_type&, const deferred_subresource& desc) = 0;
 		virtual image_view_type generate_3d_from_2d_images(commandbuffer_type&, const deferred_subresource& desc) = 0;
+		virtual image_view_type generate_reinterpreted_from_surface(commandbuffer_type&, const deferred_subresource&) { return {}; } // vanillad1: LUT on the GPU (X302): Vulkan only
 		virtual image_view_type generate_atlas_from_images(commandbuffer_type&, const deferred_subresource& desc) = 0;
 		virtual image_view_type generate_2d_mipmaps_from_images(commandbuffer_type&, const deferred_subresource& desc) = 0;
 		virtual void update_image_contents(commandbuffer_type&, image_view_type dst, const deferred_subresource& desc) = 0;
@@ -3000,6 +3039,11 @@ namespace rsx
 				result = generate_3d_from_2d_images(cmd, desc);
 				break;
 			}
+			case deferred_request_command::linear_reinterpret: // vanillad1: LUT on the GPU (X302)
+			{
+				result = generate_reinterpreted_from_surface(cmd, desc);
+				break;
+			}
 			case deferred_request_command::_3d_unwrap:
 			{
 				rsx::simple_array<copy_region_descriptor> sections;
@@ -3235,6 +3279,32 @@ namespace rsx
 				overlapping_fbos = m_rtts.get_merged_texture_memory_region(cmd, attr.address, attr.width, block_h, attr.pitch, attr.bpp, rsx::surface_access::shader_read);
 			}
 
+			// vanillad1: LUT on the GPU (X302): a linear colour target re-read over exactly its bytes as a 3D texture (the 16^3
+			// grading LUT in a 256x16 target). The surface lookup rejects it on pitch, and the CPU path behind this flushes the
+			// target with a hard GPU wait. Anything not matching exactly stays on that path.
+			if (vd1::live(vd1::lf::E18) && overlapping_fbos.empty() && overlapping_locals.empty() && !attr.swizzled &&
+				extended_dimension == rsx::texture_dimension_extended::texture_dimension_3d && attr.mipmaps <= 1 && attr.pitch == attr.width * attr.bpp)
+			{
+				if (auto surface = m_rtts.get_surface_at(attr.address); surface && !surface->is_depth_surface() && surface->get_spp() == 1 &&
+					surface->get_bpp() == attr.bpp && surface->get_rsx_pitch() == surface->get_native_pitch() &&
+					surface->get_memory_range().length() == memory_range.length() &&
+					surface->width() * surface->height() * attr.bpp == memory_range.length() &&
+					render_target_format_is_compatible(surface, attr.gcm_format))
+				{
+					surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
+					if (surface->test())
+					{
+						const coord3u src_rect = { 0, 0, 0, surface->width(), surface->height(), 1 };
+						const coord3u dst_rect = { 0, 0, 0, attr.width, attr.height, attr.depth };
+						auto desc = deferred_subresource::create_copy(surface->get_surface(rsx::surface_access::transfer_read),
+							attr, src_rect, dst_rect, rsx::surface_transform::identity, remap);
+						desc.op = deferred_request_command::linear_reinterpret;
+						desc.do_not_cache = m_rtts.address_is_bound(attr.address);
+						return { std::move(desc), texture_upload_context::framebuffer_storage, classify_format(attr.gcm_format), scale, extended_dimension, attr.address };
+					}
+				}
+			}
+
 			if (!overlapping_fbos.empty() || !overlapping_locals.empty())
 			{
 				int _pool = -1;
@@ -3455,10 +3525,29 @@ namespace rsx
 		{
 			// vanillad1: RCB keep (P13.1): a sampler over VANILLAD1_RCB_RANGE is re-resolved every draw, so the fetch always goes
 			// upload_texture -> get_merged_texture_memory_region -> memory_barrier(shader_read) (the P13 reload)
-			if (descriptor->ref_address && vd1_rcb_covers(utils::address_range32::start_length(descriptor->ref_address, 1)))
+			// vanillad1: cached RCB test (X302): the ranges never change, so the answer holds while ref_address does
+			if (descriptor->ref_address)
 			{
-				g_vd1_rcb.forced++;
-				return true;
+				bool vd1_hit;
+				if (vd1::live(vd1::lf::E3B))
+				{
+					if (descriptor->vd1_rcb_addr != descriptor->ref_address)
+					{
+						descriptor->vd1_rcb_addr = descriptor->ref_address;
+						descriptor->vd1_rcb_hit = vd1_rcb_covers(utils::address_range32::start_length(descriptor->ref_address, 1));
+					}
+					vd1_hit = descriptor->vd1_rcb_hit;
+				}
+				else
+				{
+					vd1_hit = vd1_rcb_covers(utils::address_range32::start_length(descriptor->ref_address, 1));
+				}
+
+				if (vd1_hit)
+				{
+					g_vd1_rcb.forced++;
+					return true;
+				}
 			}
 
 			auto result = descriptor->is_expired(surface_cache);
@@ -3897,6 +3986,7 @@ namespace rsx
 
 			// Do direct upload from CPU as the last resort
 			m_texture_upload_misses_this_frame++;
+			if (vd1::live(vd1::lf::UPLOADS)) vd1_upload_note(attributes.address, attributes.width, attributes.height, attributes.depth, attributes.pitch, attributes.gcm_format); // vanillad1: CPU uploads by address (X302)
 
 			const auto subresources_layout = get_subresources_layout(tex);
 			const auto format_class = classify_format(attributes.gcm_format);

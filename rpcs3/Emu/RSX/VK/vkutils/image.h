@@ -145,6 +145,9 @@ namespace vk
 	{
 	protected:
 		std::unordered_map<u64, std::unique_ptr<vk::image_view>> views;
+		// vanillad1: last view (X302): the key and view of the last get_view; reset wherever views change
+		u64 m_vd1_view_key = 0;
+		vk::image_view* m_vd1_view = nullptr;
 		viewable_image* clone();
 
 	public:

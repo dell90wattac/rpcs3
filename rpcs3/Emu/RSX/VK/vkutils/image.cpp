@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "barriers.h"
 #include "device.h"
 #include "image.h"
@@ -469,6 +470,7 @@ namespace vk
 		result->value = this->value;
 		result->memory = std::move(this->memory);
 		result->views = std::move(this->views);
+		this->m_vd1_view = nullptr; // vanillad1: last view (X302)
 		this->value = VK_NULL_HANDLE;
 		return result;
 	}
@@ -488,10 +490,22 @@ namespace vk
 		}
 
 		const u64 storage_key = remap_encoding | (static_cast<u64>(mask) << 32);
+		// vanillad1: last view (X302): an image is almost always asked for the same remap
+		const bool vd1_memo = vd1::live(vd1::lf::E3A) != 0;
+		if (vd1_memo && m_vd1_view && m_vd1_view_key == storage_key)
+		{
+			return m_vd1_view;
+		}
+
 		auto found = views.find(storage_key);
 		if (found != views.end())
 		{
 			ensure(found->second->info.subresourceRange.aspectMask & mask);
+			if (vd1_memo)
+			{
+				m_vd1_view_key = storage_key;
+				m_vd1_view = found->second.get();
+			}
 			return found->second.get();
 		}
 
@@ -538,6 +552,7 @@ namespace vk
 				gc->dispose(p.second);
 			}
 			views.clear();
+			m_vd1_view = nullptr; // vanillad1: last view (X302)
 		}
 	}
 

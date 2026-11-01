@@ -223,6 +223,8 @@ namespace rsx
 		u8 samples = 1;
 		u32 ref_address = 0;
 		u64 surface_cache_tag = 0;
+		u32 vd1_rcb_addr = 0; // vanillad1: cached RCB test (X302): the ref_address vd1_rcb_hit was worked out for
+		bool vd1_rcb_hit = false;
 
 		texcoord_xform_t texcoord_xform;
 		texture_format_ex format_ex;

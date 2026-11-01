@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "sys_time.h"
 
 #include "sys_process.h"
@@ -217,6 +218,20 @@ u64 get_system_time()
 		const u64 tsc = utils::get_tsc();
 
 #if _MSC_VER
+		// vanillad1: live switch E13 (X302): a multiply by (1e6 << 64) / freq, worked out once, instead of the 128-bit divide.
+		// The result is under 1 us from the divide's, so a flip can step time back that far; steady state is monotonic.
+		if (vd1::live(vd1::lf::E13))
+		{
+			static u64 s_vd1_mult = 0;
+			u64 mult = s_vd1_mult;
+			if (!mult) [[unlikely]]
+			{
+				mult = static_cast<u64>(u128_from_mul(1ull << 63, 2000000ull) / freq);
+				s_vd1_mult = mult;
+			}
+			return utils::umulh64(tsc, mult);
+		}
+
 		const u64 result = static_cast<u64>(u128_from_mul(tsc, 1000000ull) / freq);
 #else
 		const u64 result = (tsc / freq * 1000000ull + tsc % freq * 1000000ull / freq);

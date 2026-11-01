@@ -82,6 +82,8 @@ namespace vk
 		m_bound_pipelines[0] = VK_NULL_HANDLE;
 		m_bound_pipelines[1] = VK_NULL_HANDLE;
 		m_bound_descriptor_sets[0] = VK_NULL_HANDLE;
+		vd1_dyn.stencil_valid = false; // vanillad1: dynamic state cache (X302)
+		vd1_dyn.blend_valid = false;
 	}
 
 	void command_buffer::begin()

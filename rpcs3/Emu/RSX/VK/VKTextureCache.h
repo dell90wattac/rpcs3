@@ -555,6 +555,7 @@ namespace vk
 		vk::image_view* generate_cubemap_from_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
 		vk::image_view* generate_3d_from_2d_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
+		vk::image_view* generate_reinterpreted_from_surface(vk::command_buffer& cmd, const deferred_subresource& desc) override; // vanillad1: LUT on the GPU (X302)
 
 		vk::image_view* generate_atlas_from_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
