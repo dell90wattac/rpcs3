@@ -4,6 +4,7 @@
 #include "vkutils/memory.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
+#include "Emu/RSX/NV47/HW/nv0039.h" // vanillad1: G-buffer byte on the GPU (X300.7)
 #include "Emu/Cell/Modules/cellVideoOut.h"
 
 #include "upscalers/bilinear_pass.hpp"
@@ -424,6 +425,8 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 
 void VKGSRender::flip(const rsx::display_flip_info_t& info)
 {
+	rsx::nv0039::vd1_release_held(this); // vanillad1: G-buffer byte on the GPU (X300.7): a held copy never outlives its frame
+
 	// Check swapchain condition/status
 	if (!m_swapchain->supports_automatic_wm_reports())
 	{

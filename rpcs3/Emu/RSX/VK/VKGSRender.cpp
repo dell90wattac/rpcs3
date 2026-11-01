@@ -21,6 +21,7 @@
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 #include "Emu/Memory/vm_locking.h"
 #include "Emu/RSX/Core/RSXReservationLock.hpp" // vanillad1: GPU lighting (X300.2)
+#include "Emu/RSX/NV47/HW/nv0039.h" // vanillad1: G-buffer byte on the GPU (X300.7)
 #include "Emu/Cell/timers.hpp" // vanillad1: GPU lighting (X300.2)
 #include <cmath>
 #include <cstring>
@@ -3499,6 +3500,45 @@ namespace vk
 			m_program->bind_uniform({ *m_buf, 0, m_len }, 0, 0);
 		}
 	};
+
+	// vanillad1: G-buffer byte on the GPU (X300.7): NV0039's 4 -> 1 gather from the surface's words in scratch: one byte of
+	// each host word (byte 3 = A = the guest's first byte: A8R8G8B8 surfaces are byte-swapped into guest memory) packed four
+	// to a word, little-endian, as the pass reads the 8-bit buffer
+	struct cs_vd1_gbuf_byte : compute_task
+	{
+		const vk::buffer* m_buf = nullptr;
+		u32 m_len = 0;
+		std::array<u32, 4> m_pc{};   // o_x (words), o_m (words), the word count out, the shift
+
+		cs_vd1_gbuf_byte()
+		{
+			ssbo_count = 1;
+			use_push_constants = true;
+			push_constants_size = 16;
+
+			create();
+
+			m_src =
+				"#version 450\n"
+				"layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n"
+				"layout(set = 0, binding = 0, std430) buffer ssbo0 { uint data[]; };\n"
+				"layout(push_constant) uniform push_block { uint o_x; uint o_m; uint count; uint shift; };\n"
+				"void main()\n"
+				"{\n"
+				"	const uint i = gl_GlobalInvocationID.x;\n"
+				"	if (i >= count) return;\n"
+				"	const uint b = o_x + i * 4u;\n"
+				"	data[o_m + i] = ((data[b] >> shift) & 255u) | (((data[b + 1u] >> shift) & 255u) << 8) |\n"
+				"		(((data[b + 2u] >> shift) & 255u) << 16) | (((data[b + 3u] >> shift) & 255u) << 24);\n"
+				"}\n";
+		}
+
+		void bind_resources(const vk::command_buffer& cmd) override
+		{
+			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, m_pc.data());
+			m_program->bind_uniform({ *m_buf, 0, m_len }, 0, 0);
+		}
+	};
 }
 
 namespace
@@ -3524,19 +3564,22 @@ namespace
 	struct vd1_gl_counters
 	{
 		u32 calls = 0, lit = 0, shadow = 0, slot = 0, unfilled = 0, nosurf = 0, badsurf = 0, taken = 0, dumps = 0;
+		u32 gb_gpu = 0, gb_nomatch = 0, gb_taken = 0;   // vanillad1: G-buffer byte on the GPU (X300.7)
 		u64 last_ms = 0;
 	} s_vd1_gl;
 
-	void vd1_gl_tick()
+	void vd1_gl_tick(u32& released)
 	{
 		const u64 now = get_system_time() / 1000;
 		auto& c = s_vd1_gl;
 		if (!c.last_ms) { c.last_ms = now; return; }
 		if (now - c.last_ms < 10000) return;
 		c.last_ms = now;
-		rsx_log.notice("vanillad1: gpu light 10s: ready=%u lit=%u shadow=%u declined: slot=%u unfilled=%u nosurf=%u badsurf=%u taken=%u; dumps=%u",
-			c.calls, c.lit, c.shadow, c.slot, c.unfilled, c.nosurf, c.badsurf, c.taken, c.dumps);
+		rsx_log.notice("vanillad1: gpu light 10s: ready=%u lit=%u shadow=%u declined: slot=%u unfilled=%u nosurf=%u badsurf=%u taken=%u; dumps=%u; "
+			"gbuf byte: gpu=%u (copy skipped %u) no match=%u copies run=%u",
+			c.calls, c.lit, c.shadow, c.slot, c.unfilled, c.nosurf, c.badsurf, c.taken, c.dumps, c.gb_gpu, c.gb_taken, c.gb_nomatch, released);
 		c = {}; c.last_ms = now;
+		released = 0;
 	}
 
 	u32 vd1_be32(u32 ea) { return *vm::get_super_ptr<u32>(ea); }
@@ -3559,7 +3602,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 
 	auto& c = s_vd1_gl;
 	c.calls++;
-	vd1_gl_tick();
+	vd1_gl_tick(m_vd1_nv0039_released);
 
 	// A dump waiting for the SPU's result: the previous frame's job is done by now (the PPU waited for it before the
 	// draws that sample the target; this frame's job waits for this word)
@@ -3651,6 +3694,37 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 	}
 	const bool swap = (mode == vd1_gl_mode::on) && !dump;
 
+	// vanillad1: G-buffer byte on the GPU (X300.7): this frame's NV0039 copy into the 8-bit buffer, held (or, check, run as
+	// before): the pass gathers the byte from the copy's source surface on the GPU instead of reading guest memory
+	vk::render_target* xs = nullptr;
+	const rsx::vd1_nv0039_args& held = m_vd1_nv0039_held;
+	if (held.state != rsx::vd1_nv0039_args::none)
+	{
+		vk::render_target* s = (held.dst == mk_ea && held.line_length == w && held.line_count >= h && held.out_pitch == static_cast<s32>(w)) ?
+			m_rtts.get_surface_at(held.src) : nullptr;
+		if (s && !s->is_depth_surface() && s->samples() == 1 && s->format() == VK_FORMAT_B8G8R8A8_UNORM &&
+			s->get_surface_width<rsx::surface_metrics::pixels>() == w && s->width() == w &&
+			s->get_surface_height<rsx::surface_metrics::pixels>() >= h && s->height() >= h && s->get_rsx_pitch() == static_cast<u32>(held.in_pitch))
+		{
+			xs = s;
+		}
+		else
+		{
+			c.gb_nomatch++;
+			static u32 s_nomatch_logs = 0;
+			if (s_nomatch_logs++ < 10)
+				rsx_log.notice("vanillad1: gbuf gpu: slot %u: the NV0039 0x%x -> 0x%x %ux%u pitch %d (8-bit buffer 0x%x, %ux%u): %s; the copy runs",
+					slot, held.src, held.dst, held.line_length, held.line_count, held.in_pitch, mk_ea, w, h, s ? "the surface does not fit" : "no match / no surface");
+		}
+	}
+	static const u32 s_gb_shift = []()
+	{
+		const char* env = std::getenv("VANILLAD1_GBUF_BYTE"); // the host byte of the surface word (default 3 = A)
+		return 8u * ((env && *env >= '0' && *env <= '3') ? static_cast<u32>(*env - '0') : 3u);
+	}();
+	static u32 s_gb_checks = 0;
+	const bool gb_check = xs && held.state == rsx::vd1_nv0039_args::check && !dump && (s_gb_checks++ % 10) == 0;
+
 	// The swap: the six SPU instances take the tile past the last first and exit (the PPU's waits complete as usual)
 	if (swap)
 	{
@@ -3664,16 +3738,22 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		ctr = (w / 32u) * (h / 24u) - 1u;
 	}
 
-	// The scratch layout (bytes): depth, G-buffer A, the 8-bit buffer, the light target, P, lights, table, LUT, [G-buffer A in]
+	// The scratch layout (bytes): depth, G-buffer A, the 8-bit buffer, the light target, P, lights, table, LUT, [G-buffer A in],
+	// [the NV0039 source surface's words (X300.7)]
 	const u32 px = w * h;
 	const u32 O_Z = 0, O_G = vd1_align(O_Z + px * 4), O_M = vd1_align(O_G + px * 4), O_L = vd1_align(O_M + px);
 	const u32 O_P = vd1_align(O_L + px * 8), O_LT = vd1_align(O_P + 0x280), O_T = vd1_align(O_LT + n * 240), O_LUT = vd1_align(O_T + 0x9350);
-	const u32 O_G0 = vd1_align(O_LUT + 2048), total = dump ? vd1_align(O_G0 + px * 4) : O_G0;
+	const u32 O_G0 = vd1_align(O_LUT + 2048), total_l = dump ? vd1_align(O_G0 + px * 4) : O_G0;
+	const u32 O_X = total_l, total = xs ? vd1_align(O_X + px * 4) : total_l;
 
 	auto* cmd = m_current_command_buffer;
 	for (vk::render_target* s : { zs, gs, ls })
 	{
 		s->read_barrier(*cmd);
+	}
+	if (xs)
+	{
+		xs->read_barrier(*cmd);
 	}
 
 	vk::buffer* sb = vk::get_scratch_buffer(*cmd, total, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -3693,12 +3773,18 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		vk::copy_image_to_buffer(*cmd, s, sb, region(s, off));
 		s->pop_layout(*cmd);
 	}
+	if (xs)
+	{
+		xs->push_layout(*cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		vk::copy_image_to_buffer(*cmd, xs, sb, region(xs, O_X));
+		xs->pop_layout(*cmd);
+	}
 
 	// Guest memory through the unprotected view: P, the lights, the static table (byte-swapped to host words), the 8-bit
 	// buffer (bytes; the RSX wrote it with NV0039 earlier in this FIFO), the LUT the job builds from P+0x16c / +0x1cc
 	auto& up = *vk::get_upload_heap();
 	const u32 U_P = 0, U_LT = vd1_align(0x280), U_T = vd1_align(U_LT + n * 240), U_LUT = vd1_align(U_T + 0x9350), U_M = vd1_align(U_LUT + 2048);
-	const u32 up_len = U_M + px;
+	const u32 up_len = xs ? U_M : U_M + px;   // vanillad1: G-buffer byte on the GPU (X300.7): no 8-bit buffer from guest memory
 	const usz up_off = up.alloc<256>(up_len);
 	u8* dst = up.map<u8>(up_off, up_len);
 	auto swap_words = [&](u32 to, u32 from, u32 bytes)
@@ -3722,7 +3808,10 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			lut[i * 2 + 1] = std::pow(s, p16c);
 		}
 	}
-	std::memcpy(dst + U_M, vm::get_super_ptr<u8>(mk_ea), px);
+	if (!xs)
+	{
+		std::memcpy(dst + U_M, vm::get_super_ptr<u8>(mk_ea), px);
+	}
 	up.unmap();
 	if (up.is_dirty())
 	{
@@ -3733,9 +3822,26 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		{ up_off + U_P, O_P, 0x280 }, { up_off + U_LT, O_LT, n * 240 }, { up_off + U_T, O_T, 0x9350 },
 		{ up_off + U_LUT, O_LUT, 2048 }, { up_off + U_M, O_M, px },
 	};
-	vkCmdCopyBuffer(*cmd, up.heap->value, sb->value, 5, copies);
+	vkCmdCopyBuffer(*cmd, up.heap->value, sb->value, xs ? 4 : 5, copies);
 	vk::insert_buffer_memory_barrier(*cmd, sb->value, 0, total, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+	if (xs)
+	{
+		// vanillad1: G-buffer byte on the GPU (X300.7): the 8-bit buffer gathered from the surface's words
+		auto* gather = vk::get_compute_task<vk::cs_vd1_gbuf_byte>();
+		gather->m_buf = sb;
+		gather->m_len = total;
+		gather->m_pc = { O_X / 4, O_M / 4, px / 4, s_gb_shift };
+		gather->run(*cmd, (px / 4 + 255) / 256, 1, 1);
+		vk::insert_buffer_memory_barrier(*cmd, sb->value, O_M, px, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+		c.gb_gpu++;
+		if (swap && held.state == rsx::vd1_nv0039_args::held)
+		{
+			m_vd1_nv0039_held.state = rsx::vd1_nv0039_args::none;   // taken: the copy (and its readback of the surface) never runs
+			c.gb_taken++;
+		}
+	}
 	if (dump)
 	{
 		const VkBufferCopy keep_in = { O_G, O_G0, px * 4 };
@@ -3803,6 +3909,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		f.write(hdr, sizeof(hdr));
 		f.write(vm::get_super_ptr<u8>(P), 0x280);
 		f.write(vm::get_super_ptr<u8>(lights_ea), n * 240);
+		rsx::nv0039::vd1_release_held(this); // vanillad1: G-buffer byte on the GPU (X300.7): the SPUs light this frame: their bytes now
 		f.write(vm::get_super_ptr<u8>(mk_ea), px);
 		const u8* mapped = static_cast<const u8*>(m_vd1_gl_readback->map(0, dump_len));
 		f.write(mapped, dump_len);   // depth, G-buffer A out, light out, G-buffer A in (host words)
@@ -3811,5 +3918,42 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		m_vd1_gl_spu_ea[0] = lt_ea; m_vd1_gl_spu_ea[1] = lt_pitch; m_vd1_gl_spu_ea[2] = gb_ea; m_vd1_gl_spu_ea[3] = w | (h << 16);
 		rsx_log.success("vanillad1: gpu light: dump -> %s.bin (slot %u, %u lights, %ux%u)", name, slot, n, w, h);
 		c.dumps++;
+	}
+
+	if (gb_check)
+	{
+		// vanillad1: G-buffer byte on the GPU (X300.7): the surface's words (each host byte) and the gathered bytes against
+		// what NV0039 copied into guest memory earlier in this FIFO (VANILLAD1_GBUF_GPU=check runs the copy as before)
+		const u32 len = px * 5;
+		if (!m_vd1_gl_readback || m_vd1_gl_readback->size() < len)
+		{
+			m_vd1_gl_readback = std::make_unique<vk::buffer>(*m_device, len, m_device->get_memory_mapping().host_visible_coherent,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
+		}
+		const VkBufferCopy rb[2] = { { O_X, 0, px * 4 }, { O_M, px * 4, px } };
+		vkCmdCopyBuffer(*cmd, sb->value, m_vd1_gl_readback->value, 2, rb);
+		flush_command_queue(true);
+
+		const u8* mapped = static_cast<const u8*>(m_vd1_gl_readback->map(0, len));
+		const u32* words = reinterpret_cast<const u32*>(mapped);
+		const u8* gathered = mapped + px * 4;
+		const u8* guest = vm::get_super_ptr<u8>(mk_ea);
+		u32 off[4]{}, off_gathered = 0, first = umax, zeros = 0;
+		for (u32 i = 0; i < px; i++)
+		{
+			const u8 g = guest[i];
+			zeros += (g == 0) ? 1u : 0u;
+			for (u32 k = 0; k < 4; k++) off[k] += (((words[i] >> (8 * k)) & 255u) != g) ? 1u : 0u;
+			if (gathered[i] != g)
+			{
+				off_gathered++;
+				if (first == umax) first = i;
+			}
+		}
+		rsx_log.notice("vanillad1: gbuf gpu check: slot %u %ux%u, the copy's bytes against the surface's host byte 0 / 1 / 2 / 3: %u / %u / %u / %u off; "
+			"gathered (byte %u): %u off (first at %u: %02x, copy %02x); copy zeros %u",
+			slot, w, h, off[0], off[1], off[2], off[3], s_gb_shift / 8, off_gathered, first == umax ? 0u : first,
+			first == umax ? 0u : gathered[first], first == umax ? 0u : guest[first], zeros);
+		m_vd1_gl_readback->unmap();
 	}
 }

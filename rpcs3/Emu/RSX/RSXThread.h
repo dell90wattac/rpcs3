@@ -101,6 +101,18 @@ namespace rsx
 		u64 timestamp;
 	};
 
+	// vanillad1: G-buffer byte on the GPU (X300.7): an NV0039 copy's registers (nv0039.cpp), held back for the GPU lighting pass
+	struct vd1_nv0039_args
+	{
+		enum state_t : u8 { none, held, check };
+		state_t state = none;
+		u8 in_format = 0, out_format = 0;
+		s32 in_pitch = 0, out_pitch = 0;
+		u32 line_length = 0, line_count = 0;
+		u32 src_offset = 0, src_dma = 0, dst_offset = 0, dst_dma = 0;
+		u32 src = 0, dst = 0;   // the addresses (set when held)
+	};
+
 	// TODO: This class is a mess, this needs to be broken into smaller chunks, like I did for RSXFIFO and RSXZCULL (kd)
 	class thread : public cpu_thread, public GCM_context, public GRAPH_backend
 	{
@@ -454,6 +466,9 @@ namespace rsx
 		virtual bool scaled_image_from_memory(const blit_src_info& /*src_info*/, const blit_dst_info& /*dst_info*/, bool /*interpolate*/) { return false; }
 		// vanillad1: GPU lighting (X300.2): NV308A is about to write 0x60606060 to a lighting slot's "G-buffer ready" word
 		virtual void vd1_gpu_light_ready(u32 /*ready_word_ea*/) {}
+		// vanillad1: G-buffer byte on the GPU (X300.7): the NV0039 copy held back (nv0039::buffer_notify), for the pass to take
+		vd1_nv0039_args m_vd1_nv0039_held{};
+		u32 m_vd1_nv0039_released = 0;   // held copies that ran after all (logged by the pass every 10 s)
 
 
 		// Program public "get" handlers

@@ -12,6 +12,7 @@
 #include <emmintrin.h>
 #endif
 #include <cstdlib>
+#include <cstring> // vanillad1: G-buffer byte on the GPU (X300.7)
 
 #include "context_accessors.define.h"
 
@@ -118,29 +119,43 @@ namespace rsx
 			return true;
 		}
 
-		void buffer_notify(context* ctx, u32, u32 arg)
+		// vanillad1: G-buffer byte on the GPU (X300.7): VANILLAD1_GBUF_GPU=1 holds back Destiny's NV0039 4 -> 1 byte copy out of
+		// a local surface (G-buffer A 0xCE8E0000 -> the 8-bit buffer 0x444EFA80 the lighting job reads) while the GPU lighting
+		// pass is on: the pass takes the byte from the surface on the GPU (VKGSRender::vd1_gpu_light_ready) and the copy, with
+		// its readback of the surface (the RSX thread's own fault, ~1.5 ms a frame), never runs. A held copy the pass did not
+		// take runs at the ready word (before it lands: the SPUs wait for it), at the next NV0039 or at the flip.
+		// check = the copy runs as before and the pass compares its own bytes with it (every channel) every 10th frame.
+		int vd1_gbuf_gpu_mode()
 		{
-			s32 in_pitch = REGS(ctx)->nv0039_input_pitch();
-			s32 out_pitch = REGS(ctx)->nv0039_output_pitch();
-			const u32 line_length = REGS(ctx)->nv0039_line_length();  // Number of columns per row
-			const u32 line_count = REGS(ctx)->nv0039_line_count();    // Number of rows to copy
-			const u8 out_format = REGS(ctx)->nv0039_output_format();  // Column stride in bytes. Only the first byte is actually written to.
-			const u8 in_format = REGS(ctx)->nv0039_input_format();    // Column stride in bytes. Only the first byte is actually read from.
-			const u32 notify = arg;
-
-			if (!validate_buffer_notify(line_length, line_count, in_format, out_format))
+			static const int s_mode = []()
 			{
-				return;
-			}
+				const char* env = std::getenv("VANILLAD1_GBUF_GPU");
+				const char* gl = std::getenv("VANILLAD1_GPU_LIGHT");
+				int m = !env || !*env || *env == '0' ? 0 : !std::strcmp(env, "check") ? 2 : 1;
+				if (m && (!gl || !*gl || !std::strcmp(gl, "0") || !std::strcmp(gl, "probe")))
+				{
+					rsx_log.warning("vanillad1: VANILLAD1_GBUF_GPU=%s ignored: the GPU lighting pass is off (VANILLAD1_GPU_LIGHT)", env);
+					m = 0;
+				}
+				if (m) rsx_log.success("vanillad1: VANILLAD1_GBUF_GPU=%s: the G-buffer byte %s", env,
+					m == 2 ? "copied as before and compared with the GPU's" : "on the GPU (the NV0039 copy held back)");
+				return m;
+			}();
+			return s_mode;
+		}
 
-			rsx_log.trace("NV0039_BUFFER_NOTIFY: pitch(in=0x%x, out=0x%x), line(len=0x%x, cnt=0x%x), fmt(in=0x%x, out=0x%x), notify=0x%x",
-				in_pitch, out_pitch, line_length, line_count, in_format, out_format, notify);
-
-			u32 src_offset = REGS(ctx)->nv0039_input_offset();
-			u32 src_dma = REGS(ctx)->nv0039_input_location();
-
-			u32 dst_offset = REGS(ctx)->nv0039_output_offset();
-			u32 dst_dma = REGS(ctx)->nv0039_output_location();
+		static void do_buffer_notify(thread* rthr, const vd1_nv0039_args& a)
+		{
+			const s32 in_pitch = a.in_pitch;
+			const s32 out_pitch = a.out_pitch;
+			const u32 line_length = a.line_length;
+			const u32 line_count = a.line_count;
+			const u8 out_format = a.out_format;
+			const u8 in_format = a.in_format;
+			const u32 src_offset = a.src_offset;
+			const u32 src_dma = a.src_dma;
+			const u32 dst_offset = a.dst_offset;
+			const u32 dst_dma = a.dst_dma;
 
 			const auto in_width_in_bytes = line_length * in_format;
 			const auto out_width_in_bytes = line_length * out_format;
@@ -153,13 +168,13 @@ namespace rsx
 			const auto read_length = in_pitch * (line_count - 1) + in_width_in_bytes;
 			const auto write_length = out_pitch * (line_count - 1) + out_width_in_bytes;
 
-			RSX(ctx)->invalidate_fragment_program(dst_dma, dst_offset, write_length);
+			rthr->invalidate_fragment_program(dst_dma, dst_offset, write_length);
 
-			if (const auto result = RSX(ctx)->read_barrier(read_address, read_length, !is_block_transfer);
+			if (const auto result = rthr->read_barrier(read_address, read_length, !is_block_transfer);
 				result == rsx::result_zcull_intr)
 			{
 				// This transfer overlaps will zcull data pool
-				if (RSX(ctx)->copy_zcull_stats(read_address, read_length, write_address) >= write_length)
+				if (rthr->copy_zcull_stats(read_address, read_length, write_address) >= write_length)
 				{
 					// All writes deferred
 					return;
@@ -169,7 +184,7 @@ namespace rsx
 			// Deferred write_barrier on RSX side
 			utils::deferred_op deferred([&]()
 			{
-				RSX(ctx)->write_barrier(write_address, write_length);
+				rthr->write_barrier(write_address, write_length);
 				// res->release(0);
 			});
 
@@ -232,6 +247,71 @@ namespace rsx
 
 			block2d_copy(buf, src, line_length, line_count, in_pitch, line_length);
 			block2d_copy(dst, buf, line_length, line_count, line_length, out_pitch);
+		}
+
+		// vanillad1: G-buffer byte on the GPU (X300.7): a held copy runs now (the pass did not take it)
+		void vd1_release_held(thread* rthr)
+		{
+			const vd1_nv0039_args h = rthr->m_vd1_nv0039_held;
+			rthr->m_vd1_nv0039_held.state = vd1_nv0039_args::none;
+			if (h.state == vd1_nv0039_args::held)
+			{
+				rthr->m_vd1_nv0039_released++;
+				do_buffer_notify(rthr, h);
+			}
+		}
+
+		void buffer_notify(context* ctx, u32, u32 arg)
+		{
+			vd1_nv0039_args a{};
+			a.in_pitch = REGS(ctx)->nv0039_input_pitch();
+			a.out_pitch = REGS(ctx)->nv0039_output_pitch();
+			a.line_length = REGS(ctx)->nv0039_line_length();  // Number of columns per row
+			a.line_count = REGS(ctx)->nv0039_line_count();    // Number of rows to copy
+			a.out_format = REGS(ctx)->nv0039_output_format();  // Column stride in bytes. Only the first byte is actually written to.
+			a.in_format = REGS(ctx)->nv0039_input_format();    // Column stride in bytes. Only the first byte is actually read from.
+			const u32 notify = arg;
+
+			if (!validate_buffer_notify(a.line_length, a.line_count, a.in_format, a.out_format))
+			{
+				return;
+			}
+
+			rsx_log.trace("NV0039_BUFFER_NOTIFY: pitch(in=0x%x, out=0x%x), line(len=0x%x, cnt=0x%x), fmt(in=0x%x, out=0x%x), notify=0x%x",
+				a.in_pitch, a.out_pitch, a.line_length, a.line_count, a.in_format, a.out_format, notify);
+
+			a.src_offset = REGS(ctx)->nv0039_input_offset();
+			a.src_dma = REGS(ctx)->nv0039_input_location();
+
+			a.dst_offset = REGS(ctx)->nv0039_output_offset();
+			a.dst_dma = REGS(ctx)->nv0039_output_location();
+
+			if (const int vd1_mode = vd1_gbuf_gpu_mode()) [[unlikely]] // vanillad1: G-buffer byte on the GPU (X300.7)
+			{
+				vd1_release_held(RSX(ctx));
+
+				// Only the 4 -> 1 byte gather out of local memory (a render target) into main memory, one byte a 4-byte pixel
+				if (a.in_format == 4 && a.out_format == 1 && a.src_dma != a.dst_dma && a.in_pitch > 0 && a.out_pitch > 0)
+				{
+					a.src = get_address(a.src_offset, a.src_dma);
+					a.dst = get_address(a.dst_offset, a.dst_dma);
+					if (a.src >= rsx::constants::local_mem_base && a.dst < rsx::constants::local_mem_base)
+					{
+						a.state = vd1_mode == 1 ? vd1_nv0039_args::held : vd1_nv0039_args::check;
+						RSX(ctx)->m_vd1_nv0039_held = a;
+						static u32 s_logs = 0;
+						if (s_logs++ < 4)
+							rsx_log.notice("vanillad1: gbuf gpu: NV0039 0x%x (pitch %d) -> 0x%x (pitch %d), %u x %u, %s",
+								a.src, a.in_pitch, a.dst, a.out_pitch, a.line_length, a.line_count, vd1_mode == 1 ? "held" : "copied (check)");
+						if (vd1_mode == 1)
+						{
+							return;
+						}
+					}
+				}
+			}
+
+			do_buffer_notify(RSX(ctx), a);
 		}
 	}
 }

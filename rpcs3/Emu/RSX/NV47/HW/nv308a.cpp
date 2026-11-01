@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "nv308a.h"
+#include "nv0039.h" // vanillad1: G-buffer byte on the GPU (X300.7)
 
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/Core/RSXReservationLock.hpp"
@@ -88,6 +89,7 @@ namespace rsx
 				if (count == 1 && fifo_span[0] == 0x60606060u) // the backend checks the address (a slot's ready word)
 				{
 					RSX(ctx)->vd1_gpu_light_ready(dst_address);
+					nv0039::vd1_release_held(RSX(ctx)); // vanillad1: G-buffer byte on the GPU (X300.7): not taken: the copy runs before the word lands
 				}
 
 				const auto dst = vm::_ptr<u8>(dst_address);
