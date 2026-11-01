@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "VKHelpers.h"
 #include "VKGSRender.h"
 #include "VKCompute.h"
@@ -76,6 +77,12 @@ namespace vk
 
 		// Statistics counter reset. Also verifies that everything was deleted.
 		vk::vmm_reset();
+	}
+
+	bool vd1_draw_id_from_base_instance()
+	{
+		static const bool s_on = vd1::live(vd1::lf::E12) && g_render_device->get_shader_draw_parameters_support();
+		return s_on;
 	}
 
 	const vk::render_device *get_current_renderer()

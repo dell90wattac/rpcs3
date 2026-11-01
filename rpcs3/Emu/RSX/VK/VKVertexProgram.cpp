@@ -80,6 +80,15 @@ void VKVertexDecompilerThread::insertHeader(std::stringstream& OS)
 		"#extension GL_EXT_uniform_buffer_unsized_array : require\n"
 		"#extension GL_ARB_separate_shader_objects : enable\n\n";
 
+	// vanillad1: draw parameters through the instance base (X302, upstream 8e26652)
+	const bool use_base_instance = vk::vd1_draw_id_from_base_instance();
+	if (use_base_instance)
+	{
+		OS <<
+			"#extension GL_ARB_shader_draw_parameters : require\n"
+			"#define _VK_DRAW_ID_FROM_BASE_INSTANCE\n\n";
+	}
+
 	glsl::insert_subheader_block(OS);
 
 	OS <<
@@ -140,6 +149,13 @@ void VKVertexDecompilerThread::insertHeader(std::stringstream& OS)
 		.name = "DrawParametersBuffer"
 	};
 	inputs.push_back(std::move(layouts_input));
+
+	if (use_base_instance)
+	{
+		// Skip use of push constants
+		OS << "#define draw_parameters_offset uint(gl_BaseInstanceARB)\n\n";
+		return;
+	}
 
 	OS <<
 		"layout(push_constant) uniform push_constants_block\n"

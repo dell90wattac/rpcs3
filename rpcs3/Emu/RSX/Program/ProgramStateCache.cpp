@@ -635,9 +635,16 @@ fragment_program_utils::fragment_program_metadata fragment_program_utils::analys
 		index++;
 	}
 
+	// vanillad1: fragment hash (X302): the same rotating checksum as get_fragment_program_ucode_hash, over the same instructions
+	const s32 vd1_hash_start = index;
+	usz vd1_acc0 = 0;
+	usz vd1_acc1 = 0;
+
 	while (true)
 	{
 		const auto inst = v128::loadu(instBuffer, index);
+		vd1_acc0 += std::rotr(inst._u64[0], (index - vd1_hash_start) * 2);
+		vd1_acc1 += std::rotr(inst._u64[1], ((index - vd1_hash_start) * 2) + 1);
 		const auto d0 = OPDEST::from_be32(inst._u32[0]);
 		const auto opcode = static_cast<rsx::assembler::FP_opcode>(d0.opcode);
 
@@ -695,6 +702,7 @@ fragment_program_utils::fragment_program_metadata fragment_program_utils::analys
 	}
 
 	result.program_ucode_length = (index - (result.program_start_offset / 16)) * 16;
+	result.ucode_hash = vd1_acc0 + vd1_acc1; // vanillad1: fragment hash (X302)
 	return result;
 }
 
@@ -721,7 +729,7 @@ usz fragment_program_utils::get_fragment_program_ucode_hash(const RSXFragmentPro
 
 usz fragment_program_storage_hash::operator()(const RSXFragmentProgram& program) const
 {
-	const usz ucode_hash = fragment_program_utils::get_fragment_program_ucode_hash(program);
+	const usz ucode_hash = program.ucode_hash ? program.ucode_hash : fragment_program_utils::get_fragment_program_ucode_hash(program); // vanillad1: fragment hash (X302)
 	const u32 state_params[] =
 	{
 		program.ctrl,

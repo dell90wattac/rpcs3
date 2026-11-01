@@ -35,6 +35,8 @@ namespace vk
 	using host_data_t = rsx::host_gpu_context_t;
 }
 
+void vd1_purge_upload_caches(); // vanillad1: index and multi-block vertex caches (X302): VKVertexBuffers.cpp
+
 class VKGSRender : public GSRender, public ::rsx::reports::ZCULL_control
 {
 private:
@@ -161,6 +163,7 @@ private:
 	u64 m_xform_constants_dynamic_offset = 0;          // We manage transform_constants dynamic offset manually to alleviate performance penalty of doing a hot-patch of constants.
 	u64 m_vertex_env_dynamic_offset = 0;
 	u64 m_vertex_layout_dynamic_offset = 0;
+	u32 m_draw_parameters_index = 0;                   // vanillad1: draw parameters through the instance base (X302): current subdraw id + layout offset id
 	u64 m_fragment_constants_dynamic_offset = 0;
 	u64 m_fragment_env_dynamic_offset = 0;
 	u64 m_texture_parameters_dynamic_offset = 0;
@@ -203,6 +206,18 @@ private:
 
 	//Vertex layout
 	rsx::vertex_input_layout m_vertex_layout;
+
+	// vanillad1: vertex layout reuse (X302): what analyse_inputs_interleaved last read
+	struct vd1_layout_key_t
+	{
+		bool valid = false;
+		u32 input_mask = 0;
+		u32 frequency_mask = 0;
+		u32 format[16]{};
+		u32 offset[16]{};
+		u8 register_size[16]{};
+	}
+	m_vd1_layout_key;
 
 	vk::shader_interpreter m_shader_interpreter;
 	u32 m_interpreter_state;

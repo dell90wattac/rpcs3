@@ -193,6 +193,8 @@ static const std::string rsx_fp_op_names[] =
 
 struct RSXFragmentProgram
 {
+	usz ucode_hash = 0; // vanillad1: fragment hash (X302): from the analysis; 0 = work it out from the ucode
+
 	struct data_storage_helper
 	{
 		void* data_ptr = nullptr;

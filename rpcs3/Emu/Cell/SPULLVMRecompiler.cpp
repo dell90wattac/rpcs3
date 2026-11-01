@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "SPURecompiler.h"
 
 #include "Emu/System.h"
@@ -4746,6 +4747,37 @@ public:
 		}
 		case SPU_RdDec:
 		{
+			// vanillad1: dead RdDec (X302): the library delay loop reads the clock and throws the value away. Only when the next
+			// instruction overwrites rt without reading it. The flag counts when a block compiles, so set it at boot.
+			if (vd1::live(vd1::lf::E16) && m_next_op)
+			{
+				const spu_opcode_t next_op{std::bit_cast<be_t<u32>>(m_next_op)};
+				const auto next_flags = +g_spu_iflag.decode(next_op.opcode);
+				const bool reads_rt = ((next_flags & +spu_iflag::use_ra) && next_op.ra == op.rt) || ((next_flags & +spu_iflag::use_rb) && next_op.rb == op.rt);
+				bool overwrites_rt = false;
+
+				switch (g_spu_itype.decode(next_op.opcode))
+				{
+				case spu_itype::A: case spu_itype::AH: case spu_itype::AI: case spu_itype::AHI:
+				case spu_itype::SF: case spu_itype::SFH: case spu_itype::SFI: case spu_itype::SFHI:
+				case spu_itype::AND: case spu_itype::ANDI: case spu_itype::OR: case spu_itype::ORI: case spu_itype::XOR: case spu_itype::XORI:
+				case spu_itype::IL: case spu_itype::ILH: case spu_itype::ILHU: case spu_itype::ILA:
+				case spu_itype::CEQ: case spu_itype::CEQI: case spu_itype::CGT: case spu_itype::CGTI: case spu_itype::CLGT: case spu_itype::CLGTI:
+				case spu_itype::SHLI: case spu_itype::ROTMI:
+					overwrites_rt = next_op.rt == op.rt;
+					break;
+				default:
+					break;
+				}
+
+				if (overwrites_rt && !reads_rt)
+				{
+					spu_log.notice("vanillad1: dead RdDec at 0x%x", m_pos);
+					res.value = m_ir->getInt32(0);
+					break;
+				}
+			}
+
 #if defined(ARCH_X64) || defined(ARCH_ARM64)
 			if (utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
 			{

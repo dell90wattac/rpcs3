@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h"
 #include "RSXThread.h"
 
 #include "Capture/rsx_capture.h"
@@ -2220,6 +2221,7 @@ namespace rsx
 		current_fragment_program.data = (static_cast<u8*>(data_ptr) + current_fp_metadata.program_start_offset);
 		current_fragment_program.offset = program_offset + current_fp_metadata.program_start_offset;
 		current_fragment_program.ucode_length = current_fp_metadata.program_ucode_length;
+		current_fragment_program.ucode_hash = vd1::live(vd1::lf::E21) ? current_fp_metadata.ucode_hash : 0; // vanillad1: fragment hash (X302)
 		current_fragment_program.total_length = real_total_length;
 		current_fragment_program.texture_state.import(current_fp_texture_state, current_fp_metadata.referenced_textures_mask);
 		current_fragment_program.valid = true;
@@ -2264,12 +2266,66 @@ namespace rsx
 		current_vertex_program.data.reserve(512 * 4);
 		current_vertex_program.jump_table.clear();
 
-		current_vp_metadata = program_hash_util::vertex_program_utils::analyse_vertex_program
-		(
-			method_registers.transform_program.data(),  // Input raw block
-			transform_program_start,                    // Address of entry point
-			current_vertex_program                      // [out] Program object
-		);
+		// vanillad1: vertex program cache (X302): the analysis depends only on the entry point and the words it walked, so an
+		// exact match of those words repeats its result. ~65 % of the game's program switches hit 16 entries.
+		struct vd1_vp_entry
+		{
+			u32 entry = umax;
+			u32 base_address = 0;
+			std::vector<u32> raw;
+			std::vector<u32> data;
+			std::set<u32> jump_table;
+			bit_set<rsx::max_vertex_program_instructions> instruction_mask;
+			program_hash_util::vertex_program_utils::vertex_program_metadata metadata{};
+		};
+
+		static auto* s_vd1_vp_cache = new std::array<vd1_vp_entry, 16>();
+		static u32 s_vd1_vp_next = 0;
+
+		const bool vd1_vp_on = vd1::live(vd1::lf::E20) != 0;
+		bool vd1_vp_hit = false;
+		if (vd1_vp_on)
+		{
+			for (const auto& e : *s_vd1_vp_cache)
+			{
+				if (e.entry == transform_program_start &&
+					std::memcmp(method_registers.transform_program.data() + (e.base_address * 4), e.raw.data(), e.raw.size() * sizeof(u32)) == 0)
+				{
+					current_vertex_program.base_address = e.base_address;
+					current_vertex_program.entry = e.entry;
+					current_vertex_program.data = e.data;
+					current_vertex_program.jump_table = e.jump_table;
+					current_vertex_program.instruction_mask = e.instruction_mask;
+					current_vp_metadata = e.metadata;
+					vd1_vp_hit = true;
+					break;
+				}
+			}
+		}
+
+		if (!vd1_vp_hit)
+		{
+			current_vp_metadata = program_hash_util::vertex_program_utils::analyse_vertex_program
+			(
+				method_registers.transform_program.data(),  // Input raw block
+				transform_program_start,                    // Address of entry point
+				current_vertex_program                      // [out] Program object
+			);
+
+			if (vd1_vp_on)
+			{
+				auto& e = (*s_vd1_vp_cache)[s_vd1_vp_next];
+				s_vd1_vp_next = (s_vd1_vp_next + 1) % ::size32(*s_vd1_vp_cache);
+				const u32* raw = method_registers.transform_program.data() + (current_vertex_program.base_address * 4);
+				e.entry = transform_program_start;
+				e.base_address = current_vertex_program.base_address;
+				e.raw.assign(raw, raw + (current_vp_metadata.ucode_length / sizeof(u32)));
+				e.data = current_vertex_program.data;
+				e.jump_table = current_vertex_program.jump_table;
+				e.instruction_mask = current_vertex_program.instruction_mask;
+				e.metadata = current_vp_metadata;
+			}
+		}
 
 		current_vertex_program.texture_state.import(current_vp_texture_state, current_vp_metadata.referenced_textures_mask);
 

@@ -2671,14 +2671,18 @@ void VKGSRender::update_vertex_env(u32 id, const vk::vertex_upload_info& vertex_
 	dst->fs_texture_base_index = fs_texture_base_index;
 	dst->fs_stipple_pattern_offset = fs_stipple_pattern_offset;
 
-	const u32 push_val = vertex_layout_offset + id;
-	vkCmdPushConstants(
-		*m_current_command_buffer,
-		m_program->layout(),
-		VK_SHADER_STAGE_VERTEX_BIT,
-		0,
-		4,
-		&push_val);
+	// vanillad1: draw parameters through the instance base (X302, upstream 8e26652): the vertex shader reads it from there when on
+	m_draw_parameters_index = vertex_layout_offset + id;
+	if (!vk::vd1_draw_id_from_base_instance())
+	{
+		vkCmdPushConstants(
+			*m_current_command_buffer,
+			m_program->layout(),
+			VK_SHADER_STAGE_VERTEX_BIT,
+			0,
+			4,
+			&m_draw_parameters_index);
+	}
 
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
 	{

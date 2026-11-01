@@ -200,6 +200,7 @@ void VKGSRender::advance_queued_frames()
 	vk::remove_unused_framebuffers();
 
 	m_vertex_cache->purge();
+	vd1_purge_upload_caches(); // vanillad1: index and multi-block vertex caches (X302)
 	m_current_frame->tag_frame_end();
 
 	m_queued_frames.push_back(m_current_frame);

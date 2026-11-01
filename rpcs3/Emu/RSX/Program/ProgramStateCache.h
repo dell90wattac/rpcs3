@@ -61,6 +61,7 @@ namespace program_hash_util
 			bool has_pack_instructions;
 			bool has_branch_instructions;
 			bool is_nop_shader;           // Does this affect Z-pass testing???
+			usz ucode_hash;               // vanillad1: fragment hash (X302): get_fragment_program_ucode_hash's value, 0 = not worked out
 		};
 
 		/**

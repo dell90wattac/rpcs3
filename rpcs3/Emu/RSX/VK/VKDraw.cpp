@@ -300,8 +300,41 @@ void VKGSRender::update_draw_state()
 	m_frame_stats.setup_time += m_profiler.duration();
 }
 
+// vanillad1: texture bind memo (X302): per slot, the last few plain uploads this frame by their registers. Only shader_read
+// descriptors with an image; emptied whenever m_samplers_dirty is seen (faults, blits, every frame).
+struct vd1_texture_memo_entry
+{
+	u32 regs[9];
+	vk::texture_cache::sampled_image_descriptor desc;
+};
+
+struct vd1_texture_memo_slot
+{
+	std::array<vd1_texture_memo_entry, 4> entries;
+	u32 used = 0;
+	u32 next = 0;
+};
+
+static std::array<vd1_texture_memo_slot, rsx::limits::fragment_textures_count>& vd1_texture_memo()
+{
+	static auto* s_memo = new std::array<vd1_texture_memo_slot, rsx::limits::fragment_textures_count>();
+	return *s_memo;
+}
+
 void VKGSRender::load_texture_env()
 {
+	// vanillad1: texture bind memo (X302)
+	const bool vd1_memo_on = vd1::live(vd1::lf::E6) != 0;
+	auto& vd1_memo = vd1_texture_memo();
+	if (!vd1_memo_on || m_samplers_dirty)
+	{
+		for (auto& slot : vd1_memo)
+		{
+			slot.used = 0;
+			slot.next = 0;
+		}
+	}
+
 	// Load textures
 	bool check_for_cyclic_refs = false;
 	auto check_surface_cache_sampler_valid = [&](auto descriptor, const auto& tex)
@@ -356,7 +389,41 @@ void VKGSRender::load_texture_env()
 			continue;
 		}
 
-		*sampler_state = m_texture_cache.upload_texture(*m_current_command_buffer, tex, m_rtts);
+		// vanillad1: texture bind memo (X302)
+		bool vd1_memo_hit = false;
+		u32 vd1_regs[9]{};
+		if (vd1_memo_on)
+		{
+			std::memcpy(vd1_regs, &rsx::method_registers.registers[NV4097_SET_TEXTURE_OFFSET + (i * 8)], 8 * sizeof(u32));
+			vd1_regs[8] = rsx::method_registers.registers[NV4097_SET_TEXTURE_CONTROL3 + i];
+			auto& slot = vd1_memo[i];
+			for (u32 n = 0; n < slot.used; n++)
+			{
+				if (std::memcmp(slot.entries[n].regs, vd1_regs, sizeof(vd1_regs)) == 0)
+				{
+					*sampler_state = slot.entries[n].desc;
+					vd1_memo_hit = true;
+					break;
+				}
+			}
+		}
+
+		if (!vd1_memo_hit)
+		{
+			*sampler_state = m_texture_cache.upload_texture(*m_current_command_buffer, tex, m_rtts);
+
+			if (vd1_memo_on && sampler_state->image_handle && !sampler_state->is_cyclic_reference &&
+				sampler_state->upload_context == rsx::texture_upload_context::shader_read)
+			{
+				auto& slot = vd1_memo[i];
+				auto& entry = slot.entries[slot.next];
+				std::memcpy(entry.regs, vd1_regs, sizeof(vd1_regs));
+				entry.desc = *sampler_state;
+				slot.next = (slot.next + 1) % ::size32(slot.entries);
+				slot.used = std::max(slot.used, slot.next == 0 ? ::size32(slot.entries) : slot.next);
+			}
+		}
+
 		if (!sampler_state->validate())
 		{
 			continue;
@@ -1004,17 +1071,67 @@ bool VKGSRender::bind_interpreter_texture_env()
 	return out_of_memory;
 }
 
+// vanillad1: vertex layout reuse (X302): true if the registers analyse_inputs_interleaved reads match the last analysis.
+// Always false for immediate and inlined draws, whose layout comes from the push buffers.
+template <typename key_type, typename metadata_type>
+static bool vd1_layout_unchanged(key_type& key, const metadata_type& vp_metadata)
+{
+	const auto& regs = rsx::method_registers;
+	const auto& clause = regs.current_draw_clause;
+
+	if (!vd1::live(vd1::lf::E7) || clause.is_immediate_draw || clause.command == rsx::draw_command::inlined_array)
+	{
+		key.valid = false;
+		return false;
+	}
+
+	const u32 input_mask = regs.vertex_attrib_input_mask() & vp_metadata.referenced_inputs_mask;
+	const u32 frequency_mask = regs.frequency_divider_operation_mask();
+	const u32* format = &regs.registers[NV4097_SET_VERTEX_DATA_ARRAY_FORMAT];
+	const u32* offset = &regs.registers[NV4097_SET_VERTEX_DATA_ARRAY_OFFSET];
+
+	u8 register_size[16];
+	for (u32 i = 0; i < 16; i++)
+	{
+		register_size[i] = regs.register_vertex_info[i].size;
+	}
+
+	const bool same = key.valid && key.input_mask == input_mask && key.frequency_mask == frequency_mask &&
+		std::memcmp(key.format, format, sizeof(key.format)) == 0 &&
+		std::memcmp(key.offset, offset, sizeof(key.offset)) == 0 &&
+		std::memcmp(key.register_size, register_size, sizeof(key.register_size)) == 0;
+
+	if (!same)
+	{
+		key.valid = true;
+		key.input_mask = input_mask;
+		key.frequency_mask = frequency_mask;
+		std::memcpy(key.format, format, sizeof(key.format));
+		std::memcpy(key.offset, offset, sizeof(key.offset));
+		std::memcpy(key.register_size, register_size, sizeof(key.register_size));
+	}
+
+	return same;
+}
+
 void VKGSRender::emit_geometry(u32 sub_index)
 {
 	auto &draw_call = rsx::method_registers.current_draw_clause;
 	m_profiler.start();
 
 	const rsx::flags32_t vertex_state_mask = rsx::vertex_base_changed | rsx::vertex_arrays_changed;
-	const rsx::flags32_t state_flags = (sub_index == 0) ? rsx::vertex_arrays_changed : draw_call.execute_pipeline_dependencies(m_ctx);
+	rsx::flags32_t state_flags = (sub_index == 0) ? rsx::vertex_arrays_changed : draw_call.execute_pipeline_dependencies(m_ctx);
+
+	// vanillad1: vertex layout reuse (X302): half the draws leave the arrays alone; the rebase below still handles a moved base
+	if (sub_index == 0 && vd1_layout_unchanged(m_vd1_layout_key, current_vp_metadata))
+	{
+		state_flags = rsx::vertex_base_changed;
+	}
 
 	if (state_flags & rsx::vertex_arrays_changed)
 	{
 		m_draw_processor.analyse_inputs_interleaved(m_vertex_layout, current_vp_metadata);
+		if (sub_index != 0) m_vd1_layout_key.valid = false; // vanillad1: vertex layout reuse (X302): this layout isn't the key's
 	}
 	else if (state_flags & rsx::vertex_base_changed)
 	{
@@ -1188,23 +1305,26 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	// Bind the new set of descriptors for use with this draw call
 	m_frame_stats.setup_time += m_profiler.duration();
 
+	// vanillad1: draw parameters through the instance base (X302, upstream 8e26652)
+	const u32 first_instance = vk::vd1_draw_id_from_base_instance() ? m_draw_parameters_index : 0;
+
 	if (!upload_info.index_info)
 	{
 		if (draw_call.is_trivial_instanced_draw)
 		{
 			m_frame_stats.vd1_inst++;
 			if (rsx::FIFO::vd1_flatten_log()) { static u32 s_n = 0; if (s_n++ < 300) rsx_log.notice("vanillad1 inst: passes=%u elements=%u", draw_call.pass_count(), upload_info.vertex_draw_count); } // vanillad1: flatten repeat draws (P8)
-			vkCmdDraw(*m_current_command_buffer, upload_info.vertex_draw_count, draw_call.pass_count(), 0, 0);
+			vkCmdDraw(*m_current_command_buffer, upload_info.vertex_draw_count, draw_call.pass_count(), 0, first_instance);
 		}
 		else if (draw_call.is_single_draw())
 		{
-			vkCmdDraw(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, 0);
+			vkCmdDraw(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, first_instance);
 		}
 		else if (m_device->get_multidraw_support())
 		{
 			const auto subranges = draw_call.get_subranges();
 			auto ptr = utils::bless<const VkMultiDrawInfoEXT>(& subranges.front().first);
-			_vkCmdDrawMultiEXT(*m_current_command_buffer, ::size32(subranges), ptr, 1, 0, sizeof(rsx::draw_range_t));
+			_vkCmdDrawMultiEXT(*m_current_command_buffer, ::size32(subranges), ptr, 1, first_instance, sizeof(rsx::draw_range_t));
 		}
 		else
 		{
@@ -1212,7 +1332,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 			const auto subranges = draw_call.get_subranges();
 			for (const auto &range : subranges)
 			{
-				vkCmdDraw(*m_current_command_buffer, range.count, 1, vertex_offset, 0);
+				vkCmdDraw(*m_current_command_buffer, range.count, 1, vertex_offset, first_instance);
 				vertex_offset += range.count;
 			}
 		}
@@ -1228,11 +1348,11 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		{
 			m_frame_stats.vd1_inst++;
 			if (rsx::FIFO::vd1_flatten_log()) { static u32 s_n = 0; if (s_n++ < 300) rsx_log.notice("vanillad1 inst: passes=%u elements=%u", draw_call.pass_count(), upload_info.vertex_draw_count); } // vanillad1: flatten repeat draws (P8)
-			vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, draw_call.pass_count(), 0, 0, 0);
+			vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, draw_call.pass_count(), 0, 0, first_instance);
 		}
 		else if (rsx::method_registers.current_draw_clause.is_single_draw())
 		{
-			vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, 0, 0);
+			vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, 0, first_instance);
 		}
 		else if (m_device->get_multidraw_support())
 		{
@@ -1256,7 +1376,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 				_ptr++;
 				vertex_offset += count;
 			}
-			_vkCmdDrawMultiIndexedEXT(*m_current_command_buffer, subranges_count, base_ptr, 1, 0, sizeof(VkMultiDrawIndexedInfoEXT), nullptr);
+			_vkCmdDrawMultiIndexedEXT(*m_current_command_buffer, subranges_count, base_ptr, 1, first_instance, sizeof(VkMultiDrawIndexedInfoEXT), nullptr);
 		}
 		else
 		{
@@ -1265,7 +1385,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 			for (const auto &range : subranges)
 			{
 				const auto count = get_index_count(draw_call.primitive, range.count);
-				vkCmdDrawIndexed(*m_current_command_buffer, count, 1, vertex_offset, 0, 0);
+				vkCmdDrawIndexed(*m_current_command_buffer, count, 1, vertex_offset, 0, first_instance);
 				vertex_offset += count;
 			}
 		}
