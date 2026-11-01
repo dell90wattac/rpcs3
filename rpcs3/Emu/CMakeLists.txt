@@ -8,6 +8,7 @@ add_library(rpcs3_emu STATIC
     stb_image.cpp
     System.cpp
     system_config.cpp
+    vd1_live.cpp
     system_config_types.cpp
     system_progress.cpp
     system_utils.cpp

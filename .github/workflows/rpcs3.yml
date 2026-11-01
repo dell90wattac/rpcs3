@@ -8,6 +8,7 @@ on:
     branches:
       - master # Only trigger push event on 'master' branch
       - 'p18-*' # vanillad1 (P18): a push builds (no dispatch form needed)
+      - 'p19-*' # vanillad1 (X302)
   pull_request:
   workflow_dispatch:
 
@@ -260,7 +261,7 @@ jobs:
   Windows_Build:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || startsWith(github.ref_name, 'p18-') || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    if: github.event_name != 'push' || startsWith(github.ref_name, 'p18-') || startsWith(github.ref_name, 'p19-') || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
     name: RPCS3 Windows
     runs-on: windows-2025-vs2026
     env:

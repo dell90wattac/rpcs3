@@ -981,6 +981,9 @@
     <ClCompile Include="Emu\system_config.cpp">
       <Filter>Emu</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\vd1_live.cpp">
+      <Filter>Emu</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\Audio\AudioBackend.cpp">
       <Filter>Emu\Audio</Filter>
     </ClCompile>
