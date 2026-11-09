@@ -115,12 +115,22 @@ namespace vk
 		}
 	}
 
+	// vanillad1: clip guard (the cutscene clips' fatal, VKTexture.cpp:134): a copy region that does not fit its image is skipped and
+	// logged with its caller instead of an ensure killing the RSX thread; the first 8 and every 1000th are logged
+	static bool vd1_clip_guard_log_now(u32& n)
+	{
+		static std::atomic<u32> s_count{0};
+		n = s_count.fetch_add(1) + 1;
+		return n <= 8 || (n % 1000) == 0;
+	}
+
 	void copy_image_to_buffer(
 		const vk::command_buffer& cmd,
 		const vk::image* src,
 		const vk::buffer* dst,
 		const VkBufferImageCopy& region,
-		const image_readback_options_t& options)
+		const image_readback_options_t& options,
+		std::source_location vd1_caller)
 	{
 		// Always validate
 		ensure(src->current_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || src->current_layout == VK_IMAGE_LAYOUT_GENERAL);
@@ -130,8 +140,18 @@ namespace vk
 			vk::end_renderpass(cmd);
 		}
 
-		ensure((region.imageExtent.width + region.imageOffset.x) <= src->width());
-		ensure((region.imageExtent.height + region.imageOffset.y) <= src->height());
+		// vanillad1: clip guard: was two ensures (VKTexture.cpp:133-134)
+		if ((region.imageExtent.width + region.imageOffset.x) > src->width() ||
+			(region.imageExtent.height + region.imageOffset.y) > src->height())
+		{
+			if (u32 n; vd1_clip_guard_log_now(n))
+			{
+				rsx_log.warning("vanillad1: clip guard: copy_image_to_buffer from %s:%u (%s) skipped (#%u): image %ux%u format %d, region at (%d,%d) %ux%u",
+					vd1_caller.file_name(), vd1_caller.line(), vd1_caller.function_name(), n, src->width(), src->height(),
+					static_cast<int>(src->format()), region.imageOffset.x, region.imageOffset.y, region.imageExtent.width, region.imageExtent.height);
+			}
+			return;
+		}
 
 		switch (src->format())
 		{
@@ -400,9 +420,25 @@ namespace vk
 		vk::image* src, vk::image* dst,
 		const coord3i& src_rect, const coord3i& dst_rect,
 		const rsx::image_copy_subresource_layers& mip_layers,
-		VkImageAspectFlags src_transfer_mask, VkImageAspectFlags dst_transfer_mask)
+		VkImageAspectFlags src_transfer_mask, VkImageAspectFlags dst_transfer_mask,
+		std::source_location vd1_caller)
 	{
 		ensure(!src_rect.is_flipped() && !dst_rect.is_flipped()); //<- Flip conversion must be handled by the caller.
+
+		// vanillad1: clip guard: both rectangles inside their images, else nothing is recorded (the destination keeps its contents)
+		if (src_rect.x < 0 || src_rect.y < 0 || dst_rect.x < 0 || dst_rect.y < 0 ||
+			static_cast<u32>(src_rect.x + src_rect.width) > src->width() || static_cast<u32>(src_rect.y + src_rect.height) > src->height() ||
+			static_cast<u32>(dst_rect.x + dst_rect.width) > dst->width() || static_cast<u32>(dst_rect.y + dst_rect.height) > dst->height())
+		{
+			if (u32 n; vd1_clip_guard_log_now(n))
+			{
+				rsx_log.warning("vanillad1: clip guard: copy_image_typeless from %s:%u (%s) skipped (#%u): src %ux%u format %d rect (%d,%d) %dx%d -> dst %ux%u format %d rect (%d,%d) %dx%d",
+					vd1_caller.file_name(), vd1_caller.line(), vd1_caller.function_name(), n,
+					src->width(), src->height(), static_cast<int>(src->format()), src_rect.x, src_rect.y, src_rect.width, src_rect.height,
+					dst->width(), dst->height(), static_cast<int>(dst->format()), dst_rect.x, dst_rect.y, dst_rect.width, dst_rect.height);
+			}
+			return;
+		}
 
 		if (src->format() == dst->format())
 		{

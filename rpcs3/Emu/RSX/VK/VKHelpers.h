@@ -93,14 +93,17 @@ namespace vk
 	// Other texture management helpers
 	bool vd1_draw_id_from_base_instance(); // vanillad1: draw parameters through the instance base (X302): read once, at the first shader
 
-	void copy_image_to_buffer(const vk::command_buffer& cmd, const vk::image* src, const vk::buffer* dst, const VkBufferImageCopy& region, const image_readback_options_t& options = {});
+	// vanillad1: clip guard: the caller, for the log line when a region does not fit
+	void copy_image_to_buffer(const vk::command_buffer& cmd, const vk::image* src, const vk::buffer* dst, const VkBufferImageCopy& region, const image_readback_options_t& options = {},
+			std::source_location vd1_caller = std::source_location::current());
 	void copy_buffer_to_image(const vk::command_buffer& cmd, const vk::buffer* src, const vk::image* dst, const VkBufferImageCopy& region);
 	u64  calculate_working_buffer_size(u64 base_size, VkImageAspectFlags aspect);
 
 	void copy_image_typeless(const command_buffer &cmd, image *src, image *dst,
 			const coord3i& src_rect, const coord3i& dst_rect,
 			const rsx::image_copy_subresource_layers& mip_layers = {},
-			VkImageAspectFlags src_transfer_mask = 0xFF, VkImageAspectFlags dst_transfer_mask = 0xFF);
+			VkImageAspectFlags src_transfer_mask = 0xFF, VkImageAspectFlags dst_transfer_mask = 0xFF,
+			std::source_location vd1_caller = std::source_location::current()); // vanillad1: clip guard
 
 	void copy_image(const vk::command_buffer& cmd, vk::image* src, vk::image* dst,
 			const coord3i& src_rect, const coord3i& dst_rect,
