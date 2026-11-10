@@ -138,6 +138,8 @@ namespace rsx
 		atomic_t<bool> rsx_thread_running{ false };
 		std::vector<std::pair<u32, u32>> dump_callstack_list() const override;
 		void dump_misc(std::string& ret, std::any& custom_data) const override;
+		// vanillad1: label safety (X421): called by the self-jump rescue (VANILLAD1_LABEL_TRACE dumps the label history there)
+		virtual void vd1_label_stall_dump(u32 /*get*/, u32 /*put*/) {}
 
 	protected:
 		FIFO::flattening_helper m_flattener;
@@ -145,6 +147,11 @@ namespace rsx
 		bool m_vd1_label_open = false;
 		u32 m_vd1_label_n = 0;
 		virtual void vd1_label_flush() {}
+		// vanillad1: label safety (X421): VANILLAD1_LABEL_SAFE bits and the trace switch (set by the backend), why the next flush happens
+		u32 m_vd1_label_safe = 0;
+		bool m_vd1_ltrace = false;
+		char m_vd1_flush_why = '?';
+		virtual void vd1_label_note(char /*kind*/, u32 /*a*/, u32 /*b*/) {}
 		u32 fifo_ret_addr = RSX_CALL_STACK_EMPTY;
 		u32 saved_fifo_ret = RSX_CALL_STACK_EMPTY;
 		u32 restore_fifo_cmd = 0;

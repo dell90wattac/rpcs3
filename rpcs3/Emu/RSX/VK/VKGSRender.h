@@ -114,6 +114,13 @@ private:
 	vk::command_buffer_chunk* m_vd1_label_cb = nullptr;
 	u32 m_vd1_label_count = 0;
 	u64 m_vd1_label_last_id = 0;
+	// vanillad1: label safety (X421): when the open batch began, the label addresses in it (bit 8), the trace and the stall dump
+	u64 m_vd1_label_open_t = 0;
+	u32 m_vd1_batch_addr[64]{};
+	u32 m_vd1_batch_naddr = 0;
+	void vd1_ltrace(char path, u32 type, u32 addr, u32 value);
+	void vd1_label_note(char kind, u32 a, u32 b) override;
+	void vd1_label_stall_dump(u32 get, u32 put) override;
 
 	vk::command_pool m_command_buffer_pool;
 	vk::command_buffer_chain<VK_MAX_ASYNC_CB_COUNT> m_primary_cb_list;

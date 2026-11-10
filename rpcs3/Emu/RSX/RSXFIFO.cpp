@@ -388,6 +388,8 @@ namespace rsx
 							rsx_log.error("vanillad1 selfjump: RSX spun %.1fs on a jump-to-self at io 0x%x (ea 0x%x, cmd 0x%x) with put 0x%x; continuing at io 0x%x",
 								(now - s_spin_since) / 1'000'000., m_memwatch_addr, addr, m_memwatch_cmp, put, m_memwatch_addr + 4);
 
+							m_thread->vd1_label_stall_dump(m_memwatch_addr, put); // vanillad1: label safety (X421)
+
 							invalidate_cache();
 							m_ctrl->get.release(m_internal_get = m_memwatch_addr + 4);
 							m_remaining_commands = 0;
@@ -905,7 +907,7 @@ namespace rsx
 		if (cmd & (0xffff0000 | RSX_METHOD_NON_METHOD_CMD_MASK)) [[unlikely]]
 		{
 			// vanillad1: label batching (P9): the FIFO ran dry (FIFO_EMPTY, also the jump-to-self spin; not the game's NOP padding, FIFO_NOP): the guest may be waiting for a label
-			if (m_vd1_label_open && cmd == FIFO::FIFO_EMPTY) vd1_label_flush();
+			if (m_vd1_label_open && cmd == FIFO::FIFO_EMPTY) { m_vd1_flush_why = 'E'; vd1_label_flush(); } // vanillad1: label safety (X421): why
 			// Check for special FIFO commands
 			switch (cmd)
 			{
@@ -950,6 +952,17 @@ namespace rsx
 				recover_fifo();
 				return;
 			}
+			}
+
+			// vanillad1: label safety (X421): bit 32 writes an open batch at a jump, call or return; the trace notes them
+			if (m_vd1_label_open && (m_vd1_label_safe & 32)) [[unlikely]]
+			{
+				m_vd1_flush_why = 'J';
+				vd1_label_flush();
+			}
+			if (m_vd1_ltrace) [[unlikely]]
+			{
+				vd1_label_note('J', fifo_ctrl->get_pos(), cmd);
 			}
 
 			// Check for flow control
@@ -1151,10 +1164,17 @@ namespace rsx
 			const u32 reg = (command.reg & 0xffff) >> 2;
 			const u32 value = command.value;
 			// vanillad1: label batching (P9): burst mode (n = 1) flushes at the first command that is not a label method; any n before a wait
+			// vanillad1: label safety (X421): bit 2 also before NV406E_SET_REFERENCE; the trace notes references and acquires
 			if (m_vd1_label_open && (reg == NV406E_SEMAPHORE_ACQUIRE || (m_vd1_label_n == 1 &&
-				reg != NV4097_SET_SEMAPHORE_OFFSET && reg != NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE && reg != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE))) [[unlikely]]
+				reg != NV4097_SET_SEMAPHORE_OFFSET && reg != NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE && reg != NV4097_TEXTURE_READ_SEMAPHORE_RELEASE) ||
+				((m_vd1_label_safe & 2) && reg == NV406E_SET_REFERENCE))) [[unlikely]]
 			{
+				m_vd1_flush_why = reg == NV406E_SEMAPHORE_ACQUIRE ? 'A' : (reg == NV406E_SET_REFERENCE ? 'R' : '1');
 				vd1_label_flush();
+			}
+			if (m_vd1_ltrace && (reg == NV406E_SET_REFERENCE || reg == NV406E_SEMAPHORE_ACQUIRE)) [[unlikely]]
+			{
+				vd1_label_note(reg == NV406E_SET_REFERENCE ? 'R' : 'A', fifo_ctrl->get_pos(), value);
 			}
 
 			m_ctx->register_state->decode(reg, value);

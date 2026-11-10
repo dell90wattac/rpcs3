@@ -24,6 +24,8 @@
 #include "Emu/RSX/Core/RSXReservationLock.hpp" // vanillad1: GPU lighting (X300.2)
 #include "Emu/RSX/NV47/HW/nv0039.h" // vanillad1: G-buffer byte on the GPU (X300.7)
 #include "Emu/Cell/timers.hpp" // vanillad1: GPU lighting (X300.2)
+#include "Emu/Cell/SPUThread.h" // vanillad1: label safety (X421): the stall dump samples the SPU threads
+#include "Emu/IdManager.h" // vanillad1: label safety (X421)
 #include <cmath>
 #include <cstring>
 
@@ -1854,13 +1856,185 @@ static u32 vd1_label_batch_n()
 	return s_n;
 }
 
+// vanillad1: label safety (X421): VANILLAD1_LABEL_SAFE=<bits> (read once, logged once; 0 / unset = P9 as it was)
+static u32 vd1_label_max_us()
+{
+	static const u32 s_us = []()
+	{
+		const char* env = std::getenv("VANILLAD1_LABEL_MAX_US");
+		const u32 us = env ? static_cast<u32>(std::strtoul(env, nullptr, 0)) : 0u;
+		return us ? us : 300u;
+	}();
+	return s_us;
+}
+
+static u32 vd1_label_safe()
+{
+	static const u32 s_safe = []()
+	{
+		const char* env = std::getenv("VANILLAD1_LABEL_SAFE");
+		const u32 v = env ? static_cast<u32>(std::strtoul(env, nullptr, 0)) : 0u;
+		if (v) rsx_log.notice("vanillad1: label safety VANILLAD1_LABEL_SAFE=0x%x (1 texture-read unbatched, 2 flush at SET_REFERENCE, 4 age cap %u us, 8 no same-address collapse, 16 NV406E release unbatched, 32 flush at jump/call/return)", v, vd1_label_max_us());
+		return v;
+	}();
+	return s_safe;
+}
+
+// vanillad1: label safety (X421): VANILLAD1_LABEL_TRACE=1: the label history, dumped at a self-jump stall (RSX thread only)
+static bool vd1_label_trace()
+{
+	static const bool s_on = []()
+	{
+		const char* env = std::getenv("VANILLAD1_LABEL_TRACE");
+		const bool on = env && *env == '1';
+		if (on) rsx_log.notice("vanillad1: label trace on (VANILLAD1_LABEL_TRACE=1): dumped at a self-jump stall");
+		return on;
+	}();
+	return s_on;
+}
+
+namespace vd1_lsafe
+{
+	struct event_t { u64 t; u32 get; u32 type; u32 addr; u32 value; char path; };
+	struct flush_t { u64 t; u32 count; u32 get; char why; };
+	struct last_t { u32 addr; u32 value; u64 t; char path; };
+
+	static event_t s_ev[512]{};
+	static u32 s_ev_n = 0;
+	static flush_t s_fl[64]{};
+	static u32 s_fl_n = 0;
+	static last_t s_last[96]{};
+	static u32 s_last_n = 0;
+	static u32 s_stalls = 0;
+	static u32 s_dumps = 0;
+
+	static u32 vd1_rd32(u32 addr) { return vm::read32(addr); }
+}
+
+void VKGSRender::vd1_ltrace(char path, u32 type, u32 addr, u32 value)
+{
+	using namespace vd1_lsafe;
+	const u64 now = get_system_time();
+	s_ev[s_ev_n++ % 512] = { now, fifo_ctrl ? fifo_ctrl->get_pos() : 0u, type, addr, value, path };
+
+	if (path == 'J' || path == 'R' || path == 'A')
+	{
+		return;
+	}
+
+	for (u32 i = 0; i < std::min<u32>(s_last_n, 96); i++)
+	{
+		if (s_last[i].addr == addr)
+		{
+			s_last[i] = { addr, value, now, path };
+			return;
+		}
+	}
+
+	if (s_last_n < 96)
+	{
+		s_last[s_last_n++] = { addr, value, now, path };
+	}
+}
+
+void VKGSRender::vd1_label_note(char kind, u32 a, u32 b)
+{
+	vd1_ltrace(kind, 0, a, b);
+}
+
+void VKGSRender::vd1_label_stall_dump(u32 get, u32 put)
+{
+	using namespace vd1_lsafe;
+	s_stalls++;
+
+	if (!vd1_label_trace() || s_dumps >= 4 || (s_stalls != 1 && s_stalls % 15 != 0))
+	{
+		return;
+	}
+
+	s_dumps++;
+	const u64 now = get_system_time();
+	rsx_log.warning("vanillad1 lsafe dump %u: stall #%u at io 0x%x, put 0x%x; batch open=%d count=%u age=%llu us; safe=0x%x n=%u; %u events, %u flushes so far",
+		s_dumps, s_stalls, get, put, m_vd1_label_cb ? 1 : 0, m_vd1_label_count, m_vd1_label_cb ? now - m_vd1_label_open_t : 0ull,
+		m_vd1_label_safe, m_vd1_label_n, s_ev_n, s_fl_n);
+
+	for (u32 i = (s_fl_n > 24 ? s_fl_n - 24 : 0); i < s_fl_n; i++)
+	{
+		const auto& f = s_fl[i % 64];
+		rsx_log.warning("vanillad1 lsafe flush -%llu us why=%c count=%u get=0x%x", now - f.t, f.why, f.count, f.get);
+	}
+
+	for (u32 i = (s_ev_n > 96 ? s_ev_n - 96 : 0); i < s_ev_n; i++)
+	{
+		const auto& e = s_ev[i % 512];
+		const bool label = e.path != 'J' && e.path != 'R' && e.path != 'A';
+		const u32 mem = (label && vm::check_addr(e.addr)) ? vd1_rd32(e.addr) : 0u;
+		rsx_log.warning("vanillad1 lsafe ev -%llu us %c get=0x%x type=0x%x addr=0x%x value=0x%x mem=0x%x", now - e.t, e.path, e.get, e.type, e.addr, e.value, mem);
+	}
+
+	for (u32 i = 0; i < std::min<u32>(s_last_n, 96); i++)
+	{
+		const auto& l = s_last[i];
+		const u32 mem = vm::check_addr(l.addr) ? vd1_rd32(l.addr) : 0u;
+		rsx_log.warning("vanillad1 lsafe last addr=0x%x wrote=0x%x mem=0x%x%s -%llu us %c", l.addr, l.value, mem, mem != l.value ? " MISMATCH" : "", now - l.t, l.path);
+	}
+
+	if (label_addr && vm::check_addr(label_addr, vm::page_readable, 0x1000))
+	{
+		std::string line;
+		for (u32 i = 0; i < 256; i++)
+		{
+			if (const u32 v = vd1_rd32(label_addr + i * 16))
+			{
+				fmt::append(line, " %x:%x", i * 16, v);
+			}
+		}
+		rsx_log.warning("vanillad1 lsafe label area 0x%x:%s", label_addr, line);
+	}
+
+	if (vm::check_addr(0x019343e8))
+	{
+		const u32 fence = vd1_rd32(0x019343e8);
+		const u32 next = vd1_rd32(0x019343e4);
+		rsx_log.warning("vanillad1 lsafe fence *(0x019343e8)=0x%x -> 0x%x; *(0x019343e4)=0x%x -> 0x%x", fence,
+			(fence && vm::check_addr(fence)) ? vd1_rd32(fence) : 0u, next, (next && vm::check_addr(next)) ? vd1_rd32(next) : 0u);
+	}
+
+	for (u32 s = 0; s < 8; s++)
+	{
+		idm::select<named_thread<spu_thread>>([&](u32 id, spu_thread& spu)
+		{
+			const u32 line = spu.raddr ? spu.raddr : (spu.last_getllar_addr != umax ? spu.last_getllar_addr : 0u);
+			u32 w[4]{};
+			if (s == 0 && line && vm::check_addr(line))
+			{
+				for (u32 k = 0; k < 4; k++) w[k] = vd1_rd32(line + k * 4);
+			}
+			rsx_log.warning("vanillad1 lsafe spu s%u id=0x%x pc=0x%x raddr=0x%x getllar=0x%x mfc cmd=0x%x eal=0x%x lsa=0x%x size=0x%x line=%08x %08x %08x %08x",
+				s, id, spu.pc, spu.raddr, spu.last_getllar_addr, static_cast<u32>(spu.ch_mfc_cmd.cmd), spu.ch_mfc_cmd.eal, spu.ch_mfc_cmd.lsa,
+				static_cast<u32>(spu.ch_mfc_cmd.size), w[0], w[1], w[2], w[3]);
+		});
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+}
+
 // vanillad1: label batching (P9): end the open batch: the newest label id, one submit, then the label counts as released
 void VKGSRender::vd1_label_flush()
 {
 	if (!m_vd1_label_cb)
 	{
+		m_vd1_flush_why = '?'; // vanillad1: label safety (X421)
 		return;
 	}
+
+	if (m_vd1_ltrace) [[unlikely]] // vanillad1: label safety (X421): the flush and why
+	{
+		auto& f = vd1_lsafe::s_fl[vd1_lsafe::s_fl_n++ % 64];
+		f = { get_system_time(), m_vd1_label_count, fifo_ctrl ? fifo_ctrl->get_pos() : 0u, m_vd1_flush_why };
+	}
+	m_vd1_flush_why = '?';
+	m_vd1_batch_naddr = 0;
 
 	rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit);
 	auto cmd = m_vd1_label_cb;
@@ -1893,8 +2067,19 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	auto host_ctx = ensure(m_host_dma_ctrl->host_ctx());
 
 	// vanillad1: label batching (P9)
-	const u32 vd1_n = vd1_label_batch_n();
-	m_vd1_label_n = vd1_n;
+	// vanillad1: label safety (X421): bit 1 keeps texture-read labels, bit 16 NV406E releases out of batches (an open batch is written first,
+	// then stock RPCS3 handles the label)
+	const u32 vd1_safe = vd1_label_safe();
+	m_vd1_label_safe = vd1_safe;
+	m_vd1_ltrace = vd1_label_trace();
+	const bool vd1_unbatched = ((vd1_safe & 1) && type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE) || ((vd1_safe & 16) && type == NV406E_SEMAPHORE_RELEASE);
+	if (vd1_unbatched && m_vd1_label_cb)
+	{
+		m_vd1_flush_why = 'T';
+		vd1_label_flush();
+	}
+	const u32 vd1_n = vd1_unbatched ? 0u : vd1_label_batch_n();
+	m_vd1_label_n = vd1_label_batch_n();
 	const bool vd1_texread_batched = vd1_n && m_vd1_label_cb && type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed();
 
 	if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed() && !vd1_texread_batched)
@@ -1902,6 +2087,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		// All texture loads already seen by the host GPU
 		// Wait for all previously submitted labels to be flushed
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
+		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('C', type, address, args); // vanillad1: label safety (X421)
 		return false;
 	}
 
@@ -1915,7 +2101,9 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		// NVIDIA GPUs can disappoint when DMA blocks straddle VirtualAlloc boundaries.
 		// Take the L and try the fallback.
 		rsx_log.warning("Host label update at 0x%x was not possible.", address);
+		m_vd1_flush_why = 'F'; // vanillad1: label safety (X421)
 		vd1_label_flush(); // vanillad1: label batching (P9)
+		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('F', type, address, args); // vanillad1: label safety (X421)
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
 		return false;
 	}
@@ -1945,7 +2133,16 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	}
 	if (vd1_primary)
 	{
+		m_vd1_flush_why = 'X'; // vanillad1: label safety (X421)
 		vd1_label_flush(); // the primary submit writes commands_complete_event for this label: older ids go first
+	}
+
+	// vanillad1: label safety (X421): bit 8, no value of a label is lost inside a batch: an address already in the open batch writes the batch first
+	if ((vd1_safe & 8) && vd1_n && !vd1_primary && m_vd1_label_cb &&
+		(m_vd1_batch_naddr >= 64 || std::find(m_vd1_batch_addr, m_vd1_batch_addr + m_vd1_batch_naddr, address) != m_vd1_batch_addr + m_vd1_batch_naddr))
+	{
+		m_vd1_flush_why = 'D';
+		vd1_label_flush();
 	}
 
 	const auto release_event_id = host_ctx->on_label_acquire();
@@ -1954,6 +2151,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	if (vd1_primary)
 	{
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
+		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('P', type, address, args); // vanillad1: label safety (X421)
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_lsubmit); flush_command_queue(); } // vanillad1: RSX timers (P3)
 	}
 	else if (vd1_n) // vanillad1: label batching (P9): append to the open batch
@@ -1964,14 +2162,19 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 			m_vd1_label_cb->begin();
 			m_vd1_label_count = 0;
 			m_vd1_label_open = true;
+			m_vd1_label_open_t = get_system_time(); // vanillad1: label safety (X421)
+			m_vd1_batch_naddr = 0;
 		}
 
 		vkCmdUpdateBuffer(*m_vd1_label_cb, mapping.second->value, mapping.first, 4, &write_data);
 		m_vd1_label_last_id = release_event_id;
 		m_vd1_label_count++;
+		if (m_vd1_batch_naddr < 64) m_vd1_batch_addr[m_vd1_batch_naddr++] = address; // vanillad1: label safety (X421)
+		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('B', type, address, args); // vanillad1: label safety (X421)
 
 		if (vd1_n > 1 && m_vd1_label_count >= vd1_n)
 		{
+			m_vd1_flush_why = 'N'; // vanillad1: label safety (X421)
 			vd1_label_flush();
 		}
 	}
@@ -1988,6 +2191,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		cmd->submit(submit_info);
 
 		host_ctx->on_label_release();
+		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('S', type, address, args); // vanillad1: label safety (X421)
 	}
 
 	return true;
@@ -2084,6 +2288,13 @@ void VKGSRender::sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_hi
 
 void VKGSRender::do_local_task(rsx::FIFO::state state)
 {
+	// vanillad1: label safety (X421): bit 4, an open batch older than VANILLAD1_LABEL_MAX_US is written now
+	if (m_vd1_label_cb && (m_vd1_label_safe & 4) && get_system_time() - m_vd1_label_open_t >= vd1_label_max_us()) [[unlikely]]
+	{
+		m_vd1_flush_why = 'G';
+		vd1_label_flush();
+	}
+
 	if (rsx::vd1_fault_stats_secs()) [[unlikely]] // vanillad1: fault stats (X300.3)
 	{
 		vd1_fault::maybe_dump(int_flip_index);
@@ -2759,6 +2970,7 @@ void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)
 
 void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
 {
+	if (m_vd1_flush_why == '?') m_vd1_flush_why = 'P'; // vanillad1: label safety (X421)
 	vd1_label_flush(); // vanillad1: label batching (P9): the batch first (the primary submit writes commands_complete_event for newer labels)
 
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
