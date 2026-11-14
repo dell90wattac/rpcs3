@@ -600,10 +600,47 @@ void gui_application::InitializeConnects()
 	connect(this, &gui_application::RequestCallFromMainThread, this, &gui_application::CallFromMainThread);
 }
 
+// vanillad1: window icon (X430): VANILLAD1_WINDOW_ICON=<file>[;<file>...] is the game window's icon (the Launcher's player boot); unset = the game's
+static QIcon vanillad1_window_icon()
+{
+	const QString spec = qEnvironmentVariable("VANILLAD1_WINDOW_ICON");
+	if (spec.isEmpty())
+	{
+		return {};
+	}
+
+	QIcon icon;
+	int files = 0;
+	for (const QString& file : spec.split(';', Qt::SkipEmptyParts))
+	{
+		if (QFileInfo::exists(file))
+		{
+			icon.addFile(file);
+			files++;
+		}
+		else
+		{
+			gui_log.warning("vanillad1: window icon: no file %s", file.toStdString());
+		}
+	}
+
+	if (files)
+	{
+		gui_log.notice("vanillad1: window icon: %d file(s)", files);
+	}
+	return icon;
+}
+
 std::unique_ptr<gs_frame> gui_application::get_gs_frame()
 {
 	// Load AppIcon
-	const QIcon app_icon = m_main_window ? m_main_window->GetAppIcon() : gui::utils::get_app_icon_from_path(Emu.GetBoot(), Emu.GetTitleID());
+	const QIcon vd1_icon = vanillad1_window_icon();
+	const QIcon app_icon = !vd1_icon.isNull() ? vd1_icon : m_main_window ? m_main_window->GetAppIcon() : gui::utils::get_app_icon_from_path(Emu.GetBoot(), Emu.GetTitleID());
+
+	if (!vd1_icon.isNull() && !m_main_window)
+	{
+		setWindowIcon(vd1_icon);
+	}
 
 	if (m_game_window)
 	{
