@@ -362,6 +362,12 @@ namespace rsx
 				{
 					if (const u32 addr = m_iotable->get_addr(m_memwatch_addr); addr + 1)
 					{
+						// vanillad1: sdsm on the GPU (X301.2): the backend times sdsm's self-jump and may finish the job here (it zeroes the block)
+						if (m_thread->m_vd1_sdsm_on)
+						{
+							m_thread->vd1_sdsm_selfjump(addr, vm::read32(addr) == m_memwatch_cmp);
+						}
+
 						if (vm::read32(addr) == m_memwatch_cmp)
 						{
 							// vanillad1 selfjump: a self-jump the game never re-pointed while commands are queued

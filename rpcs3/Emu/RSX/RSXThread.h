@@ -476,6 +476,12 @@ namespace rsx
 		// vanillad1: G-buffer byte on the GPU (X300.7): the NV0039 copy held back (nv0039::buffer_notify), for the pass to take
 		vd1_nv0039_args m_vd1_nv0039_held{};
 		u32 m_vd1_nv0039_released = 0;   // held copies that ran after all (logged by the pass every 10 s)
+		// vanillad1: sdsm on the GPU (X301.2): VANILLAD1_GPU_SDSM (VKGSRender.cpp). The label hook: NV308A is about to write one
+		// word into main memory (sdsm's start label when the address is its sync word). The self-jump hook: the FIFO spins on a
+		// jump-to-self at ea (spinning = still a jump); the backend may finish sdsm there and zero the block.
+		bool m_vd1_sdsm_on = false;
+		virtual void vd1_sdsm_label(u32 /*ea*/, u32 /*value*/) {}
+		virtual void vd1_sdsm_selfjump(u32 /*ea*/, bool /*spinning*/) {}
 
 
 		// Program public "get" handlers

@@ -498,6 +498,10 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	m_secondary_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
 	m_secondary_cb_list.create(m_secondary_command_buffer_pool, vk::command_buffer::access_type_hint::all);
 	m_vd1_label_cb_list.create(m_secondary_command_buffer_pool, vk::command_buffer::access_type_hint::all); // vanillad1: label batching (P9)
+	{ // vanillad1: sdsm on the GPU (X301.2): VANILLAD1_GPU_SDSM set = the label and self-jump hooks call the backend
+		const char* env = std::getenv("VANILLAD1_GPU_SDSM");
+		m_vd1_sdsm_on = env && *env && std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0;
+	}
 
 	//Occlusion
 	m_occlusion_query_manager = std::make_unique<vk::query_pool_manager>(*m_device, VK_QUERY_TYPE_OCCLUSION, OCCLUSION_MAX_POOL_SIZE);
@@ -4180,4 +4184,638 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			first == umax ? 0u : gathered[first], first == umax ? 0u : guest[first], zeros);
 		m_vd1_gl_readback->unmap();
 	}
+}
+
+// vanillad1: sdsm on the GPU (X301.2) --------------------------------------------------------------------------------
+// Destiny's sdsm SPU job (spu_sdsm_job, docs/findings/spu_sdsm.md) as one Vulkan compute pass and a CPU finaliser.
+// The job: from the frame's depth copy (0x445A3A80) it writes linear depth in place, three small surfaces (half_a, half_b,
+// quarter), and per cascade the light-space box of the visible pixels, which crops three shadow matrices; the last SPU
+// instance writes them (16-B results, 80-B RSX subroutines) and zeroes a self-jump block the RSX spins on.
+// Hook 1, the label (nv308a.cpp): the RSX writes the frame's sequence into sdsm's sync word, which starts the six SPU
+// instances. Here: the slot's P, the depth surface; the pass is recorded and submitted; in mode 1 the instances are
+// retired first (tile counter = the last tile, finaliser claim = 0: they exit without computing or finalising).
+// Hook 2, the self-jump (RSXFIFO.cpp): the RSX reaches the block. Mode 1: wait the pass's event, finalise on the CPU
+// (vd1_sdsm_final.h), write half_a / half_b / quarter, the bounds, results and subroutines into guest memory, zero the
+// block. The linear depth goes straight into the depth surface (the GPU light pass and the samplers read it there).
+// VANILLAD1_GPU_SDSM: unset / 0 / off = off; stats = the self-jump wait only; probe = + the slots and surfaces logged;
+// shadow = the pass every frame, the SPUs do the job (its cost); check = the pass every Nth frame
+// (VANILLAD1_GPU_SDSM_EVERY, 30) compared with the SPUs' output at the self-jump, the first two compared frames and the
+// first two mismatches dumped to <config>/vd1_sdsm_<n>.bin (re/notes/X301.2/sdsmdump.py); 1 / on = the swap.
+// <config>/vd1_gpu_sdsm.glsl replaces the built-in shader with no rebuild. A frame that fails a check stays on the SPUs.
+#include "vd1_sdsm_final.h"
+
+namespace vk
+{
+	struct cs_vd1_sdsm : compute_task
+	{
+		const vk::buffer* m_buf = nullptr;
+		u32 m_len = 0;
+		std::array<u32, 12> m_pc{};
+
+		cs_vd1_sdsm()
+		{
+			ssbo_count = 1;
+			use_push_constants = true;
+			push_constants_size = 48;
+
+			create();
+
+			m_src =
+			#include "../Program/GLSLSnippets/VD1GpuSdsm.glsl"
+			;
+
+			std::string dir = fs::get_config_dir();
+			if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+			if (fs::file f{ dir + "vd1_gpu_sdsm.glsl" })
+			{
+				std::string text = f.to_string();
+				const usz o1 = text.find("R\"(");
+				const usz o2 = text.rfind(")\"");
+				if (o1 != umax && o2 != umax && o2 > o1) text = text.substr(o1 + 3, o2 - o1 - 3);
+				rsx_log.success("vanillad1: gpu sdsm: the shader from %svd1_gpu_sdsm.glsl (%u bytes)", dir, ::size32(text));
+				m_src = std::move(text);
+			}
+
+			const std::pair<std::string_view, std::string> syntax_replace[] =
+			{
+				{ "%vk", "1" },
+			};
+
+			m_src = fmt::replace_all(m_src, syntax_replace);
+		}
+
+		void bind_resources(const vk::command_buffer& cmd) override
+		{
+			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, m_pc.data());
+			m_program->bind_uniform({ *m_buf, 0, m_len }, 0, 0);
+		}
+	};
+}
+
+namespace
+{
+	enum vd1_sd_mode : u32 { sd_off = 0, sd_stats, sd_probe, sd_shadow, sd_check, sd_on };
+
+	vd1_sd_mode vd1_sd_get_mode()
+	{
+		static const vd1_sd_mode s_mode = []()
+		{
+			const char* env = std::getenv("VANILLAD1_GPU_SDSM");
+			vd1_sd_mode m = sd_on;
+			if (!env || !*env || !std::strcmp(env, "0") || !std::strcmp(env, "off")) m = sd_off;
+			else if (!std::strcmp(env, "stats")) m = sd_stats;
+			else if (!std::strcmp(env, "probe")) m = sd_probe;
+			else if (!std::strcmp(env, "shadow")) m = sd_shadow;
+			else if (!std::strcmp(env, "check")) m = sd_check;
+			if (m != sd_off) rsx_log.success("vanillad1: VANILLAD1_GPU_SDSM=%s: sdsm %s", env,
+				m == sd_stats ? "on the SPUs, the self-jump wait logged" : m == sd_probe ? "on the SPUs, the slots and surfaces logged" :
+				m == sd_shadow ? "shadow (the GPU pass every frame, the SPUs do the job)" : m == sd_check ? "check (the GPU pass compared with the SPUs)" :
+				"on the GPU (the SPU job retired)");
+			return m;
+		}();
+		return s_mode;
+	}
+
+	u32 vd1_sd_every()
+	{
+		static const u32 s_every = []()
+		{
+			const char* env = std::getenv("VANILLAD1_GPU_SDSM_EVERY");
+			const u32 v = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+			return v ? v : 30u;
+		}();
+		return s_every;
+	}
+
+	struct vd1_sd_counters
+	{
+		u32 labels = 0, ran = 0, retired = 0, late = 0, slot = 0, unfilled = 0, abort = 0, nosurf = 0, badsurf = 0, taken = 0;
+		u32 spins = 0, gpu_waits = 0, timeouts = 0, checks = 0, check_bad = 0, dumps = 0;
+		u64 spin_us = 0, spin_max = 0, gpu_us = 0, gpu_max = 0, retire_us = 0, retire_max = 0;
+		u64 last_ms = 0, last_flip = 0;
+	} s_vd1_sd;
+
+	void vd1_sd_tick(u64 flip)
+	{
+		const u64 now = get_system_time() / 1000;
+		auto& c = s_vd1_sd;
+		if (!c.last_ms) { c.last_ms = now; c.last_flip = flip; return; }
+		if (now - c.last_ms < 10000) return;
+		const u64 frames = std::max<u64>(flip - c.last_flip, 1);
+		rsx_log.notice("vanillad1: gpu sdsm 10s: %llu frames, labels=%u ran=%u retired=%u (late %u) declined: slot=%u unfilled=%u abort=%u nosurf=%u badsurf=%u taken=%u; "
+			"self-jump %.3f ms a frame (%u waits, max %.2f ms); GPU wait %.3f ms a frame (%u, max %.2f ms, timeouts %u); retire %.3f ms a frame (max %.2f ms); "
+			"checks %u (bad %u), dumps %u",
+			frames, c.labels, c.ran, c.retired, c.late, c.slot, c.unfilled, c.abort, c.nosurf, c.badsurf, c.taken,
+			c.spin_us / 1000. / frames, c.spins, c.spin_max / 1000., c.gpu_us / 1000. / frames, c.gpu_waits, c.gpu_max / 1000., c.timeouts,
+			c.retire_us / 1000. / frames, c.retire_max / 1000., c.checks, c.check_bad, c.dumps);
+		const u32 dumps = c.dumps;
+		c = {};
+		c.last_ms = now;
+		c.last_flip = flip;
+		c.dumps = dumps;   // the dump budget is for the whole boot
+	}
+
+	constexpr u32 vd1_sd_ctx = 0x0195fa10u;   // g_sdsm_ctx: 3 parameter slots of 0x2b0 B; +0x81c the sync word's EA
+	u32 vd1_sd_be32(u32 ea) { return *vm::get_super_ptr<be_t<u32>>(ea); }
+	u32 vd1_sd_align(u32 v) { return (v + 255u) & ~255u; }
+
+	u32 vd1_sd_ordered(f32 f)
+	{
+		const u32 u = std::bit_cast<u32>(f);
+		return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+	}
+
+	f32 vd1_sd_from_ordered(u32 o)
+	{
+		return std::bit_cast<f32>((o & 0x80000000u) ? (o & 0x7fffffffu) : ~o);
+	}
+
+	// A guest write as the RSX's own NV0039 copies do it (through the protected view: a cached section faults and is
+	// invalidated as if the SPU had written it)
+	void vd1_sd_guest_write(u32 ea, const void* src, u32 len)
+	{
+		if (!ea || !len)
+		{
+			return;
+		}
+		rsx::reservation_lock<true> lock(ea, len);
+		u8* dst = vm::_ptr<u8>(ea);
+		const rsx::simple_array<utils::address_range64> ranges = { utils::address_range64::start_length(reinterpret_cast<u64>(dst), len) };
+		rsx::mm_flush(ranges);
+		std::memcpy(dst, src, len);
+	}
+}
+
+void VKGSRender::vd1_sdsm_label(u32 ea, u32 value)
+{
+	const vd1_sd_mode mode = vd1_sd_get_mode();
+	if (mode == sd_off || ea != vd1_sd_be32(vd1_sd_ctx + 0x81c))
+	{
+		return;
+	}
+
+	auto& c = s_vd1_sd;
+	c.labels++;
+	vd1_sd_tick(int_flip_index);
+
+	// A frame whose self-jump never came (no cascades): finish it first, so its block and outputs are never left behind
+	if (m_vd1_sd.state == 1)
+	{
+		c.late++;
+		vd1_sdsm_retire(true);
+	}
+	m_vd1_sd.state = 0;
+
+	// The slot: the one this label starts (P[0] = this sync word, P[4] = the sequence written)
+	u32 P = 0;
+	for (u32 s = 0; s < 3; s++)
+	{
+		const u32 p = vd1_sd_ctx + s * 0x2b0u;
+		if (vd1_sd_be32(p) == ea && vd1_sd_be32(p + 4) == value)
+		{
+			P = p;
+			break;
+		}
+	}
+	if (!P)
+	{
+		c.slot++;
+		return;
+	}
+
+	const u32 z_ea = vd1_sd_be32(P + 0x08), w = vd1_sd_be32(P + 0x260), h = vd1_sd_be32(P + 0x264);
+	const u32 tile_ea = vd1_sd_be32(P + 0x248), abort_ea = vd1_sd_be32(P + 0x24c), claim_ea = vd1_sd_be32(P + 0x254);
+	const u32 wait_ea = vd1_sd_be32(P + 0x25c);
+	m_vd1_sd.wait_ea = wait_ea;   // the stats time the SPUs' frames too
+	m_vd1_sd.state = 2;
+
+	if (mode == sd_stats)
+	{
+		return;
+	}
+
+	if (!w || !h || (w % 32) || (h % 24) || w > 2048 || h > 1248 || !wait_ea || !tile_ea || !claim_ea ||
+		vd1_sd_be32(tile_ea) != 0xffffffffu || vd1_sd_be32(claim_ea) != 0xffffffffu)
+	{
+		c.unfilled++;
+		return;
+	}
+	if (abort_ea && vd1_sd_be32(abort_ea) != 0)
+	{
+		c.abort++;
+		return;
+	}
+
+	static u32 s_probe_logs = 0;
+	const bool log_now = (mode == sd_probe) && (s_probe_logs < 8 || (c.labels % 600) == 0);
+	if (log_now)
+	{
+		s_probe_logs++;
+		rsx_log.notice("vanillad1: gpu sdsm probe: P 0x%x seq %u depth 0x%x %ux%u half_a 0x%x half_b 0x%x quarter 0x%x results 0x%x 0x%x 0x%x subs 0x%x 0x%x 0x%x "
+			"reduce 0x%x wait 0x%x masks %u %u lin %g %g records %u",
+			P, value, z_ea, w, h, vd1_sd_be32(P + 0x268), vd1_sd_be32(P + 0x26c), vd1_sd_be32(P + 0x270), vd1_sd_be32(P + 0x0c), vd1_sd_be32(P + 0x10),
+			vd1_sd_be32(P + 0x14), vd1_sd_be32(P + 0x18), vd1_sd_be32(P + 0x1c), vd1_sd_be32(P + 0x20), vd1_sd_be32(P + 0x258), wait_ea,
+			vd1_sd_be32(P + 0x240), vd1_sd_be32(P + 0x244), std::bit_cast<f32>(vd1_sd_be32(P + 0x280)), std::bit_cast<f32>(vd1_sd_be32(P + 0x284)),
+			*vm::get_super_ptr<u8>(P + 0x290));
+	}
+
+	vk::render_target* zs = m_rtts.get_surface_at(z_ea);
+	if (!zs)
+	{
+		if (log_now) rsx_log.notice("vanillad1: gpu sdsm probe: depth 0x%x: no surface", z_ea);
+		c.nosurf++;
+		return;
+	}
+	const bool ok = !zs->is_depth_surface() && zs->samples() == 1 && zs->format() == VK_FORMAT_B8G8R8A8_UNORM &&
+		zs->get_surface_width<rsx::surface_metrics::pixels>() == w && zs->get_surface_height<rsx::surface_metrics::pixels>() >= h &&
+		zs->width() == w && zs->height() >= h && zs->get_rsx_pitch() == w * 4;
+	if (log_now || !ok)
+	{
+		static u32 s_bad_logs = 0;
+		if (log_now || s_bad_logs++ < 20)
+			rsx_log.notice("vanillad1: gpu sdsm %s: depth 0x%x: %ux%u (image %ux%u) pitch %u fmt %d samples %u depth %d -> %s", ok ? "probe" : "surface", z_ea,
+				zs->get_surface_width<rsx::surface_metrics::pixels>(), zs->get_surface_height<rsx::surface_metrics::pixels>(), zs->width(), zs->height(),
+				zs->get_rsx_pitch(), static_cast<int>(zs->format()), zs->samples(), zs->is_depth_surface(), ok ? "ok" : "unusable");
+	}
+	if (!ok)
+	{
+		c.badsurf++;
+		return;
+	}
+	if (mode == sd_probe)
+	{
+		return;
+	}
+
+	static u32 s_check_n = 0;
+	const bool check = (mode == sd_check) && ((s_check_n++ % vd1_sd_every()) == 0);
+	if (mode == sd_check && !check)
+	{
+		return;
+	}
+	const bool swap = (mode == sd_on);
+
+	// The swap: the six SPU instances find no tile and no finaliser's claim, and exit (the label has not landed yet)
+	if (swap)
+	{
+		{
+			rsx::reservation_lock<true> lock(tile_ea, 4);
+			auto& tile = *vm::get_super_ptr<be_t<u32>>(tile_ea);
+			if (tile != 0xffffffffu)
+			{
+				c.taken++;
+				return;
+			}
+			tile = (w / 32u) * (h / 24u) - 1u;
+		}
+		{
+			rsx::reservation_lock<true> lock(claim_ea, 4);
+			*vm::get_super_ptr<be_t<u32>>(claim_ea) = 0u;
+		}
+	}
+
+	// The work buffer (words): input, linear depth, half_a, half_b, quarter, bounds (12), constants (8), P (172)
+	const u32 n = w * h, hn = n / 4, qn = n / 16;
+	const u32 O_IN = 0, O_LIN = vd1_sd_align(O_IN + n * 4), O_HA = vd1_sd_align(O_LIN + n * 4), O_HB = vd1_sd_align(O_HA + hn * 4);
+	const u32 O_Q = vd1_sd_align(O_HB + hn * 4), O_B = vd1_sd_align(O_Q + qn * 4), O_K = O_B + 48, O_P = O_K + 32, total = vd1_sd_align(O_P + 0x2b0);
+	if (!m_vd1_sd_work || m_vd1_sd_work->size() < total)
+	{
+		m_vd1_sd_work = std::make_unique<vk::buffer>(*m_device, total, m_device->get_memory_mapping().device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
+	}
+	// The readback (bytes): bounds, half_a, half_b, quarter; for a check also the linear depth and the input
+	auto& pd = m_vd1_sd;
+	pd.rb_bounds = 0;
+	pd.rb_ha = 256;
+	pd.rb_hb = vd1_sd_align(pd.rb_ha + hn * 4);
+	pd.rb_q = vd1_sd_align(pd.rb_hb + hn * 4);
+	pd.rb_lin = vd1_sd_align(pd.rb_q + qn * 4);
+	pd.rb_len = check ? vd1_sd_align(pd.rb_lin + n * 8) : pd.rb_lin;
+	if (!m_vd1_sd_readback || m_vd1_sd_readback->size() < pd.rb_len)
+	{
+		m_vd1_sd_readback = std::make_unique<vk::buffer>(*m_device, std::max<u32>(pd.rb_len, vd1_sd_align(pd.rb_lin + n * 8)), m_device->get_memory_mapping().host_visible_coherent,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
+	}
+
+	auto* cmd = m_current_command_buffer;
+	if (vk::is_renderpass_open(*cmd))
+	{
+		vk::end_renderpass(*cmd);
+	}
+	vk::buffer* wb = m_vd1_sd_work.get();
+
+	// The input: the depth copy as the RSX left it (host words = the guest's words)
+	zs->read_barrier(*cmd);
+	VkBufferImageCopy region{};
+	region.bufferOffset = O_IN;
+	region.bufferRowLength = w;
+	region.bufferImageHeight = h;
+	region.imageSubresource = { zs->aspect(), 0, 0, 1 };
+	region.imageExtent = { w, h, 1 };
+	zs->push_layout(*cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+	vk::copy_image_to_buffer(*cmd, zs, wb, region);
+	zs->pop_layout(*cmd);
+
+	// The bounds' start (2, 2, -2, -2), the constants, P (host words)
+	std::memcpy(pd.P.data(), vm::get_super_ptr<u8>(P), 0x2b0);
+	std::array<u32, (48 + 32 + 0x2b0) / 4> up{};
+	for (u32 i = 0; i < 3; i++)
+	{
+		up[4 * i + 0] = vd1_sd_ordered(2.f);
+		up[4 * i + 1] = vd1_sd_ordered(2.f);
+		up[4 * i + 2] = vd1_sd_ordered(-2.f);
+		up[4 * i + 3] = vd1_sd_ordered(-2.f);
+	}
+	{
+		const f32 a = std::bit_cast<f32>(vd1_sd_be32(P + 0x284)) * std::bit_cast<f32>(0x07000000u);   // * 2^-113
+		const f32 b = std::bit_cast<f32>(vd1_sd_be32(P + 0x280));
+		const f32 fhw = static_cast<f32>(w / 2), fhh = static_cast<f32>(h / 2);
+		const f32 ihw = 1.f / fhw, ihh = 1.f / fhh;
+		const f32 k[8] = { a, b, ihw, ihh, ihw * 0.5f, ihh * 0.5f, fhw, fhh };
+		std::memcpy(&up[12], k, sizeof(k));
+	}
+	for (u32 i = 0; i < 0x2b0 / 4; i++)
+	{
+		up[20 + i] = vd1_sd_be32(P + i * 4);
+	}
+	vkCmdUpdateBuffer(*cmd, wb->value, O_B, sizeof(up), up.data());
+	vk::insert_buffer_memory_barrier(*cmd, wb->value, 0, total, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+	auto* job = vk::get_compute_task<vk::cs_vd1_sdsm>();
+	job->m_buf = wb;
+	job->m_len = total;
+	job->m_pc = { O_IN / 4, O_LIN / 4, O_HA / 4, O_HB / 4, O_Q / 4, O_B / 4, O_K / 4, O_P / 4, w, h, 0u, 0u };
+	job->run(*cmd, w / 32, h / 24, 1);
+	vk::insert_buffer_memory_barrier(*cmd, wb->value, 0, total, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+	// The swap: the linear depth into the surface itself, marked current (no reload over it); the GPU light pass and the
+	// samplers read it there
+	if (swap)
+	{
+		region.bufferOffset = O_LIN;
+		m_rtts.prepare_transfer_target(*cmd, zs, rsx::surface_access::transfer_write);
+		zs->push_layout(*cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		vk::copy_buffer_to_image(*cmd, wb, zs, region);
+		zs->pop_layout(*cmd);
+		zs->on_write(rsx::get_shared_tag());
+		m_texture_cache.notify_surface_changed(zs->get_memory_range());
+		m_texture_cache.vd1_drop_copies(zs->get_memory_range()); // vanillad1: fault fast path (X300.3): an eager copy is stale now
+		std::array<u64, 2> bands{};
+		if (zs->vd1_rcb_bands(bands))
+		{
+			zs->vd1_seen = bands;   // guest memory is not going to change: the RCB rule must not reload over this
+			zs->vd1_seen_valid = true;
+		}
+		m_samplers_dirty.store(true);
+	}
+
+	// The readback, then the event the self-jump waits on
+	{
+		VkBufferCopy rb[6];
+		u32 nrb = 0;
+		rb[nrb++] = { O_B, pd.rb_bounds, 48 };
+		rb[nrb++] = { O_HA, pd.rb_ha, hn * 4 };
+		rb[nrb++] = { O_HB, pd.rb_hb, hn * 4 };
+		rb[nrb++] = { O_Q, pd.rb_q, qn * 4 };
+		if (check)
+		{
+			rb[nrb++] = { O_LIN, pd.rb_lin, n * 4 };
+			rb[nrb++] = { O_IN, pd.rb_lin + n * 4, n * 4 };
+		}
+		vkCmdCopyBuffer(*cmd, wb->value, m_vd1_sd_readback->value, nrb, rb);
+	}
+	if (m_vd1_sd_event)
+	{
+		vk::get_resource_manager()->dispose(m_vd1_sd_event);
+	}
+	m_vd1_sd_event = std::make_unique<vk::event>(*m_device, vk::sync_domain::host);
+	{
+		VkBufferMemoryBarrier2KHR mem_barrier =
+		{
+			.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR,
+			.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+			.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+			.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR,
+			.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR,
+			.buffer = m_vd1_sd_readback->value,
+			.offset = 0,
+			.size = pd.rb_len
+		};
+		m_vd1_sd_event->signal(*cmd,
+		{
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.bufferMemoryBarrierCount = 1,
+			.pBufferMemoryBarriers = &mem_barrier
+		});
+	}
+
+	pd.state = 1;
+	pd.mode = mode;
+	pd.w = w;
+	pd.h = h;
+	pd.check = check;
+	pd.t_label = get_system_time();
+	c.ran++;
+
+	// Submit now: the RSX reaches the self-jump a few commands later and the GPU should be done by then
+	flush_command_queue();
+}
+
+void VKGSRender::vd1_sdsm_selfjump(u32 ea, bool spinning)
+{
+	auto& c = s_vd1_sd;
+	auto& pd = m_vd1_sd;
+	if (!pd.state || ea != pd.wait_ea)
+	{
+		return;
+	}
+
+	const u64 now = get_system_time();
+	if (m_vd1_sd_spin_ea != ea)
+	{
+		m_vd1_sd_spin_ea = ea;
+		m_vd1_sd_spin_t0 = now;
+	}
+	m_vd1_sd_spin_last = now;
+
+	if (pd.state == 1 && pd.mode == sd_on && spinning)
+	{
+		vd1_sdsm_retire(false);
+		const u64 end = get_system_time();
+		c.retire_us += end - now;
+		c.retire_max = std::max(c.retire_max, end - now);
+		c.retired++;
+		spinning = false;
+	}
+
+	if (spinning)
+	{
+		return;
+	}
+
+	// Released (the SPUs zeroed the block, or the retire did): the wait, then for shadow / check the GPU pass's own
+	const u64 spin = get_system_time() - m_vd1_sd_spin_t0;
+	c.spins++;
+	c.spin_us += spin;
+	c.spin_max = std::max(c.spin_max, spin);
+	m_vd1_sd_spin_ea = 0;
+
+	if (pd.state == 1)
+	{
+		vd1_sdsm_retire(false);   // shadow / check: the SPUs' outputs are in guest memory now
+	}
+	pd.state = 0;
+}
+
+void VKGSRender::vd1_sdsm_retire(bool late)
+{
+	auto& c = s_vd1_sd;
+	auto& pd = m_vd1_sd;
+	pd.state = 0;
+
+	const u64 t0 = get_system_time();
+	if (vk::wait_for_event(m_vd1_sd_event.get(), 2'000'000) != VK_SUCCESS)
+	{
+		c.timeouts++;
+		flush_command_queue(true);
+	}
+	const u64 waited = get_system_time() - t0;
+	c.gpu_waits++;
+	c.gpu_us += waited;
+	c.gpu_max = std::max(c.gpu_max, waited);
+
+	const u32 w = pd.w, h = pd.h, n = w * h, hn = n / 4, qn = n / 16;
+	const u8* rb = static_cast<const u8*>(m_vd1_sd_readback->map(0, pd.rb_len));
+	f32 bounds[3][4];
+	for (u32 i = 0; i < 12; i++)
+	{
+		u32 o;
+		std::memcpy(&o, rb + pd.rb_bounds + i * 4, 4);
+		bounds[i / 4][i % 4] = vd1_sd_from_ordered(o);
+	}
+	const vd1_sdsm::final_t fin = vd1_sdsm::finalise(pd.P.data(), bounds);
+	const u8* Pb = pd.P.data();
+	auto pw = [&](u32 off) { return vd1_sdsm::be32(Pb + off); };
+
+	// Guest-order images of what the SPU writes: the reduce block, the three results and subroutines
+	u8 red[48], res[3][16], sub[3][76];
+	for (u32 i = 0; i < 12; i++) vd1_sdsm::put_be32(red + i * 4, std::bit_cast<u32>(bounds[i / 4][i % 4]));
+	for (u32 i = 0; i < 3; i++)
+	{
+		for (u32 k = 0; k < 4; k++) vd1_sdsm::put_be32(res[i] + k * 4, std::bit_cast<u32>(fin.result[i][k]));
+		for (u32 k = 0; k < 19; k++) vd1_sdsm::put_be32(sub[i] + k * 4, fin.cmd[i][k]);
+	}
+
+	if (pd.mode == sd_on)
+	{
+		vd1_sd_guest_write(pw(0x268), rb + pd.rb_ha, hn * 4);
+		vd1_sd_guest_write(pw(0x26c), rb + pd.rb_hb, hn * 4);
+		vd1_sd_guest_write(pw(0x270), rb + pd.rb_q, qn * 4);
+		vd1_sd_guest_write(pw(0x258), red, 48);
+		for (u32 i = 0; i < 3; i++)
+		{
+			vd1_sd_guest_write(pw(0x0c + 4 * i), res[i], 16);
+			vd1_sd_guest_write(pw(0x18 + 4 * i), sub[i], 76);
+		}
+		static const u8 s_zero[128]{};
+		vd1_sd_guest_write(pd.wait_ea, s_zero, 128);   // the release: the RSX goes on
+		m_vd1_sd_readback->unmap();
+		if (late)
+		{
+			static u32 s_late_logs = 0;
+			if (s_late_logs++ < 10) rsx_log.warning("vanillad1: gpu sdsm: the frame's self-jump never came; finished at the next label");
+		}
+		return;
+	}
+
+	if (pd.mode == sd_check && !late)
+	{
+		// The SPUs' outputs in guest memory against the pass and the finaliser
+		const u32* lin = reinterpret_cast<const u32*>(rb + pd.rb_lin);
+		const u32* in = reinterpret_cast<const u32*>(rb + pd.rb_lin + n * 4);
+		const u32 z_ea = pw(0x08);
+		u32 d_lin = 0, d_ha = 0, d_hb = 0, d_q = 0, first_lin = umax;
+		for (u32 i = 0; i < n; i++)
+		{
+			if (vd1_sd_be32(z_ea + i * 4) != lin[i])
+			{
+				if (first_lin == umax) first_lin = i;
+				d_lin++;
+			}
+		}
+		auto cmp = [&](u32 ea, const u8* mine, u32 len)
+		{
+			if (!ea) return 0u;
+			u32 d = 0;
+			const u8* g = vm::get_super_ptr<u8>(ea);
+			for (u32 i = 0; i < len; i += 4) d += std::memcmp(g + i, mine + i, 4) ? 1u : 0u;
+			return d;
+		};
+		d_ha = cmp(pw(0x268), rb + pd.rb_ha, hn * 4);
+		d_hb = cmp(pw(0x26c), rb + pd.rb_hb, hn * 4);
+		d_q = cmp(pw(0x270), rb + pd.rb_q, qn * 4);
+		const u32 d_red = cmp(pw(0x258), red, 48);
+		u32 d_res = 0, d_sub = 0, ulp_res = 0, ulp_sub = 0;
+		for (u32 i = 0; i < 3; i++)
+		{
+			d_res += cmp(pw(0x0c + 4 * i), res[i], 16);
+			d_sub += cmp(pw(0x18 + 4 * i), sub[i], 76);
+			for (u32 k = 0; k < 4; k++)
+			{
+				const s64 e = static_cast<s64>(vd1_sd_be32(pw(0x0c + 4 * i) + k * 4)) - static_cast<s64>(std::bit_cast<u32>(fin.result[i][k]));
+				ulp_res = std::max<u32>(ulp_res, static_cast<u32>(std::min<s64>(std::abs(e), 0xffffffffll)));
+			}
+			for (u32 k = 2; k < 18; k++)
+			{
+				const s64 e = static_cast<s64>(vd1_sd_be32(pw(0x18 + 4 * i) + k * 4)) - static_cast<s64>(fin.cmd[i][k]);
+				ulp_sub = std::max<u32>(ulp_sub, static_cast<u32>(std::min<s64>(std::abs(e), 0xffffffffll)));
+			}
+		}
+		const bool bad = d_lin || d_ha || d_hb || d_q || d_red || ulp_res > 2 || ulp_sub > 2;
+		c.checks++;
+		c.check_bad += bad ? 1 : 0;
+		static u32 s_check_logs = 0;
+		if (bad || s_check_logs++ < 6 || (c.checks % 20) == 0)
+		{
+			rsx_log.notice("vanillad1: gpu sdsm check %s: %ux%u: linear depth %u/%u differ (first %u: SPU %08x GPU %08x in %08x), half_a %u, half_b %u, quarter %u, "
+				"bounds %u words; results %u words (max %u ulp), subroutines %u words (max %u ulp); GPU wait %.2f ms after the SPUs",
+				bad ? "BAD" : "ok", w, h, d_lin, n, first_lin == umax ? 0u : first_lin, first_lin == umax ? 0u : vd1_sd_be32(z_ea + first_lin * 4),
+				first_lin == umax ? 0u : lin[first_lin], first_lin == umax ? 0u : in[first_lin], d_ha, d_hb, d_q, d_red, d_res, ulp_res, d_sub, ulp_sub,
+				(get_system_time() - t0) / 1000.);
+		}
+
+		// A dump (the first two checks and the first two bad ones): P, the input, the pass's outputs, the SPUs'
+		static u32 s_dumped_ok = 0, s_dumped_bad = 0;
+		if ((bad && s_dumped_bad < 2) || (!bad && s_dumped_ok < 2))
+		{
+			(bad ? s_dumped_bad : s_dumped_ok)++;
+			std::string dir = fs::get_config_dir();
+			if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+			static u32 s_dump_n = 0;
+			const std::string name = fmt::format("%svd1_sdsm_%u.bin", dir, s_dump_n++);
+			fs::file f(name, fs::rewrite);
+			const u32 hdr[16] = { 0x53314456u /* VD1S */, 1u, w, h, bad ? 1u : 0u, static_cast<u32>(int_flip_index), 0x2b0u, n * 4, hn * 4, qn * 4, 48u, 0, 0, 0, 0, 0 };
+			f.write(hdr, sizeof(hdr));
+			f.write(pd.P.data(), 0x2b0);
+			f.write(in, n * 4);                                           // the input (host words)
+			f.write(lin, n * 4);                                          // the pass: linear depth (host words)
+			f.write(rb + pd.rb_ha, hn * 4); f.write(rb + pd.rb_hb, hn * 4); f.write(rb + pd.rb_q, qn * 4);   // guest order
+			f.write(red, 48); f.write(res, sizeof(res)); f.write(sub, sizeof(sub));
+			f.write(vm::get_super_ptr<u8>(z_ea), n * 4);                  // the SPUs: in place (guest order)
+			const u8 zero[4]{};
+			for (u32 off : { 0x268u, 0x26cu })
+			{
+				if (pw(off)) f.write(vm::get_super_ptr<u8>(pw(off)), hn * 4); else for (u32 i = 0; i < hn; i++) f.write(zero, 4);
+			}
+			if (pw(0x270)) f.write(vm::get_super_ptr<u8>(pw(0x270)), qn * 4); else for (u32 i = 0; i < qn; i++) f.write(zero, 4);
+			f.write(vm::get_super_ptr<u8>(pw(0x258)), 48);
+			for (u32 i = 0; i < 3; i++) f.write(vm::get_super_ptr<u8>(pw(0x0c + 4 * i)), 16);
+			for (u32 i = 0; i < 3; i++) f.write(vm::get_super_ptr<u8>(pw(0x18 + 4 * i)), 76);
+			c.dumps++;
+			rsx_log.success("vanillad1: gpu sdsm: dump -> %s (%s)", name, bad ? "bad" : "ok");
+		}
+	}
+	m_vd1_sd_readback->unmap();
 }
