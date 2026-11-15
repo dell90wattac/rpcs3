@@ -11,7 +11,7 @@ namespace vd1
 #define VD1_LIVE_FLAGS(X) \
 	X(E1) X(E24) X(E25) X(E27) X(E13) X(E3A) X(E3B) X(E14) X(E18) X(E22) \
 	X(E7) X(E6) X(E9) X(E10) X(E20) X(E21) X(E16) X(E23) X(E26) X(E12) \
-	X(B1) X(A1) X(B3) X(LABEL) X(B7) X(UPLOADS)
+	X(B1) X(A1) X(B3) X(LABEL) X(B7) X(UPLOADS) X(SDSMSPU)
 
 	enum class lf : u32
 	{

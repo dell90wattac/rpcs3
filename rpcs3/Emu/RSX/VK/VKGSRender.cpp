@@ -4201,6 +4201,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 // shadow = the pass every frame, the SPUs do the job (its cost); check = the pass every Nth frame
 // (VANILLAD1_GPU_SDSM_EVERY, 30) compared with the SPUs' output at the self-jump, the first two compared frames and the
 // first two mismatches dumped to <config>/vd1_sdsm_<n>.bin (re/notes/X301.2/sdsmdump.py); 1 / on = the swap.
+// Live switch SDSMSPU (vd1_live.h, tools/live.py): 1 = mode 1 leaves each frame to the SPUs (the A/B on one boot).
 // <config>/vd1_gpu_sdsm.glsl replaces the built-in shader with no rebuild. A frame that fails a check stays on the SPUs.
 #include "vd1_sdsm_final.h"
 
@@ -4289,7 +4290,7 @@ namespace
 
 	struct vd1_sd_counters
 	{
-		u32 labels = 0, ran = 0, retired = 0, late = 0, slot = 0, unfilled = 0, abort = 0, nosurf = 0, badsurf = 0, taken = 0;
+		u32 labels = 0, ran = 0, retired = 0, late = 0, spu_live = 0, slot = 0, unfilled = 0, abort = 0, nosurf = 0, badsurf = 0, taken = 0;
 		u32 spins = 0, gpu_waits = 0, timeouts = 0, checks = 0, check_bad = 0, dumps = 0;
 		u64 spin_us = 0, spin_max = 0, gpu_us = 0, gpu_max = 0, retire_us = 0, retire_max = 0;
 		u64 last_ms = 0, last_flip = 0;
@@ -4302,10 +4303,10 @@ namespace
 		if (!c.last_ms) { c.last_ms = now; c.last_flip = flip; return; }
 		if (now - c.last_ms < 10000) return;
 		const u64 frames = std::max<u64>(flip - c.last_flip, 1);
-		rsx_log.notice("vanillad1: gpu sdsm 10s: %llu frames, labels=%u ran=%u retired=%u (late %u) declined: slot=%u unfilled=%u abort=%u nosurf=%u badsurf=%u taken=%u; "
+		rsx_log.notice("vanillad1: gpu sdsm 10s: %llu frames, labels=%u ran=%u retired=%u (late %u) live SDSMSPU=%u declined: slot=%u unfilled=%u abort=%u nosurf=%u badsurf=%u taken=%u; "
 			"self-jump %.3f ms a frame (%u waits, max %.2f ms); GPU wait %.3f ms a frame (%u, max %.2f ms, timeouts %u); retire %.3f ms a frame (max %.2f ms); "
 			"checks %u (bad %u), dumps %u",
-			frames, c.labels, c.ran, c.retired, c.late, c.slot, c.unfilled, c.abort, c.nosurf, c.badsurf, c.taken,
+			frames, c.labels, c.ran, c.retired, c.late, c.spu_live, c.slot, c.unfilled, c.abort, c.nosurf, c.badsurf, c.taken,
 			c.spin_us / 1000. / frames, c.spins, c.spin_max / 1000., c.gpu_us / 1000. / frames, c.gpu_waits, c.gpu_max / 1000., c.timeouts,
 			c.retire_us / 1000. / frames, c.retire_max / 1000., c.checks, c.check_bad, c.dumps);
 		const u32 dumps = c.dumps;
@@ -4391,6 +4392,11 @@ void VKGSRender::vd1_sdsm_label(u32 ea, u32 value)
 
 	if (mode == sd_stats)
 	{
+		return;
+	}
+	if (mode == sd_on && vd1::live(vd1::lf::SDSMSPU))
+	{
+		c.spu_live++;   // live switch SDSMSPU (tools/live.py): this frame on the SPUs, for an A/B on one boot
 		return;
 	}
 
