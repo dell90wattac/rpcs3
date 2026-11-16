@@ -2205,14 +2205,58 @@ namespace rsx
 		const auto prev_textures_reference_mask = current_fp_metadata.referenced_textures_mask;
 
 		auto data_ptr = vm::base(rsx::get_address(program_offset, program_location));
-		current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+
+		// vanillad1: start scan cap (X301.1). Live switch FPSCAN: 0 = the stock scan, however long. 1 = a register that
+		// points at no program within vd1_fp_scan_cap instructions is the NOP program when the draw ignores the
+		// program's output (the result those draws had anyway, without the scan); a draw that uses the output gets
+		// the stock scan. 2 = the NOP program for every such draw.
+		const u32 vd1_fpscan = vd1::live(vd1::lf::FPSCAN);
+		current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr, vd1_fpscan != 0);
+		bool vd1_capped = vd1_fpscan != 0 && current_fp_metadata.vd1_long_scan;
+		auto& vd1_fs = m_vd1_fpscan;
+		vd1_fs.prefetch++;
+		vd1_fs.longscan += current_fp_metadata.vd1_long_scan;
+		if (vd1_capped)
+		{
+			m_fp_original_textures_mask = 0;
+			if (vd1_fpscan == 1 && !fragment_program_output_is_unused())
+			{
+				current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+				vd1_capped = false;
+				vd1_fs.full++;
+			}
+			else
+			{
+				vd1_fs.capped++;
+			}
+		}
+
+		if (!(++vd1_fs.ticks & 0xff))
+		{
+			const u64 now = get_system_time() / 1000;
+			if (!vd1_fs.last_ms)
+			{
+				vd1_fs.last_ms = now;
+			}
+			else if (now - vd1_fs.last_ms >= 10000)
+			{
+				rsx_log.notice("vanillad1: fp scan 10s: FPSCAN=%u prefetch=%u long=%u capped=%u full=%u dirty by: set=%u flip=%u write=%u",
+					vd1_fpscan, vd1_fs.prefetch, vd1_fs.longscan, vd1_fs.capped, vd1_fs.full, vd1_fs.by_set, vd1_fs.by_flip, vd1_fs.by_write);
+				vd1_fs = {};
+				vd1_fs.last_ms = now;
+			}
+		}
 
 		// vanillad1: depth-only draws that ignore the program's output key and compile the NOP program.
 		// total_length keeps covering the real ucode, so writes to it still trigger a new prefetch.
-		const u32 real_total_length = current_fp_metadata.program_ucode_length + current_fp_metadata.program_start_offset;
-		m_fp_original_textures_mask = current_fp_metadata.referenced_textures_mask;
+		const u32 real_total_length = vd1_capped ? program_hash_util::fragment_program_utils::vd1_fp_scan_cap * 16 :
+			current_fp_metadata.program_ucode_length + current_fp_metadata.program_start_offset;
+		if (!vd1_capped)
+		{
+			m_fp_original_textures_mask = current_fp_metadata.referenced_textures_mask;
+		}
 		m_fp_nop_substituted = fragment_program_output_is_unused();
-		if (m_fp_nop_substituted)
+		if (m_fp_nop_substituted || vd1_capped)
 		{
 			data_ptr = s_nop_fragment_program;
 			current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
@@ -2354,6 +2398,7 @@ namespace rsx
 			!m_graphics_state.test(rsx::pipeline_state::fragment_program_ucode_dirty) &&
 			fragment_program_output_is_unused() != m_fp_nop_substituted)
 		{
+			m_vd1_fpscan.by_flip++;
 			m_graphics_state |= rsx::pipeline_state::fragment_program_ucode_dirty | rsx::pipeline_state::fragment_program_state_dirty;
 		}
 
@@ -2749,6 +2794,7 @@ namespace rsx
 		}
 
 		// Data overlaps. Force ucode reload.
+		m_vd1_fpscan.by_write++;
 		m_graphics_state |= rsx::pipeline_state::fragment_program_ucode_dirty;
 		return true;
 	}

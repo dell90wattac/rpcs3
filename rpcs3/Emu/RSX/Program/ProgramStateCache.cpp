@@ -604,7 +604,7 @@ usz fragment_program_utils::get_fragment_program_ucode_size(const void* ptr)
 	}
 }
 
-fragment_program_utils::fragment_program_metadata fragment_program_utils::analyse_fragment_program(const void* ptr)
+fragment_program_utils::fragment_program_metadata fragment_program_utils::analyse_fragment_program(const void* ptr, bool vd1_cap_scan)
 {
 	fragment_program_utils::fragment_program_metadata result{};
 	result.program_start_offset = -1;
@@ -633,6 +633,19 @@ fragment_program_utils::fragment_program_metadata fragment_program_utils::analys
 		}
 
 		index++;
+
+		// vanillad1: start scan cap (X301.1)
+		if (index == vd1_fp_scan_cap) [[unlikely]]
+		{
+			result.vd1_long_scan = true;
+			if (vd1_cap_scan)
+			{
+				result.program_start_offset = 0;
+				result.program_ucode_length = 16;
+				result.is_nop_shader = true;
+				return result;
+			}
+		}
 	}
 
 	// vanillad1: fragment hash (X302): the same rotating checksum as get_fragment_program_ucode_hash, over the same instructions

@@ -18,6 +18,7 @@ namespace rsx
 
 		void set_shader_program_dirty(context* ctx, u32, u32)
 		{
+			RSX(ctx)->m_vd1_fpscan.by_set++; // vanillad1: start scan cap (X301.1)
 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_ucode_dirty;
 		}
 

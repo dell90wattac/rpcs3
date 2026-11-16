@@ -279,6 +279,8 @@ namespace rsx
 		// vanillad1: depth-only draws that ignore their fragment program use the NOP program (RSXThread.cpp)
 		bool m_fp_nop_substituted = false;
 		u32 m_fp_original_textures_mask = 0; // textures the real program reads
+		// vanillad1: start scan cap (X301.1): counts for the 10-s log line
+		struct vd1_fpscan_t { u32 ticks, prefetch, longscan, capped, full, by_set, by_flip, by_write; u64 last_ms; } m_vd1_fpscan{};
 
 		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
 		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};

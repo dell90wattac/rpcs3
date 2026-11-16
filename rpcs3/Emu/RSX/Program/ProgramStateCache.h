@@ -62,6 +62,7 @@ namespace program_hash_util
 			bool has_branch_instructions;
 			bool is_nop_shader;           // Does this affect Z-pass testing???
 			usz ucode_hash;               // vanillad1: fragment hash (X302): get_fragment_program_ucode_hash's value, 0 = not worked out
+			bool vd1_long_scan;           // vanillad1: start scan cap (X301.1): vd1_fp_scan_cap NOPs and still no program
 		};
 
 		/**
@@ -72,7 +73,13 @@ namespace program_hash_util
 
 		static usz get_fragment_program_ucode_size(const void* ptr);
 
-		static fragment_program_metadata analyse_fragment_program(const void* ptr);
+		// vanillad1: start scan cap (X301.1). Destiny (BLUS31181) draws with the shader program register at local offset 0,
+		// which holds float data, not a program: every 16 bytes read as a NOP with no END bit, so the scan for the
+		// program's start ran ~2.4 MB to the first word that looked like an opcode, dozens of times a frame (22 % of
+		// the RSX thread in the Riksis fight). A real program has at most a few NOPs of padding in front.
+		// vd1_cap_scan: stop there and report the NOP program (start 0, 16 bytes); else only vd1_long_scan is set.
+		static constexpr s32 vd1_fp_scan_cap = 1024;
+		static fragment_program_metadata analyse_fragment_program(const void* ptr, bool vd1_cap_scan = false);
 
 		static usz get_fragment_program_ucode_hash(const RSXFragmentProgram &program);
 	};
