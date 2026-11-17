@@ -1,3 +1,4 @@
+#include "Emu/Cell/SPUThread.h" // vanillad1: label safety (X421): the stall dump samples the SPU threads; first, before the Vulkan headers bring in X11, whose CWX macro breaks SPUOpcodes.h on Linux
 #include "Emu/RSX/VK/vkutils/descriptors.h"
 #include "Emu/vd1_live.h"
 #include "stdafx.h"
@@ -25,7 +26,6 @@
 #include "Emu/RSX/Core/RSXReservationLock.hpp" // vanillad1: GPU lighting (X300.2)
 #include "Emu/RSX/NV47/HW/nv0039.h" // vanillad1: G-buffer byte on the GPU (X300.7)
 #include "Emu/Cell/timers.hpp" // vanillad1: GPU lighting (X300.2)
-#include "Emu/Cell/SPUThread.h" // vanillad1: label safety (X421): the stall dump samples the SPU threads
 #include "Emu/IdManager.h" // vanillad1: label safety (X421)
 #include <cmath>
 #include <cstring>
