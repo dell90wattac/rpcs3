@@ -2244,6 +2244,12 @@ namespace rsx
 					vd1_fpscan, vd1_fs.prefetch, vd1_fs.longscan, vd1_fs.capped, vd1_fs.full, vd1_fs.by_set, vd1_fs.by_flip, vd1_fs.by_write);
 				vd1_fs = {};
 				vd1_fs.last_ms = now;
+
+				// vanillad1 (X466.2): the SPU return shortcut's lookups (VANILLAD1_SPU_MIRROR_STATS=1; unlocked counters)
+				if (const u64 hits = std::exchange(vd1::g_spu_mirror_stats[0], 0), misses = std::exchange(vd1::g_spu_mirror_stats[1], 0); hits | misses)
+				{
+					rsx_log.notice("vanillad1: spu mirror 10s hits=%u misses=%u", hits, misses);
+				}
 			}
 		}
 

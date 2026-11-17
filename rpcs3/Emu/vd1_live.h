@@ -32,4 +32,7 @@ namespace vd1
 	{
 		return g_live[static_cast<u32>(flag)];
 	}
+
+	// vanillad1 (X466.2): the SPU return shortcut's lookups, counted by the LLVM code under VANILLAD1_SPU_MIRROR_STATS=1
+	extern u64 g_spu_mirror_stats[2]; // hits, misses
 }

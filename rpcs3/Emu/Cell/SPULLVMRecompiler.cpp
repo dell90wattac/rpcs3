@@ -76,6 +76,32 @@ void spu_llvm_set_compile_context(spu_llvm_compile_context* context) noexcept
 }
 #endif
 
+// vanillad1 (X466.2): the Mega / Giga return shortcut (spu_thread::stack_mirror). A call arms stack_mirror[sp >> 4] with the
+// chunk at its return address, and a later "bi" enters that chunk after matching the target and ONE word of local store.
+// spu_fast blocks (the interpreter functions) neither arm nor clear, so in a mixed spu_fast / LLVM run an entry outlives its
+// program, and a sibling program loaded at the same address returns into the other program's chunk.
+// VANILLAD1_SPU_MIRROR, read once: 0 / unset = stock code. 1 = safe: the interpreter "bi" clears the slot at its sp and a
+// lookup that misses clears its slot. 2 = off: no arming and no lookup (the in-function table stays). 3 = 1, and the
+// interpreter's calls (brsl / brasl / bisl / bisled) clear the slot at their sp too.
+// VANILLAD1_SPU_MIRROR_STATS=1 counts the lookups (one unlocked add per "bi"; printed by the RSX thread every 10 s).
+static u32 vd1_spu_mirror()
+{
+	static const u32 s_mode = []() -> u32
+	{
+		const char* env = std::getenv("VANILLAD1_SPU_MIRROR");
+		const u32 mode = env && *env >= '1' && *env <= '3' && !env[1] ? static_cast<u32>(*env - '0') : 0u;
+		spu_log.notice("vanillad1: spu mirror: VANILLAD1_SPU_MIRROR=%u (0 stock, 1 safe, 2 off, 3 safe + calls)", mode);
+		return mode;
+	}();
+	return s_mode;
+}
+
+static bool vd1_spu_mirror_stats()
+{
+	static const bool s_on = []() { const char* e = std::getenv("VANILLAD1_SPU_MIRROR_STATS"); return e && *e == '1'; }();
+	return s_on;
+}
+
 class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 {
 	// JIT Instance
@@ -1605,6 +1631,22 @@ public:
 		, cpu_translator(nullptr, false)
 		, m_interp_magn(interp_magn)
 	{
+		vd1_spu_mirror(); // vanillad1 (X466.2): read (and logged) before anything is compiled
+	}
+
+	// vanillad1 (X466.2): one add on a counter of vd1::g_spu_mirror_stats (unlocked: a diagnostic)
+	void vd1_mirror_count(u32 index)
+	{
+		const auto ptr = m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&vd1::g_spu_mirror_stats[index])), get_type<u64*>());
+		m_ir->CreateStore(m_ir->CreateAdd(m_ir->CreateLoad(get_type<u64>(), ptr), m_ir->getInt64(1)), ptr);
+	}
+
+	// vanillad1 (X466.2): the interpreter (spu_fast) side of VANILLAD1_SPU_MIRROR=1 / 3: drop the entry at the current sp
+	void vd1_mirror_clear_interp()
+	{
+		const auto sp = m_ir->CreateAnd(m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::gpr, 1, &v128::_u32, 3)), m_ir->getInt32(0x3fff0));
+		const auto off = m_ir->CreateAdd(m_ir->CreateZExt(sp, get_type<u64>()), m_ir->getInt64(::offset32(&spu_thread::stack_mirror)));
+		m_ir->CreateStore(splat<u64[2]>(-1).eval(m_ir), _ptr(m_thread, off));
 	}
 
 	virtual void init() override
@@ -9828,6 +9870,13 @@ public:
 			const auto d_exec = llvm::BasicBlock::Create(m_context, "", m_function);
 			const auto d_done = llvm::BasicBlock::Create(m_context, "", m_function);
 			m_ir->SetInsertPoint(result);
+
+			if (ret && (vd1_spu_mirror() & 1) && g_cfg.core.spu_block_size >= spu_block_size_type::mega)
+			{
+				// vanillad1 (X466.2): a return that does not go through the lookup uses the entry up all the same
+				vd1_mirror_clear_interp();
+			}
+
 			m_ir->CreateCondBr(get_imm<bool>(op.e).value, e_exec, d_test, m_md_unlikely);
 			m_ir->SetInsertPoint(e_exec);
 			const auto e_addr = call("spu_check_interrupts", &exec_check_interrupts, m_thread, addr.value);
@@ -9866,7 +9915,7 @@ public:
 		// Load stack addr if necessary
 		value_t<u32> sp;
 
-		if (ret && g_cfg.core.spu_block_size != spu_block_size_type::safe)
+		if (ret && g_cfg.core.spu_block_size != spu_block_size_type::safe && vd1_spu_mirror() != 2)
 		{
 			if (op.opcode)
 			{
@@ -9894,7 +9943,7 @@ public:
 
 		m_ir->CreateStore(addr.value, spu_ptr(&spu_thread::pc));
 
-		if (ret && g_cfg.core.spu_block_size >= spu_block_size_type::mega)
+		if (ret && g_cfg.core.spu_block_size >= spu_block_size_type::mega && vd1_spu_mirror() != 2)
 		{
 			// Compare address stored in stack mirror with addr
 			const auto stack0 = eval(zext<u64>(sp) + ::offset32(&spu_thread::stack_mirror));
@@ -9910,12 +9959,28 @@ public:
 			m_ir->CreateCondBr(m_ir->CreateICmpEQ(cmp2, m_ir->CreateTrunc(_ret, get_type<u32>())), done, fail, m_md_likely);
 			m_ir->SetInsertPoint(done);
 
+			if (vd1_spu_mirror_stats())
+			{
+				vd1_mirror_count(0);
+			}
+
 			// Clear stack mirror and return by tail call to the provided return address
 			m_ir->CreateStore(splat<u64[2]>(-1).eval(m_ir), _ptr(m_thread, stack0.value));
 			const auto type = m_finfo->chunk->getFunctionType();
 			const auto fval = _ptr(get_segment_base(), m_ir->CreateLShr(_ret, 32));
 			tail_chunk({type, fval}, m_ir->CreateTrunc(m_ir->CreateLShr(link, 32), get_type<u32>()));
 			m_ir->SetInsertPoint(fail);
+
+			if (vd1_spu_mirror_stats())
+			{
+				vd1_mirror_count(1);
+			}
+
+			if (vd1_spu_mirror() & 1)
+			{
+				// vanillad1 (X466.2): a miss leaves no entry behind at this sp
+				m_ir->CreateStore(splat<u64[2]>(-1).eval(m_ir), _ptr(m_thread, stack0.value));
+			}
 		}
 
 		if (g_cfg.core.spu_block_size >= spu_block_size_type::mega)
@@ -10593,6 +10658,13 @@ public:
 			value_t<u32> next;
 			next.value = m_interp_pc_next;
 			set_vr(op.rt, insert(splat<u32[4]>(0), 3, next));
+
+			if (vd1_spu_mirror() == 3 && g_cfg.core.spu_block_size >= spu_block_size_type::mega)
+			{
+				// vanillad1 (X466.2): a call that does not arm the entry at its sp leaves none there
+				vd1_mirror_clear_interp();
+			}
+
 			return;
 		}
 
@@ -10607,6 +10679,13 @@ public:
 		{
 			// Store the return function chunk address at the stack mirror
 			const auto pfunc = add_function(m_pos + 4);
+
+			if (vd1_spu_mirror() == 2)
+			{
+				// vanillad1 (X466.2): off: the return chunk is still made (the in-function table uses it), never armed
+				return;
+			}
+
 			const auto stack0 = eval(zext<u64>(extract(get_reg_fixed(1), 3) & 0x3fff0) + ::offset32(&spu_thread::stack_mirror));
 			const auto stack1 = eval(stack0 + 8);
 			const auto rel_ptr = m_ir->CreateSub(m_ir->CreatePtrToInt(pfunc->chunk, get_type<u64>()), m_ir->CreatePtrToInt(get_segment_base(), get_type<u64>()));

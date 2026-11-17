@@ -23,6 +23,8 @@ namespace vd1
 
 	constinit volatile u32* g_live = s_storage;
 
+	u64 g_spu_mirror_stats[2]{}; // vanillad1 (X466.2): hits, misses
+
 	static const char* const s_names[]
 	{
 #define X(name) #name,
