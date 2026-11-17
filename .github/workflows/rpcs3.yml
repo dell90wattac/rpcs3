@@ -70,8 +70,9 @@ jobs:
   Linux_Build:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage)
-    if: github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')
+    # vanillad1: on the fork only the Windows MSVC build runs (GitHub disabled the fork's Actions over the full matrix's usage);
+    # a dispatch on a branch named *-linux builds the Linux x86_64 clang AppImage alone (the upstream's shipped Linux build)
+    if: (github.repository == 'RPCS3/rpcs3' && (github.event_name != 'push' || github.ref_name == 'master')) || (github.event_name == 'workflow_dispatch' && endsWith(github.ref_name, '-linux'))
     strategy:
       fail-fast: false
       matrix:
@@ -82,20 +83,6 @@ jobs:
             compiler: clang
             UPLOAD_COMMIT_HASH: d812f1254a1157c80fd402f94446310560f54e5f
             UPLOAD_REPO_FULL_NAME: "rpcs3/rpcs3-binaries-linux"
-          - os: ubuntu-24.04
-            docker_img: "rpcs3/rpcs3-ci-jammy:2.1"
-            build_sh: "/rpcs3/.ci/build-linux.sh"
-            compiler: gcc
-          - os: ubuntu-24.04-arm
-            docker_img: "rpcs3/rpcs3-ci-jammy-aarch64:2.1"
-            build_sh: "/rpcs3/.ci/build-linux-aarch64.sh"
-            compiler: clang
-            UPLOAD_COMMIT_HASH: a1d35836e8d45bfc6f63c26f0a3e5d46ef622fe1
-            UPLOAD_REPO_FULL_NAME: "rpcs3/rpcs3-binaries-linux-arm64"
-          - os: ubuntu-24.04-arm
-            docker_img: "rpcs3/rpcs3-ci-jammy-aarch64:2.1"
-            build_sh: "/rpcs3/.ci/build-linux-aarch64.sh"
-            compiler: gcc
     name: RPCS3 Linux ${{ matrix.os }} ${{ matrix.compiler }}
     runs-on: ${{ matrix.os }}
     env:
@@ -261,7 +248,7 @@ jobs:
   Windows_Build:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches
-    if: github.event_name != 'push' || startsWith(github.ref_name, 'p18-') || startsWith(github.ref_name, 'p19-') || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
+    if: (github.event_name != 'push' && !endsWith(github.ref_name, '-linux')) || startsWith(github.ref_name, 'p18-') || startsWith(github.ref_name, 'p19-') || (github.repository == 'RPCS3/rpcs3' && github.ref_name == 'master')
     name: RPCS3 Windows
     runs-on: windows-2025-vs2026
     env:
