@@ -4830,11 +4830,27 @@ public:
 			const auto vd1_full_end = m_ir->GetInsertBlock();
 			m_ir->CreateBr(vd1_bb_join);
 			m_ir->SetInsertPoint(vd1_bb_zero);
+#if defined(ARCH_X64)
+			// p24: DRDEC=2: one pause instead of the clock read (SMT-friendly, ~140 cycles on Skylake: about the read's time)
+			const auto vd1_bb_pause = llvm::BasicBlock::Create(m_context, "", vd1_fn);
+			m_ir->CreateCondBr(m_ir->CreateICmpEQ(vd1_flag, m_ir->getInt32(2)), vd1_bb_pause, vd1_bb_join);
+			m_ir->SetInsertPoint(vd1_bb_pause);
+			m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::x86_sse2_pause));
 			m_ir->CreateBr(vd1_bb_join);
+#else
+			m_ir->CreateBr(vd1_bb_join);
+#endif
 			m_ir->SetInsertPoint(vd1_bb_join);
+#if defined(ARCH_X64)
+			const auto vd1_phi = m_ir->CreatePHI(get_type<u32>(), 3);
+			vd1_phi->addIncoming(vd1_full, vd1_full_end);
+			vd1_phi->addIncoming(m_ir->getInt32(0), vd1_bb_zero);
+			vd1_phi->addIncoming(m_ir->getInt32(0), vd1_bb_pause);
+#else
 			const auto vd1_phi = m_ir->CreatePHI(get_type<u32>(), 2);
 			vd1_phi->addIncoming(vd1_full, vd1_full_end);
 			vd1_phi->addIncoming(m_ir->getInt32(0), vd1_bb_zero);
+#endif
 			res.value = vd1_phi;
 			break;
 		}

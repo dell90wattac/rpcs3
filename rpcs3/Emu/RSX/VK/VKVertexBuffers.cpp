@@ -7,6 +7,9 @@
 #include "vkutils/buffer_object.h"
 
 #include <span>
+#include <bit> // vanillad1: X301 p24: std::rotl
+#include <algorithm>
+#include <cstring>
 
 namespace vk
 {
@@ -62,6 +65,8 @@ namespace
 	// vanillad1: X301: EIDX (live): an emulated primitive's index list depends only on the primitive and the vertex count, so
 	// this frame's earlier list is drawn again instead of generated and uploaded again. Its ring offset lasts the frame, as
 	// X302's caches' do (purged with them at the flip: vd1_purge_upload_caches).
+	void vd1_idx_advance(u64 offset, u64 length, u64 ring); // vanillad1: X301 p24: IXC's ring age (defined below)
+
 	rsx::unordered_map<u64, VkDeviceSize> g_vd1_emu_index_cache;
 	u32 g_vd1_emu_index_hits = 0;
 	u32 g_vd1_emu_index_made = 0;
@@ -86,6 +91,7 @@ namespace
 		}
 
 		VkDeviceSize offset_in_index_buffer = m_index_buffer_ring_info.alloc<256>(upload_size);
+		vd1_idx_advance(offset_in_index_buffer, upload_size, m_index_buffer_ring_info.size()); // X301 p24: IXC's ring age
 		void* buf = m_index_buffer_ring_info.map(offset_in_index_buffer, upload_size);
 
 		g_fxo->get<rsx::dma_manager>().emulate_as_indexed(buf, clause.primitive, vertex_count);
@@ -126,9 +132,33 @@ namespace
 		u64 first8, last8;
 		VkDeviceSize offset;
 		u32 min_index, max_index, index_count;
+		u64 hash;           // X301 p24: IXC: every byte of the game's index list
+		u64 total_end;      // the index ring's running byte count at this entry's end
+		u32 frame;          // the frame that stored it (without IXC only this frame's entries count)
 	};
 
 	rsx::unordered_map<u64, vd1_index_entry> g_vd1_index_cache;
+
+	// vanillad1: X301 p24: the index ring's age, as the attribute ring's for VXC (two allocation sites, both in this file)
+	u64 g_vd1_idx_total = 0;
+	u64 g_vd1_idx_last_end = 0;
+	u64 g_vd1_idx_frame_start = 0;
+	u64 g_vd1_idx_ring_size = 0;
+	bool g_vd1_ixc_guard_ok = true;
+	u32 g_vd1_ixc_old_hits = 0;
+	u32 g_vd1_ixc_misses = 0;
+	u32 g_vd1_idx_frame = 0;
+
+	void vd1_idx_advance(u64 offset, u64 length, u64 ring)
+	{
+		g_vd1_idx_ring_size = ring;
+		const u64 advance = offset >= g_vd1_idx_last_end ? offset + length - g_vd1_idx_last_end : ring - g_vd1_idx_last_end + offset + length;
+		g_vd1_idx_total += advance;
+		g_vd1_idx_last_end = offset + length;
+	}
+
+	u64 vd1_vxc_hash(u32 address, u32 bytes);
+	u64 vd1_bytes_hash(const u8* p, usz bytes);
 
 	// vanillad1: multi-block vertex cache (X302): the same for draws with 2-4 interleaved blocks (the stock cache takes one)
 	struct vd1_vertex_entry
@@ -157,12 +187,54 @@ namespace
 	u32 g_vd1_vxc_old_hits = 0;
 	u32 g_vd1_vxc_new_hits = 0;
 	u32 g_vd1_vxc_misses = 0;
+	u64 g_vd1_attr_ring_size = 0;       // X301 p24: the attribute ring's size, for the frame-end guard
+	u64 g_vd1_attr_frame_start = 0;     // the running count at this frame's start
+	bool g_vd1_vxc_guard_ok = true;     // the last frame allocated under 1/8 of the ring (VXC=1 reuses only then)
+	u64 g_vd1_attr_frame_max = 0;       // the largest frame's allocation in the 10-s window
+	u64 g_vd1_attr_frame_sum = 0;
 
 	void vd1_attr_advance(u64 offset, u64 length, u64 ring)
 	{
 		const u64 advance = offset >= g_vd1_attr_last_end ? offset + length - g_vd1_attr_last_end : ring - g_vd1_attr_last_end + offset + length;
 		g_vd1_attr_total += advance;
 		g_vd1_attr_last_end = offset + length;
+	}
+
+	// X301 p24: VXC=1's check: every byte of the block, four independent 64-bit lanes (multiply, xor, rotate) and a final mix.
+	// Not cryptographic; an accidental match of changed data is ~2^-64 a draw.
+	u64 vd1_vxc_hash(u32 address, u32 bytes)
+	{
+		return vd1_bytes_hash(vm::get_super_ptr<u8>(address), bytes);
+	}
+
+	u64 vd1_bytes_hash(const u8* p, usz bytes)
+	{
+		u64 h0 = 0x9E3779B97F4A7C15ull ^ bytes, h1 = 0xC2B2AE3D27D4EB4Full, h2 = 0x165667B19E3779F9ull, h3 = 0x27D4EB2F165667C5ull;
+		usz i = 0;
+		for (; i + 32 <= bytes; i += 32)
+		{
+			u64 w[4];
+			std::memcpy(w, p + i, 32);
+			h0 = std::rotl((h0 ^ w[0]) * 0x9E3779B97F4A7C15ull, 31);
+			h1 = std::rotl((h1 ^ w[1]) * 0xC2B2AE3D27D4EB4Full, 29);
+			h2 = std::rotl((h2 ^ w[2]) * 0x165667B19E3779F9ull, 27);
+			h3 = std::rotl((h3 ^ w[3]) * 0x27D4EB2F165667C5ull, 33);
+		}
+		for (; i + 8 <= bytes; i += 8)
+		{
+			u64 w;
+			std::memcpy(&w, p + i, 8);
+			h0 = std::rotl((h0 ^ w) * 0x9E3779B97F4A7C15ull, 31);
+		}
+		for (; i < bytes; i++)
+		{
+			h1 = (h1 ^ p[i]) * 0x100000001B3ull;
+		}
+		u64 h = h0 ^ std::rotl(h1, 17) ^ std::rotl(h2, 41) ^ std::rotl(h3, 7);
+		h ^= h >> 33;
+		h *= 0xFF51AFD7ED558CCDull;
+		h ^= h >> 33;
+		return h;
 	}
 
 	u64 vd1_vxc_sample(u32 address, u32 bytes)
@@ -227,7 +299,9 @@ namespace
 
 			// vanillad1: index cache (X302)
 			const auto& vd1_src = command.raw_index_buffer;
-			const bool vd1_cacheable = vd1::live(vd1::lf::E9) && vd1_src.size() >= 8 && !rsx::method_registers.current_draw_clause.is_immediate_draw;
+			const bool vd1_ixc = vd1::live(vd1::lf::IXC) != 0; // X301 p24
+			const bool vd1_cacheable = (vd1::live(vd1::lf::E9) || vd1_ixc) && vd1_src.size() >= 8 && !rsx::method_registers.current_draw_clause.is_immediate_draw;
+			u64 vd1_hash = 0;
 			const u32 vd1_key_bits = static_cast<u32>(index_type) | (static_cast<u32>(primitive) << 8) |
 				(rsx::method_registers.restart_index_enabled() ? (1u << 16) : 0u) | (emulate_restart ? (1u << 17) : 0u);
 			const u32 vd1_restart_index = rsx::method_registers.restart_index();
@@ -238,13 +312,22 @@ namespace
 			{
 				std::memcpy(&vd1_first8, vd1_src.data(), 8);
 				std::memcpy(&vd1_last8, vd1_src.data() + vd1_src.size() - 8, 8);
+				if (vd1_ixc)
+				{
+					vd1_hash = vd1_bytes_hash(reinterpret_cast<const u8*>(vd1_src.data()), vd1_src.size());
+				}
 
 				if (const auto found = g_vd1_index_cache.find(vd1_key); found != g_vd1_index_cache.end())
 				{
 					const auto& e = found->second;
+					// X301 p24: an entry of an earlier frame only under IXC: its full hash, within 1/8 of the index ring, guard on
+					const bool vd1_this_frame = e.frame == g_vd1_idx_frame;
+					const bool vd1_old_ok = vd1_ixc && !vd1_this_frame && g_vd1_ixc_guard_ok && e.hash == vd1_hash &&
+						g_vd1_idx_total - e.total_end < m_index_buffer_ring_info.size() / 8;
 					if (e.src == vd1_src.data() && e.size == vd1_src.size() && e.upload_size == upload_size && e.key_bits == vd1_key_bits &&
-						e.restart_index == vd1_restart_index && e.first8 == vd1_first8 && e.last8 == vd1_last8)
+						e.restart_index == vd1_restart_index && e.first8 == vd1_first8 && e.last8 == vd1_last8 && (vd1_this_frame || vd1_old_ok))
 					{
+						if (!vd1_this_frame) g_vd1_ixc_old_hits++;
 						std::optional<std::tuple<VkDeviceSize, VkIndexType>> index_info =
 							std::make_tuple(e.offset, vk::get_index_type(index_type));
 						return {prims, true, e.min_index, e.max_index, e.index_count, rsx::method_registers.vertex_data_base_index(), index_info};
@@ -253,6 +336,8 @@ namespace
 			}
 
 			VkDeviceSize offset_in_index_buffer = m_index_buffer_ring_info.alloc<64>(upload_size);
+			vd1_idx_advance(offset_in_index_buffer, upload_size, m_index_buffer_ring_info.size()); // X301 p24: IXC's ring age
+			if (vd1_ixc) g_vd1_ixc_misses++;
 			void* buf = m_index_buffer_ring_info.map(offset_in_index_buffer, upload_size);
 
 			std::span<std::byte> dst;
@@ -303,7 +388,7 @@ namespace
 			if (vd1_cacheable) // vanillad1: index cache (X302)
 			{
 				g_vd1_index_cache[vd1_key] = { vd1_src.data(), vd1_src.size(), upload_size, vd1_restart_index, vd1_key_bits, vd1_first8, vd1_last8,
-					offset_in_index_buffer, min_index, max_index, index_count };
+					offset_in_index_buffer, min_index, max_index, index_count, vd1_hash, g_vd1_idx_total, g_vd1_idx_frame };
 			}
 
 			std::optional<std::tuple<VkDeviceSize, VkIndexType>> index_info =
@@ -344,8 +429,27 @@ u32 g_vd1_view_remakes = 0;
 // vanillad1: index and multi-block vertex caches (X302): the ring offsets they hold last a frame, like the vertex cache's
 void vd1_purge_upload_caches()
 {
-	g_vd1_index_cache.clear();
+	// X301 p24: IXC keeps the index cache across frames (bounded); its guard: this frame's index allocation under 1/8 ring
+	if (!vd1::live(vd1::lf::IXC) || g_vd1_index_cache.size() > 65536)
+	{
+		g_vd1_index_cache.clear();
+	}
+	g_vd1_idx_frame++;
+	{
+		const u64 frame_alloc = g_vd1_idx_total - g_vd1_idx_frame_start;
+		g_vd1_idx_frame_start = g_vd1_idx_total;
+		g_vd1_ixc_guard_ok = g_vd1_idx_ring_size && frame_alloc < g_vd1_idx_ring_size / 8;
+	}
 	g_vd1_frame++; // X301: entries from earlier frames count only under VXC
+
+	// X301 p24: this frame's attribute allocation; VXC=1 reuses older entries next frame only if it stayed under 1/8 ring
+	{
+		const u64 frame_alloc = g_vd1_attr_total - g_vd1_attr_frame_start;
+		g_vd1_attr_frame_start = g_vd1_attr_total;
+		g_vd1_vxc_guard_ok = g_vd1_attr_ring_size && frame_alloc < g_vd1_attr_ring_size / 8;
+		g_vd1_attr_frame_max = std::max(g_vd1_attr_frame_max, frame_alloc);
+		g_vd1_attr_frame_sum += frame_alloc;
+	}
 	if (!vd1::live(vd1::lf::VXC) || g_vd1_vertex_cache.size() > 65536)
 	{
 		g_vd1_vertex_cache.clear();
@@ -364,8 +468,19 @@ void vd1_purge_upload_caches()
 				g_vd1_view_remakes, s_frames, vd1::live(vd1::lf::EIDX), g_vd1_emu_index_made, g_vd1_emu_index_hits);
 			if (vd1::live(vd1::lf::VXC))
 			{
-				rsx_log.notice("vanillad1: vxc 10s: hits from earlier frames=%u, this frame=%u, misses=%u, entries=%u",
-					g_vd1_vxc_old_hits, g_vd1_vxc_new_hits, g_vd1_vxc_misses, static_cast<u32>(g_vd1_vertex_cache.size()));
+				rsx_log.notice("vanillad1: vxc 10s: VXC=%u hits from earlier frames=%u, this frame=%u, misses=%u, entries=%u",
+					vd1::live(vd1::lf::VXC), g_vd1_vxc_old_hits, g_vd1_vxc_new_hits, g_vd1_vxc_misses, static_cast<u32>(g_vd1_vertex_cache.size()));
+			}
+			if (vd1::live(vd1::lf::IXC))
+			{
+				rsx_log.notice("vanillad1: ixc 10s: hits from earlier frames=%u, misses=%u, entries=%u, guard=%u",
+					g_vd1_ixc_old_hits, g_vd1_ixc_misses, static_cast<u32>(g_vd1_index_cache.size()), g_vd1_ixc_guard_ok ? 1u : 0u);
+			}
+			if (s_frames)
+			{
+				rsx_log.notice("vanillad1: attrib ring 10s: KB a frame avg=%u max=%u, ring KB=%u, guard=%u",
+					static_cast<u32>(g_vd1_attr_frame_sum / s_frames / 1024), static_cast<u32>(g_vd1_attr_frame_max / 1024),
+					static_cast<u32>(g_vd1_attr_ring_size / 1024), g_vd1_vxc_guard_ok ? 1u : 0u);
 			}
 		}
 		s_last_ms = now;
@@ -374,6 +489,10 @@ void vd1_purge_upload_caches()
 		g_vd1_vxc_old_hits = 0;
 		g_vd1_vxc_new_hits = 0;
 		g_vd1_vxc_misses = 0;
+		g_vd1_attr_frame_max = 0;
+		g_vd1_attr_frame_sum = 0;
+		g_vd1_ixc_old_hits = 0;
+		g_vd1_ixc_misses = 0;
 		g_vd1_emu_index_hits = 0;
 		s_frames = 0;
 	}
@@ -381,6 +500,13 @@ void vd1_purge_upload_caches()
 
 vk::vertex_upload_info VKGSRender::upload_vertex_data()
 {
+	// vanillad1: X301 p24: a changed heap moves every ring offset the caches hold (X302's per-frame ones too): none survives
+	if (vk::test_status_interrupt(vk::heap_changed))
+	{
+		g_vd1_vertex_cache.clear();
+		g_vd1_index_cache.clear();
+	}
+
 	draw_command_visitor visitor(m_index_buffer_ring_info, m_vertex_layout);
 	auto result = std::visit(visitor, m_draw_processor.get_draw_command(rsx::method_registers));
 
@@ -413,7 +539,16 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 
 		m_frame_stats.vertex_cache_request_count++;
 
-		const bool vd1_vxc = vd1::live(vd1::lf::VXC) != 0; // X301
+		// X301: VXC=1 the full-content check (p24), 2 the three-sample experiment (p23)
+		const u32 vd1_vxc_mode = vd1::live(vd1::lf::VXC);
+		const bool vd1_vxc = vd1_vxc_mode != 0;
+		g_vd1_attr_ring_size = m_attrib_ring_info.size();
+
+		// X301 p24: a changed heap moves every ring offset: no entry survives it (this frame's included)
+		if (vk::test_status_interrupt(vk::heap_changed))
+		{
+			g_vd1_vertex_cache.clear();
+		}
 
 		if (!vd1_vxc && m_vertex_layout.interleaved_blocks.size() == 1 &&
 			rsx::method_registers.current_draw_clause.command != rsx::draw_command::inlined_array)
@@ -453,8 +588,9 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 				{
 					// the exact range the upload copies (write_vertex_data_to_memory), so a sample never reads past it
 					const auto vd1_range = block->calculate_required_range(vertex_base, vertex_count);
-					vd1_entry.vxc_fp[b] = vd1_vxc_sample(block->real_offset_address + vd1_range.first * block->attribute_stride,
-						vd1_range.second * block->attribute_stride);
+					const u32 vd1_addr = block->real_offset_address + vd1_range.first * block->attribute_stride;
+					const u32 vd1_bytes = vd1_range.second * block->attribute_stride;
+					vd1_entry.vxc_fp[b] = vd1_vxc_mode == 2 ? vd1_vxc_sample(vd1_addr, vd1_bytes) : vd1_vxc_hash(vd1_addr, vd1_bytes);
 				}
 				vd1_vertex_key = (vd1_vertex_key ^ address ^ (u64{block->attribute_stride} << 40)) * 0x9E3779B97F4A7C15ull;
 			}
@@ -469,7 +605,11 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 				{
 					// X301: an entry from an earlier frame only under VXC, young enough in the ring, with its extra samples
 					const bool this_frame = e.frame == g_vd1_frame;
-					const bool old_ok = vd1_vxc && !this_frame && g_vd1_attr_total - e.total_end < m_attrib_ring_info.size() / 4 &&
+					// p24: VXC=1 reuses an older entry only within 1/8 of the ring of its writing, and only while the last frame
+					// allocated under 1/8: the ring then needs ~7 frames to come back over it, and at most 2 are in flight
+					const u64 vd1_window = vd1_vxc_mode == 2 ? m_attrib_ring_info.size() / 4 : m_attrib_ring_info.size() / 8;
+					const bool old_ok = vd1_vxc && !this_frame && (vd1_vxc_mode == 2 || g_vd1_vxc_guard_ok) &&
+						g_vd1_attr_total - e.total_end < vd1_window &&
 						std::memcmp(e.vxc_fp, vd1_entry.vxc_fp, sizeof(u64) * vd1_blocks) == 0;
 
 					if (this_frame || old_ok)

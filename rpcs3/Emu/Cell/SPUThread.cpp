@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/vd1_live.h" // vanillad1: X301 p24: PUTU
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
 #include "Emu/Memory/vm.h"
@@ -3710,6 +3711,21 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			{
 				raddr = 0;
 				return true;
+			}
+
+			// vanillad1: X301 p24: PUTU (live): an unchanged writeback whose line still holds the data (read twice around the
+			// reservation time) succeeds without bumping the time: nothing is written, so no update is lost, and the other
+			// SPUs keep their reservations on a line that did not change (the JobQueue lock's failed tries bump it every time,
+			// a cache-line ping-pong among the six SPUs: re/notes/perf_2026-11-01/code_spu_report.md F1)
+			if (vd1::live(vd1::lf::PUTU))
+			{
+				if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)))
+				{
+					raddr = 0;
+					return true;
+				}
+
+				return false;
 			}
 
 			// Writeback of unchanged data. Only check memory change

@@ -219,7 +219,7 @@ namespace rsx
 			if (on) rsx_log.notice("vanillad1: the RSX thread writes finished eager copies back (VANILLAD1_FAULT_FAST_WB=1)");
 			return on;
 		}();
-		return s_on;
+		return s_on || vd1::live(vd1::lf::FFWB) != 0; // vanillad1: X301 p24: live switch FFWB, the same write-back
 	}
 
 	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_EAGER=1 (read once): VANILLAD1_FAULT_FAST's ranges are read
