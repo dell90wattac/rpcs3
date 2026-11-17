@@ -4749,7 +4749,11 @@ public:
 		{
 			// vanillad1: dead RdDec (X302): the library delay loop reads the clock and throws the value away. Only when the next
 			// instruction overwrites rt without reading it. The flag counts when a block compiles, so set it at boot.
-			if (vd1::live(vd1::lf::E16) && m_next_op)
+			// vanillad1: X301: DRDEC (live): with VANILLAD1_DRDEC_LIVE=1 at boot, a dead read compiles to a run-time choice (DRDEC on: 0;
+			// off: the stock read below), so one boot can A/B it. Without the env the code is as before.
+			bool vd1_dead_rddec = false;
+			static const bool s_vd1_drdec_live = []() { const char* e = std::getenv("VANILLAD1_DRDEC_LIVE"); return e && *e == '1'; }();
+			if ((vd1::live(vd1::lf::E16) || s_vd1_drdec_live) && m_next_op)
 			{
 				const spu_opcode_t next_op{std::bit_cast<be_t<u32>>(m_next_op)};
 				const auto next_flags = +g_spu_iflag.decode(next_op.opcode);
@@ -4772,32 +4776,66 @@ public:
 
 				if (overwrites_rt && !reads_rt)
 				{
-					spu_log.notice("vanillad1: dead RdDec at 0x%x", m_pos);
-					res.value = m_ir->getInt32(0);
-					break;
+					if (vd1::live(vd1::lf::E16))
+					{
+						spu_log.notice("vanillad1: dead RdDec at 0x%x", m_pos);
+						res.value = m_ir->getInt32(0);
+						break;
+					}
+
+					vd1_dead_rddec = true;
 				}
 			}
 
-#if defined(ARCH_X64) || defined(ARCH_ARM64)
-			if (utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
+			const auto vd1_read_dec = [&]() -> llvm::Value*
 			{
-				const auto timebase_offs = m_ir->CreateLoad(get_type<u64>(), m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_timebase_offs)), get_type<u64*>()));
-				const auto timestamp = m_ir->CreateLoad(get_type<u64>(), spu_ptr(&spu_thread::ch_dec_start_timestamp));
-				const auto dec_value = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::ch_dec_value));
-				const auto tsc = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::readcyclecounter));
-				const auto tscx = m_ir->CreateMul(m_ir->CreateUDiv(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000));
-				const auto tscm = m_ir->CreateUDiv(m_ir->CreateMul(m_ir->CreateURem(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000)), m_ir->getInt64(utils::get_tsc_freq()));
-				const auto tsctb = m_ir->CreateSub(m_ir->CreateAdd(tscx, tscm), timebase_offs);
-				const auto frz = m_ir->CreateLoad(get_type<u8>(), spu_ptr(&spu_thread::is_dec_frozen));
-				const auto frzev = m_ir->CreateICmpEQ(frz, m_ir->getInt8(0));
+#if defined(ARCH_X64) || defined(ARCH_ARM64)
+				if (utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
+				{
+					const auto timebase_offs = m_ir->CreateLoad(get_type<u64>(), m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_timebase_offs)), get_type<u64*>()));
+					const auto timestamp = m_ir->CreateLoad(get_type<u64>(), spu_ptr(&spu_thread::ch_dec_start_timestamp));
+					const auto dec_value = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::ch_dec_value));
+					const auto tsc = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::readcyclecounter));
+					const auto tscx = m_ir->CreateMul(m_ir->CreateUDiv(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000));
+					const auto tscm = m_ir->CreateUDiv(m_ir->CreateMul(m_ir->CreateURem(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000)), m_ir->getInt64(utils::get_tsc_freq()));
+					const auto tsctb = m_ir->CreateSub(m_ir->CreateAdd(tscx, tscm), timebase_offs);
+					const auto frz = m_ir->CreateLoad(get_type<u8>(), spu_ptr(&spu_thread::is_dec_frozen));
+					const auto frzev = m_ir->CreateICmpEQ(frz, m_ir->getInt8(0));
 
-				const auto delta = m_ir->CreateTrunc(m_ir->CreateSub(tsctb, timestamp), get_type<u32>());
-				const auto deltax = m_ir->CreateSelect(frzev, delta, m_ir->getInt32(0));
-				res.value = m_ir->CreateSub(dec_value, deltax);
+					const auto delta = m_ir->CreateTrunc(m_ir->CreateSub(tsctb, timestamp), get_type<u32>());
+					const auto deltax = m_ir->CreateSelect(frzev, delta, m_ir->getInt32(0));
+					return m_ir->CreateSub(dec_value, deltax);
+				}
+#endif
+				return call("spu_read_decrementer", &exec_read_dec, m_thread);
+			};
+
+			if (!vd1_dead_rddec)
+			{
+				res.value = vd1_read_dec();
 				break;
 			}
-#endif
-			res.value = call("spu_read_decrementer", &exec_read_dec, m_thread);
+
+			// X301: DRDEC: if (live flag) 0 else the stock read; the flag's address is fixed before main (vd1_live.cpp)
+			const auto vd1_flag = m_ir->CreateLoad(get_type<u32>(), m_ir->CreateIntToPtr(
+				m_ir->getInt64(reinterpret_cast<u64>(&vd1::g_live[static_cast<u32>(vd1::lf::DRDEC)])), get_type<u32*>()));
+			vd1_flag->setVolatile(true);
+			const auto vd1_fn = m_ir->GetInsertBlock()->getParent();
+			const auto vd1_bb_zero = llvm::BasicBlock::Create(m_context, "", vd1_fn);
+			const auto vd1_bb_full = llvm::BasicBlock::Create(m_context, "", vd1_fn);
+			const auto vd1_bb_join = llvm::BasicBlock::Create(m_context, "", vd1_fn);
+			m_ir->CreateCondBr(m_ir->CreateICmpNE(vd1_flag, m_ir->getInt32(0)), vd1_bb_zero, vd1_bb_full);
+			m_ir->SetInsertPoint(vd1_bb_full);
+			const auto vd1_full = vd1_read_dec();
+			const auto vd1_full_end = m_ir->GetInsertBlock();
+			m_ir->CreateBr(vd1_bb_join);
+			m_ir->SetInsertPoint(vd1_bb_zero);
+			m_ir->CreateBr(vd1_bb_join);
+			m_ir->SetInsertPoint(vd1_bb_join);
+			const auto vd1_phi = m_ir->CreatePHI(get_type<u32>(), 2);
+			vd1_phi->addIncoming(vd1_full, vd1_full_end);
+			vd1_phi->addIncoming(m_ir->getInt32(0), vd1_bb_zero);
+			res.value = vd1_phi;
 			break;
 		}
 		case SPU_RdEventMask:

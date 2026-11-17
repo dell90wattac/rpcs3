@@ -262,6 +262,29 @@ namespace vk
 			return true;
 		}
 
+		// vanillad1: X301 (FFLOCK): vd1_copy_done without the wait, as a state: 1 finished on the GPU, 2 submitted and still
+		// running (worth waiting for, outside the cache lock), 0 neither (not synchronized, no event, or not submitted yet:
+		// only the RSX thread's flush would submit it, so the stock flush request). Under the texture cache's lock.
+		int vd1_copy_state() const
+		{
+			if (!synchronized || !dma_fence)
+			{
+				return 0;
+			}
+
+			if (dma_fence->status() == VK_EVENT_SET)
+			{
+				return 1;
+			}
+
+			if (!m_vd1_copy_eid || vk::current_event_id() < m_vd1_copy_eid)
+			{
+				return 0;
+			}
+
+			return 2;
+		}
+
 		void dma_transfer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, const utils::address_range32& valid_range, u32 pitch);
 
 		void copy_texture(vk::command_buffer& cmd, bool miss)

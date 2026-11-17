@@ -1097,6 +1097,28 @@ namespace vd1_fault
 	}
 }
 
+// vanillad1: X301: the fault fast path's lock switches (FFTRY, FFLOCK): their counters every 10 s while one is on
+static void vd1_ff_log()
+{
+	if (!vd1::live(vd1::lf::FFLOCK) && !vd1::live(vd1::lf::FFTRY))
+	{
+		return;
+	}
+
+	const u64 now = get_system_time() / 1000;
+	u64 last = rsx::vd1_ff_stats::g_last_log.load();
+
+	if (now - last < 10'000 || !rsx::vd1_ff_stats::g_last_log.compare_exchange_strong(last, now))
+	{
+		return;
+	}
+
+	rsx_log.notice("vanillad1: ff lock 10s: FFTRY=%u FFLOCK=%u FFWAIT=%u fast=%u stock=%u tries=%u timeouts=%u wb_skips=%u",
+		vd1::live(vd1::lf::FFTRY), vd1::live(vd1::lf::FFLOCK), vd1::live(vd1::lf::FFWAIT),
+		rsx::vd1_ff_stats::g_fast.exchange(0), rsx::vd1_ff_stats::g_stock.exchange(0), rsx::vd1_ff_stats::g_tries.exchange(0),
+		rsx::vd1_ff_stats::g_timeouts.exchange(0), rsx::vd1_ff_stats::g_wb_skips.exchange(0));
+}
+
 bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 {
 	// vanillad1: fault stats (X300.3): VANILLAD1_FAULT_STATS (vd1_fault above), the time from here to each return
@@ -1183,17 +1205,64 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			const u64 vd1_wait = rsx::vd1_fault_fast_wait_us();
 			const u64 vd1_tf = vd1_stats ? utils::get_tsc() : 0;
 
-			if (m_texture_cache.vd1_flush_all_ready(*m_secondary_cb_list.get(), result,
-				[vd1_wait](vk::cached_texture_section& section) { return section.vd1_copy_done(vd1_wait); }))
+			int vd1_done = 0;
+
+			if (const u32 vd1_gap = vd1::live(vd1::lf::FFLOCK))
+			{
+				// X301: FFLOCK=<us>: a copy still on the GPU is waited for outside the texture cache's lock, in rounds <us> apart,
+				// so the RSX thread (texture binds, the write-back) is not parked behind this thread's wait. The limit is the
+				// same (FFWAIT / VANILLAD1_FAULT_FAST_WAIT_US); each round classifies again under the lock if the cache moved.
+				const u64 vd1_freq = utils::get_tsc_freq();
+				const u64 vd1_per_us = vd1_freq ? vd1_freq / 1'000'000 : 3'000;
+				const u64 vd1_limit = vd1_wait * vd1_per_us;
+				const u64 vd1_tw0 = utils::get_tsc();
+
+				for (;;)
+				{
+					vd1_done = m_texture_cache.vd1_flush_all_ready(*m_secondary_cb_list.get(), result,
+						[](vk::cached_texture_section& section) { return section.vd1_copy_state(); });
+
+					if (vd1_done != 2)
+					{
+						break;
+					}
+
+					if (utils::get_tsc() - vd1_tw0 > vd1_limit)
+					{
+						rsx::vd1_ff_stats::g_timeouts++;
+						vd1_done = 0;
+						break;
+					}
+
+					rsx::vd1_ff_stats::g_tries++;
+					const u64 vd1_tg = utils::get_tsc();
+					while (utils::get_tsc() - vd1_tg < vd1_gap * vd1_per_us)
+					{
+						utils::pause();
+					}
+				}
+			}
+			else
+			{
+				vd1_done = m_texture_cache.vd1_flush_all_ready(*m_secondary_cb_list.get(), result,
+					[vd1_wait](vk::cached_texture_section& section) { return section.vd1_copy_done(vd1_wait); });
+			}
+
+			vd1_ff_log();
+
+			if (vd1_done == 1)
 			{
 				if (vd1_stats)
 				{
 					vd1_scope.fl = utils::get_tsc() - vd1_tf;
 				}
 
+				rsx::vd1_ff_stats::g_fast++;
 				vd1_scope.fast = true;
 				return true;
 			}
+
+			rsx::vd1_ff_stats::g_stock++;
 		}
 
 		bool has_queue_ref = false;
@@ -2057,6 +2126,33 @@ std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data(
 	return { m_host_dma_ctrl->host_ctx(), m_host_object_data->value };
 }
 
+// vanillad1: X301: LBAR (live switch): the label batch's same-address rule by a barrier, not a submit; RSX thread only
+namespace vd1_lbar_stats
+{
+	static u32 barriers = 0;
+	static u32 dup_flushes = 0;
+	static u64 last_ms = 0;
+}
+
+static void vd1_lbar_log()
+{
+	if (!vd1::live(vd1::lf::LBAR))
+	{
+		return;
+	}
+
+	const u64 now = get_system_time() / 1000;
+	if (now - vd1_lbar_stats::last_ms < 10'000)
+	{
+		return;
+	}
+
+	vd1_lbar_stats::last_ms = now;
+	rsx_log.notice("vanillad1: lbar 10s: LBAR=%u barriers=%u dup_flushes=%u", vd1::live(vd1::lf::LBAR), vd1_lbar_stats::barriers, vd1_lbar_stats::dup_flushes);
+	vd1_lbar_stats::barriers = 0;
+	vd1_lbar_stats::dup_flushes = 0;
+}
+
 bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 {
 	if (!backend_config.supports_host_gpu_labels)
@@ -2141,9 +2237,25 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	if ((vd1_safe & 8) && vd1_n && !vd1_primary && m_vd1_label_cb &&
 		(m_vd1_batch_naddr >= 64 || std::find(m_vd1_batch_addr, m_vd1_batch_addr + m_vd1_batch_naddr, address) != m_vd1_batch_addr + m_vd1_batch_naddr))
 	{
-		m_vd1_flush_why = 'D';
-		vd1_label_flush();
+		if (vd1::live(vd1::lf::LBAR))
+		{
+			// X301: LBAR: the batch's earlier writes are ordered before the ones that follow by a transfer barrier in the same
+			// command buffer, not by submitting it: a second write to an address lands after the first (bit 8's need: two
+			// same-address vkCmdUpdateBuffers with no barrier may land in any order), and the batch stays open
+			vk::insert_global_memory_barrier(*m_vd1_label_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+			m_vd1_batch_naddr = 0;
+			vd1_lbar_stats::barriers++;
+		}
+		else
+		{
+			m_vd1_flush_why = 'D';
+			vd1_label_flush();
+			vd1_lbar_stats::dup_flushes++;
+		}
 	}
+
+	vd1_lbar_log(); // X301: LBAR's counters every 10 s while it is on
 
 	const auto release_event_id = host_ctx->on_label_acquire();
 	m_frame_stats.vd1_labels++;

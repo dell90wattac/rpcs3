@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "Emu/vd1_live.h"
+#include "Emu/Cell/timers.hpp" // vanillad1: X301: get_system_time for the 10-s lines
 #include "VKGSRender.h"
 #include "../Common/BufferUtils.h"
 #include "../rsx_methods.h"
@@ -58,6 +59,13 @@ namespace vk
 
 namespace
 {
+	// vanillad1: X301: EIDX (live): an emulated primitive's index list depends only on the primitive and the vertex count, so
+	// this frame's earlier list is drawn again instead of generated and uploaded again. Its ring offset lasts the frame, as
+	// X302's caches' do (purged with them at the flip: vd1_purge_upload_caches).
+	rsx::unordered_map<u64, VkDeviceSize> g_vd1_emu_index_cache;
+	u32 g_vd1_emu_index_hits = 0;
+	u32 g_vd1_emu_index_made = 0;
+
 	std::tuple<u32, std::tuple<VkDeviceSize, VkIndexType>> generate_emulating_index_buffer(
 		const rsx::draw_clause& clause, u32 vertex_count,
 		vk::data_heap& m_index_buffer_ring_info)
@@ -65,12 +73,31 @@ namespace
 		u32 index_count = get_index_count(clause.primitive, vertex_count);
 		u32 upload_size = index_count * sizeof(u16);
 
+		const bool vd1_eidx = vd1::live(vd1::lf::EIDX) != 0;
+		const u64 vd1_key = (u64{static_cast<u32>(clause.primitive)} << 32) | vertex_count;
+
+		if (vd1_eidx)
+		{
+			if (const auto found = g_vd1_emu_index_cache.find(vd1_key); found != g_vd1_emu_index_cache.end())
+			{
+				g_vd1_emu_index_hits++;
+				return std::make_tuple(index_count, std::make_tuple(found->second, VK_INDEX_TYPE_UINT16));
+			}
+		}
+
 		VkDeviceSize offset_in_index_buffer = m_index_buffer_ring_info.alloc<256>(upload_size);
 		void* buf = m_index_buffer_ring_info.map(offset_in_index_buffer, upload_size);
 
 		g_fxo->get<rsx::dma_manager>().emulate_as_indexed(buf, clause.primitive, vertex_count);
 
 		m_index_buffer_ring_info.unmap();
+		g_vd1_emu_index_made++;
+
+		if (vd1_eidx)
+		{
+			g_vd1_emu_index_cache[vd1_key] = offset_in_index_buffer;
+		}
+
 		return std::make_tuple(
 			index_count, std::make_tuple(offset_in_index_buffer, VK_INDEX_TYPE_UINT16));
 	}
@@ -113,9 +140,41 @@ namespace
 		u32 address[4];
 		u32 stride[4];
 		u64 fingerprint[4];
+		u64 vxc_fp[4];      // X301: VXC: the middle and last 8 bytes of each block, mixed
+		u64 total_end;      // X301: VXC: the attribute ring's running byte count at this entry's end
+		u32 frame;          // X301: the frame that stored it (without VXC only this frame's entries count)
 	};
 
 	rsx::unordered_map<u64, vd1_vertex_entry> g_vd1_vertex_cache;
+
+	// vanillad1: X301: VXC (live, an experiment): X302's multi-block vertex cache across frames. An entry is used again while the
+	// attribute ring has moved on less than a quarter of its size since it was written (so its bytes are still there and
+	// stay there for several frames more), and its addresses, strides and three 8-byte samples a block match. The samples
+	// are a weak check: this measures what a cross-frame cache could give, it is not a fix to ship as it is.
+	u64 g_vd1_attr_total = 0;
+	u64 g_vd1_attr_last_end = 0;
+	u32 g_vd1_frame = 0;
+	u32 g_vd1_vxc_old_hits = 0;
+	u32 g_vd1_vxc_new_hits = 0;
+	u32 g_vd1_vxc_misses = 0;
+
+	void vd1_attr_advance(u64 offset, u64 length, u64 ring)
+	{
+		const u64 advance = offset >= g_vd1_attr_last_end ? offset + length - g_vd1_attr_last_end : ring - g_vd1_attr_last_end + offset + length;
+		g_vd1_attr_total += advance;
+		g_vd1_attr_last_end = offset + length;
+	}
+
+	u64 vd1_vxc_sample(u32 address, u32 bytes)
+	{
+		if (bytes < 16)
+		{
+			return 0;
+		}
+		const u64 mid = *utils::bless<u64>(vm::get_super_ptr<char>(address + ((bytes / 2) & ~7u)));
+		const u64 last = *utils::bless<u64>(vm::get_super_ptr<char>(address + bytes - 8));
+		return mid * 0x9E3779B97F4A7C15ull ^ last;
+	}
 
 	struct draw_command_visitor
 	{
@@ -279,11 +338,45 @@ namespace
 	};
 }
 
+// vanillad1: X301: attribute views made, logged every 10 s with the other upload counters
+u32 g_vd1_view_remakes = 0;
+
 // vanillad1: index and multi-block vertex caches (X302): the ring offsets they hold last a frame, like the vertex cache's
 void vd1_purge_upload_caches()
 {
 	g_vd1_index_cache.clear();
-	g_vd1_vertex_cache.clear();
+	g_vd1_frame++; // X301: entries from earlier frames count only under VXC
+	if (!vd1::live(vd1::lf::VXC) || g_vd1_vertex_cache.size() > 65536)
+	{
+		g_vd1_vertex_cache.clear();
+	}
+	g_vd1_emu_index_cache.clear(); // vanillad1: X301: EIDX
+
+	// vanillad1: X301: the upload counters of the last 10 s (attribute views, EIDX, VXC)
+	static u64 s_last_ms = 0;
+	static u32 s_frames = 0;
+	s_frames++;
+	if (const u64 now = get_system_time() / 1000; now - s_last_ms >= 10'000)
+	{
+		if (s_last_ms)
+		{
+			rsx_log.notice("vanillad1: attrib views 10s: made=%u frames=%u; emulated index lists: EIDX=%u made=%u reused=%u",
+				g_vd1_view_remakes, s_frames, vd1::live(vd1::lf::EIDX), g_vd1_emu_index_made, g_vd1_emu_index_hits);
+			if (vd1::live(vd1::lf::VXC))
+			{
+				rsx_log.notice("vanillad1: vxc 10s: hits from earlier frames=%u, this frame=%u, misses=%u, entries=%u",
+					g_vd1_vxc_old_hits, g_vd1_vxc_new_hits, g_vd1_vxc_misses, static_cast<u32>(g_vd1_vertex_cache.size()));
+			}
+		}
+		s_last_ms = now;
+		g_vd1_view_remakes = 0;
+		g_vd1_emu_index_made = 0;
+		g_vd1_vxc_old_hits = 0;
+		g_vd1_vxc_new_hits = 0;
+		g_vd1_vxc_misses = 0;
+		g_vd1_emu_index_hits = 0;
+		s_frames = 0;
+	}
 }
 
 vk::vertex_upload_info VKGSRender::upload_vertex_data()
@@ -320,7 +413,9 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 
 		m_frame_stats.vertex_cache_request_count++;
 
-		if (m_vertex_layout.interleaved_blocks.size() == 1 &&
+		const bool vd1_vxc = vd1::live(vd1::lf::VXC) != 0; // X301
+
+		if (!vd1_vxc && m_vertex_layout.interleaved_blocks.size() == 1 &&
 			rsx::method_registers.current_draw_clause.command != rsx::draw_command::inlined_array)
 		{
 			const auto data_offset = (vertex_base * m_vertex_layout.interleaved_blocks[0]->attribute_stride);
@@ -339,7 +434,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			}
 		}
 		else if (const usz vd1_blocks = m_vertex_layout.interleaved_blocks.size();
-			vd1::live(vd1::lf::E10) && vd1_blocks > 1 && vd1_blocks <= 4 && required.first >= 8 &&
+			(vd1::live(vd1::lf::E10) || vd1_vxc) && vd1_blocks > (vd1_vxc ? 0u : 1u) && vd1_blocks <= 4 && required.first >= 8 &&
 			rsx::method_registers.current_draw_clause.command != rsx::draw_command::inlined_array)
 		{
 			vd1_entry.count = static_cast<u32>(vd1_blocks);
@@ -354,6 +449,13 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 				vd1_entry.address[b] = address;
 				vd1_entry.stride[b] = block->attribute_stride;
 				vd1_entry.fingerprint[b] = *utils::bless<u64>(vm::get_super_ptr<char>(address));
+				if (vd1_vxc)
+				{
+					// the exact range the upload copies (write_vertex_data_to_memory), so a sample never reads past it
+					const auto vd1_range = block->calculate_required_range(vertex_base, vertex_count);
+					vd1_entry.vxc_fp[b] = vd1_vxc_sample(block->real_offset_address + vd1_range.first * block->attribute_stride,
+						vd1_range.second * block->attribute_stride);
+				}
 				vd1_vertex_key = (vd1_vertex_key ^ address ^ (u64{block->attribute_stride} << 40)) * 0x9E3779B97F4A7C15ull;
 			}
 
@@ -365,12 +467,22 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 					std::memcmp(e.stride, vd1_entry.stride, sizeof(u32) * vd1_blocks) == 0 &&
 					std::memcmp(e.fingerprint, vd1_entry.fingerprint, sizeof(u64) * vd1_blocks) == 0)
 				{
-					in_cache = true;
-					persistent_range_base = e.offset_in_heap;
+					// X301: an entry from an earlier frame only under VXC, young enough in the ring, with its extra samples
+					const bool this_frame = e.frame == g_vd1_frame;
+					const bool old_ok = vd1_vxc && !this_frame && g_vd1_attr_total - e.total_end < m_attrib_ring_info.size() / 4 &&
+						std::memcmp(e.vxc_fp, vd1_entry.vxc_fp, sizeof(u64) * vd1_blocks) == 0;
+
+					if (this_frame || old_ok)
+					{
+						in_cache = true;
+						persistent_range_base = e.offset_in_heap;
+						if (vd1_vxc) (this_frame ? g_vd1_vxc_new_hits : g_vd1_vxc_old_hits)++;
+					}
 				}
 			}
 
 			vd1_store = !in_cache;
+			if (vd1_vxc && !in_cache) g_vd1_vxc_misses++;
 		}
 
 		if (!in_cache)
@@ -378,6 +490,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			m_frame_stats.vertex_cache_miss_count++;
 
 			persistent_offset = static_cast<u32>(m_attrib_ring_info.alloc<256>(required.first));
+			vd1_attr_advance(persistent_offset, required.first, m_attrib_ring_info.size()); // X301: VXC's ring age
 			persistent_range_base = static_cast<u32>(persistent_offset);
 
 			if (to_store)
@@ -389,6 +502,8 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			if (vd1_store) // vanillad1: multi-block vertex cache (X302)
 			{
 				vd1_entry.offset_in_heap = static_cast<u32>(persistent_offset);
+				vd1_entry.total_end = g_vd1_attr_total;
+				vd1_entry.frame = g_vd1_frame;
 				g_vd1_vertex_cache[vd1_vertex_key] = vd1_entry;
 			}
 		}
@@ -397,6 +512,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 	if (required.second > 0)
 	{
 		volatile_offset = static_cast<u32>(m_attrib_ring_info.alloc<256>(required.second));
+		vd1_attr_advance(volatile_offset, required.second, m_attrib_ring_info.size()); // X301: VXC's ring age
 		volatile_range_base = static_cast<u32>(volatile_offset);
 	}
 
@@ -466,6 +582,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			const usz view_size = (persistent_range_base + m_texbuffer_view_size) > m_attrib_ring_info.size() ? m_attrib_ring_info.size() - persistent_range_base : m_texbuffer_view_size;
 			m_persistent_attribute_storage = std::make_unique<vk::buffer_view>(*m_device, m_attrib_ring_info.heap->value, VK_FORMAT_R8_UINT, persistent_range_base, view_size);
 			persistent_range_base = 0;
+			g_vd1_view_remakes++; // vanillad1: X301: views made (the 10-s line)
 		}
 	}
 
@@ -479,6 +596,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			const usz view_size = (volatile_range_base + m_texbuffer_view_size) > m_attrib_ring_info.size() ? m_attrib_ring_info.size() - volatile_range_base : m_texbuffer_view_size;
 			m_volatile_attribute_storage = std::make_unique<vk::buffer_view>(*m_device, m_attrib_ring_info.heap->value, VK_FORMAT_R8_UINT, volatile_range_base, view_size);
 			volatile_range_base = 0;
+			g_vd1_view_remakes++; // vanillad1: X301: views made (the 10-s line)
 		}
 	}
 

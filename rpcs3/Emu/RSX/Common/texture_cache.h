@@ -13,6 +13,7 @@
 #include "surface_utils.h" // vanillad1: RCB range (P13): vd1_rcb_covers
 
 #include <unordered_map>
+#include <atomic> // vanillad1: X301 counters
 #include <cstdlib> // vanillad1: WCB only range (P5)
 #include <utility>
 #include <vector>
@@ -175,6 +176,17 @@ namespace rsx
 		return !s_ranges.empty() && vd1::live(vd1::lf::A1) && vd1_ranges_overlap(s_ranges, range); // vanillad1: live switch A1 (X302): on at boot when the env is set
 	}
 
+	// vanillad1: X301: the fault fast path's lock switches (FFTRY, FFLOCK): counters, logged every 10 s while one is on
+	namespace vd1_ff_stats
+	{
+		inline std::atomic<u64> g_wb_skips{0};  // FFTRY: write-back rounds skipped on a busy cache lock
+		inline std::atomic<u64> g_fast{0};      // faults the fast path handled
+		inline std::atomic<u64> g_stock{0};     // faults it handed to the stock flush request
+		inline std::atomic<u64> g_tries{0};     // FFLOCK: lock rounds taken again while a copy was still on the GPU
+		inline std::atomic<u64> g_timeouts{0};  // FFLOCK: waits that ran out (the stock path took them)
+		inline std::atomic<u64> g_last_log{0};
+	}
+
 	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WAIT_US=<n> (decimal, read once; default 1000, 0 = never wait):
 	// how long a fault waits for a copy whose command buffer was submitted but has not finished on the GPU, before it falls
 	// back to the stock flush request
@@ -185,6 +197,13 @@ namespace rsx
 			const char* env = std::getenv("VANILLAD1_FAULT_FAST_WAIT_US");
 			return (env && *env) ? std::strtoull(env, nullptr, 10) : 1000;
 		}();
+
+		// vanillad1: X301: live switch FFWAIT=<us> overrides the env's wait (0 = the env's, or 1000); vd1_ff_stats below
+		if (const u32 live_us = vd1::live(vd1::lf::FFWAIT))
+		{
+			return live_us;
+		}
+
 		return s_us;
 	}
 
@@ -2584,7 +2603,7 @@ namespace rsx
 		// records no GPU work, so the RSX thread need not submit its command buffer or park. ready(section) says the copy has
 		// finished on the GPU (it may wait a bounded time for one already submitted). false = nothing done: the stock path.
 		template <typename Ready, typename ...Args>
-		bool vd1_flush_all_ready(commandbuffer_type& cmd, thrashed_set& data, Ready&& ready, Args&&... extras)
+		int vd1_flush_all_ready(commandbuffer_type& cmd, thrashed_set& data, Ready&& ready, Args&&... extras)
 		{
 			vd1_wait_cache_mutex(true);
 			std::lock_guard lock(m_cache_mutex);
@@ -2594,7 +2613,7 @@ namespace rsx
 
 			if (data.sections_to_flush.empty())
 			{
-				return false;
+				return 0;
 			}
 
 			if (m_cache_update_tag.load() != data.cache_tag)
@@ -2608,7 +2627,7 @@ namespace rsx
 				if (again.num_flushable == 0)
 				{
 					data.vd1_retag = true;
-					return true;
+					return 1;
 				}
 
 				again.vd1_base = data.vd1_base;
@@ -2622,7 +2641,7 @@ namespace rsx
 				again.vd1_bound = data.vd1_bound;
 				again.vd1_retag = true;
 				data = std::move(again);
-				return false;
+				return 0;
 			}
 
 			for (const auto* surface : data.sections_to_flush)
@@ -2631,7 +2650,7 @@ namespace rsx
 				if (!surface->is_synchronized() || surface->get_memory_read_flags() == memory_read_flags::flush_always ||
 					!vd1_fault_fast_covers(surface->get_section_range()))
 				{
-					return false;
+					return 0;
 				}
 			}
 
@@ -2640,22 +2659,34 @@ namespace rsx
 				// flush_set would resync this render target from the flushed ones (the surface cache's state): stock path
 				if (excluded->get_context() == texture_upload_context::framebuffer_storage)
 				{
-					return false;
+					return 0;
 				}
 			}
 
+			// X301: ready() may say 2 (submitted, still on the GPU): the caller waits outside this lock and calls again
+			int vd1_pending = 0;
 			for (auto* surface : data.sections_to_flush)
 			{
-				if (!ready(*surface))
+				const int vd1_state = static_cast<int>(ready(*surface));
+				if (vd1_state == 0)
 				{
-					return false;
+					return 0;
 				}
+				if (vd1_state == 2)
+				{
+					vd1_pending = 2;
+				}
+			}
+
+			if (vd1_pending)
+			{
+				return vd1_pending;
 			}
 
 			// No transfer below (every section is synchronized and flush_once): the write-back to guest memory and the unprotect
 			flush_set(cmd, data, {}, std::forward<Args>(extras)...);
 			unprotect_set(data);
-			return true;
+			return 1;
 		}
 
 		// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WB. The RSX thread (do_local_task) writes back the eager
@@ -2670,8 +2701,22 @@ namespace rsx
 				return false;
 			}
 
-			vd1_wait_cache_mutex(true);
-			std::lock_guard lock(m_cache_mutex);
+			// X301: live switch FFTRY: the write-back is opportunistic, so a cache lock held elsewhere (an SPU's fault fast
+			// path waiting on the GPU) skips this round instead of parking the RSX thread behind it
+			std::unique_lock<shared_mutex> lock(m_cache_mutex, std::defer_lock);
+			if (vd1::live(vd1::lf::FFTRY))
+			{
+				if (!lock.try_lock())
+				{
+					vd1_ff_stats::g_wb_skips++;
+					return false;
+				}
+			}
+			else
+			{
+				vd1_wait_cache_mutex(true);
+				lock.lock();
+			}
 
 			bool invalidate_samplers = false;
 
