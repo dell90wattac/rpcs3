@@ -67,6 +67,13 @@ namespace
 	// X302's caches' do (purged with them at the flip: vd1_purge_upload_caches).
 	void vd1_idx_advance(u64 offset, u64 length, u64 ring); // vanillad1: X301 p24: IXC's ring age (defined below)
 
+	// vanillad1: X301 p25: the cross-frame caches' safety, live: an entry is used again only within ring / VXCW of its writing
+	// (0 = 8), and only while the last frame's allocation times VXCK (0 = 4: two frames in flight and two spare) stays under
+	// the rest of the ring, so the allocator needs VXCK such frames to come back over a reused entry. p24's guard (a frame
+	// under 1/8 ring) never opened at the plaza (9.5-10.9 MB a frame on a 64 MB ring) and VXC lost 2.9 %.
+	inline u64 vd1_xc_window(u64 ring) { const u32 d = vd1::live(vd1::lf::VXCW); return ring / (d ? d : 8); }
+	inline bool vd1_xc_guard(u64 frame_alloc, u64 ring) { const u32 k = vd1::live(vd1::lf::VXCK); return ring && frame_alloc * (k ? k : 4) < ring - vd1_xc_window(ring); }
+
 	rsx::unordered_map<u64, VkDeviceSize> g_vd1_emu_index_cache;
 	u32 g_vd1_emu_index_hits = 0;
 	u32 g_vd1_emu_index_made = 0;
@@ -189,7 +196,7 @@ namespace
 	u32 g_vd1_vxc_misses = 0;
 	u64 g_vd1_attr_ring_size = 0;       // X301 p24: the attribute ring's size, for the frame-end guard
 	u64 g_vd1_attr_frame_start = 0;     // the running count at this frame's start
-	bool g_vd1_vxc_guard_ok = true;     // the last frame allocated under 1/8 of the ring (VXC=1 reuses only then)
+	bool g_vd1_vxc_guard_ok = true;     // p25: vd1_xc_guard of the last frame's allocation (VXC=1 reuses only then)
 	u64 g_vd1_attr_frame_max = 0;       // the largest frame's allocation in the 10-s window
 	u64 g_vd1_attr_frame_sum = 0;
 
@@ -323,7 +330,7 @@ namespace
 					// X301 p24: an entry of an earlier frame only under IXC: its full hash, within 1/8 of the index ring, guard on
 					const bool vd1_this_frame = e.frame == g_vd1_idx_frame;
 					const bool vd1_old_ok = vd1_ixc && !vd1_this_frame && g_vd1_ixc_guard_ok && e.hash == vd1_hash &&
-						g_vd1_idx_total - e.total_end < m_index_buffer_ring_info.size() / 8;
+						g_vd1_idx_total - e.total_end < vd1_xc_window(m_index_buffer_ring_info.size());
 					if (e.src == vd1_src.data() && e.size == vd1_src.size() && e.upload_size == upload_size && e.key_bits == vd1_key_bits &&
 						e.restart_index == vd1_restart_index && e.first8 == vd1_first8 && e.last8 == vd1_last8 && (vd1_this_frame || vd1_old_ok))
 					{
@@ -438,7 +445,7 @@ void vd1_purge_upload_caches()
 	{
 		const u64 frame_alloc = g_vd1_idx_total - g_vd1_idx_frame_start;
 		g_vd1_idx_frame_start = g_vd1_idx_total;
-		g_vd1_ixc_guard_ok = g_vd1_idx_ring_size && frame_alloc < g_vd1_idx_ring_size / 8;
+		g_vd1_ixc_guard_ok = vd1_xc_guard(frame_alloc, g_vd1_idx_ring_size);
 	}
 	g_vd1_frame++; // X301: entries from earlier frames count only under VXC
 
@@ -446,7 +453,7 @@ void vd1_purge_upload_caches()
 	{
 		const u64 frame_alloc = g_vd1_attr_total - g_vd1_attr_frame_start;
 		g_vd1_attr_frame_start = g_vd1_attr_total;
-		g_vd1_vxc_guard_ok = g_vd1_attr_ring_size && frame_alloc < g_vd1_attr_ring_size / 8;
+		g_vd1_vxc_guard_ok = vd1_xc_guard(frame_alloc, g_vd1_attr_ring_size);
 		g_vd1_attr_frame_max = std::max(g_vd1_attr_frame_max, frame_alloc);
 		g_vd1_attr_frame_sum += frame_alloc;
 	}
@@ -607,7 +614,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 					const bool this_frame = e.frame == g_vd1_frame;
 					// p24: VXC=1 reuses an older entry only within 1/8 of the ring of its writing, and only while the last frame
 					// allocated under 1/8: the ring then needs ~7 frames to come back over it, and at most 2 are in flight
-					const u64 vd1_window = vd1_vxc_mode == 2 ? m_attrib_ring_info.size() / 4 : m_attrib_ring_info.size() / 8;
+					const u64 vd1_window = vd1_vxc_mode == 2 ? m_attrib_ring_info.size() / 4 : vd1_xc_window(m_attrib_ring_info.size());
 					const bool old_ok = vd1_vxc && !this_frame && (vd1_vxc_mode == 2 || g_vd1_vxc_guard_ok) &&
 						g_vd1_attr_total - e.total_end < vd1_window &&
 						std::memcmp(e.vxc_fp, vd1_entry.vxc_fp, sizeof(u64) * vd1_blocks) == 0;

@@ -234,7 +234,7 @@ namespace rsx
 			if (on) rsx_log.notice("vanillad1: eager readback in the VANILLAD1_FAULT_FAST ranges (VANILLAD1_FAULT_FAST_EAGER=1)");
 			return on;
 		}();
-		return s_on;
+		return s_on || vd1::live(vd1::lf::FFEAGER) != 0; // vanillad1: X301 p25: live switch FFEAGER (FFWB acts only on eager copies)
 	}
 
 	// vanillad1: fault fast path (X300.3): sections the RSX thread wrote back itself (VANILLAD1_FAULT_FAST_WB)
@@ -246,7 +246,8 @@ namespace rsx
 	inline bool vd1_fault_norearm_covers(const utils::address_range32& range)
 	{
 		static const auto s_ranges = vd1_env_ranges("VANILLAD1_FAULT_NOREARM", "bound render targets not re-locked after a CPU flush");
-		return !s_ranges.empty() && vd1_ranges_overlap(s_ranges, range);
+		// vanillad1: X301 p25: live switch FFNOREARM, the same rule over VANILLAD1_FAULT_FAST's ranges
+		return (!s_ranges.empty() && vd1_ranges_overlap(s_ranges, range)) || (vd1::live(vd1::lf::FFNOREARM) && vd1_fault_fast_covers(range));
 	}
 
 	// vanillad1: WCB only range (P5): VANILLAD1_WCB_ONLY=<lo>-<hi>[,<lo>-<hi>...] (hex, read once). With Write Color
