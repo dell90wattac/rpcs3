@@ -168,6 +168,16 @@ void GLGSRender::flip(const rsx::display_flip_info_t& info)
 		return;
 	}
 
+	// vanillad1: SMAA (X467.4 p28): VANILLAD1_SMAA is in the Vulkan renderer only; say so once
+	static const bool s_vd1_smaa_note = []()
+	{
+		const char* env = std::getenv("VANILLAD1_SMAA");
+		if (env && std::strtoul(env, nullptr, 10))
+			rsx_log.warning("vanillad1: VANILLAD1_SMAA=%s ignored: SMAA is in the Vulkan renderer only (this is OpenGL)", env);
+		return true;
+	}();
+	static_cast<void>(s_vd1_smaa_note);
+
 	gl::command_context cmd{ gl_state };
 
 	u32 buffer_width = display_buffers[info.buffer].width;

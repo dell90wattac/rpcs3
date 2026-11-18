@@ -10,6 +10,7 @@
 #include "upscalers/bilinear_pass.hpp"
 #include "upscalers/fsr_pass.h"
 #include "upscalers/nearest_pass.hpp"
+#include "upscalers/smaa_pass.h" // vanillad1: SMAA (X467.4)
 #include "util/asm.hpp"
 #include "util/video_provider.h"
 
@@ -682,6 +683,44 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		}
 	};
 
+	// vanillad1: SMAA (X467.4 p28): the upscaler is picked here, ahead of the screenshot copy (was after the clear below;
+	// it records nothing), so that VANILLAD1_SMAA can replace the frame by its anti-aliased copy for everything after:
+	// the F12 / recording copy, the calibration pass and the upscaler. SMAA's targets live in the upscaler's wrapper.
+	const output_scaling_mode output_scaling = g_cfg.video.output_scaling.get();
+
+	if (!m_upscaler || m_output_scaling != output_scaling)
+	{
+		m_output_scaling = output_scaling;
+
+		if (m_output_scaling == output_scaling_mode::nearest)
+		{
+			m_upscaler = std::make_unique<vk::nearest_upscale_pass>();
+		}
+		else if (m_output_scaling == output_scaling_mode::fsr)
+		{
+			m_upscaler = std::make_unique<vk::fsr_upscale_pass>();
+		}
+		else
+		{
+			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
+		}
+
+		if (vk::vd1_smaa_level()) // vanillad1: SMAA (X467.4): 0 / unset = the upscaler alone, as before
+		{
+			m_upscaler = std::make_unique<vk::smaa_upscale_pass>(std::move(m_upscaler));
+		}
+	}
+
+	// vanillad1: SMAA (X467.4 p28): VANILLAD1_SMAA=1 / 2: SMAA 1x on the frame at its own size, before the output scaling.
+	// Not for 3D (two eyes); a frame SMAA can't take (not 8-bit RGBA, out of memory) goes out as it is.
+	if (image_to_flip && !image_to_flip2 && !avconfig.stereo_enabled && vk::vd1_smaa_level())
+	{
+		if (auto smaa = dynamic_cast<vk::smaa_upscale_pass*>(m_upscaler.get()))
+		{
+			image_to_flip = smaa->antialias(*m_current_command_buffer, image_to_flip);
+		}
+	}
+
 	// WARNING: We have to do this here. We cannot touch the acquired image on the CB and then do a hard sync on it before it is submitted to the presentation engine.
 	// That introduces a WRITE_AFTER_PRESENT (from the previous present) when we later try to present on a different CB
 	if (image_to_flip && need_media_capture)
@@ -795,26 +834,6 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			VK_ACCESS_TRANSFER_WRITE_BIT,
 			subresource_range
 		);
-	}
-
-	const output_scaling_mode output_scaling = g_cfg.video.output_scaling.get();
-
-	if (!m_upscaler || m_output_scaling != output_scaling)
-	{
-		m_output_scaling = output_scaling;
-
-		if (m_output_scaling == output_scaling_mode::nearest)
-		{
-			m_upscaler = std::make_unique<vk::nearest_upscale_pass>();
-		}
-		else if (m_output_scaling == output_scaling_mode::fsr)
-		{
-			m_upscaler = std::make_unique<vk::fsr_upscale_pass>();
-		}
-		else
-		{
-			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
-		}
 	}
 
 	if (image_to_flip)

@@ -74,6 +74,9 @@
     <ClCompile Include="Emu\RSX\VK\upscalers\fsr1\fsr_pass.cpp">
       <Filter>upscalers\fsr1</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\RSX\VK\upscalers\smaa\smaa_pass.cpp">
+      <Filter>upscalers\smaa</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\RSX\VK\VKCommonPipelineLayout.cpp" />
     <ClCompile Include="Emu\RSX\VK\vkutils\instance.cpp">
       <Filter>vkutils</Filter>
@@ -189,6 +192,12 @@
     <ClInclude Include="Emu\RSX\VK\upscalers\nearest_pass.hpp">
       <Filter>upscalers</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\RSX\VK\upscalers\smaa_pass.h">
+      <Filter>upscalers</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\VK\upscalers\smaa\smaa_lut.h">
+      <Filter>upscalers\smaa</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\RSX\VK\vkutils\garbage_collector.h">
       <Filter>vkutils</Filter>
     </ClInclude>
@@ -229,5 +238,16 @@
     <Filter Include="upscalers\fsr1">
       <UniqueIdentifier>{8387b0fc-178f-4c9c-9cf2-03df99ce4df2}</UniqueIdentifier>
     </Filter>
+    <Filter Include="upscalers\smaa">
+      <UniqueIdentifier>{7c12d9ba-c1d2-4896-9482-3db50b5fd142}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Emu\RSX\VK\upscalers\smaa\smaa_core.inc">
+      <Filter>upscalers\smaa</Filter>
+    </None>
+    <None Include="Emu\RSX\VK\upscalers\smaa\smaa_cs.glsl">
+      <Filter>upscalers\smaa</Filter>
+    </None>
   </ItemGroup>
 </Project>

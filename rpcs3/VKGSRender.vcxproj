@@ -14,6 +14,8 @@
     <ClInclude Include="Emu\RSX\VK\upscalers\bilinear_pass.hpp" />
     <ClInclude Include="Emu\RSX\VK\upscalers\fsr_pass.h" />
     <ClInclude Include="Emu\RSX\VK\upscalers\nearest_pass.hpp" />
+    <ClInclude Include="Emu\RSX\VK\upscalers\smaa_pass.h" />
+    <ClInclude Include="Emu\RSX\VK\upscalers\smaa\smaa_lut.h" />
     <ClInclude Include="Emu\RSX\VK\upscalers\upscaling.h" />
     <ClInclude Include="Emu\RSX\VK\VKAsyncScheduler.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommandStream.h" />
@@ -74,6 +76,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Emu\RSX\VK\upscalers\fsr1\fsr_pass.cpp" />
+    <ClCompile Include="Emu\RSX\VK\upscalers\smaa\smaa_pass.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKAsyncScheduler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommandStream.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommonDecompiler.cpp" />
@@ -122,6 +125,10 @@
     <ClCompile Include="Emu\RSX\VK\VKTextureCache.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKMemAlloc.cpp" />
     <ClCompile Include="Emu\RSX\VK\VulkanAPI.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Emu\RSX\VK\upscalers\smaa\smaa_core.inc" />
+    <None Include="Emu\RSX\VK\upscalers\smaa\smaa_cs.glsl" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="emucore.vcxproj">
