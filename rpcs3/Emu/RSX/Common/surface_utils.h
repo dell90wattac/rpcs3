@@ -136,6 +136,23 @@ namespace rsx
 		return s_on;
 	}
 
+	// vanillad1: X467.2 p28 (f): VANILLAD1_BLIT_DST_NOSCALE=1 (read once, logged once; unset / 0 = as before): a blit destination
+	// made in the surface cache from a source that is not a render target (guest-memory data, e.g. Destiny's gear atlases: DXT
+	// blocks moved by cellGcmSetTransferImage as A8R8G8B8 pixels) keeps its guest size at a resolution scale. Stock scales it,
+	// loads it LINEAR, and reads it back LINEAR: the DXT endpoints and indices blend into per-block noise (the Guardian's
+	// speckle, re/notes/gfx_quality/speckle.md). Destinations fed from render targets (the SPU hand-offs) still scale.
+	inline bool vd1_blit_dst_noscale()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_BLIT_DST_NOSCALE");
+			const bool on = env && *env && std::strcmp(env, "0") != 0;
+			if (on) rsx_log.notice("vanillad1: blit destinations from guest memory kept at their guest size (VANILLAD1_BLIT_DST_NOSCALE=%s)", env);
+			return on;
+		}();
+		return s_on;
+	}
+
 	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][:own][:keep][,...] (hex range, hi
 	// exclusive, read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest
 	// memory, reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).

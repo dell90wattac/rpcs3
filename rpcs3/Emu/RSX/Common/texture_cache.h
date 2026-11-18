@@ -2161,7 +2161,9 @@ namespace rsx
 					};
 
 					surface_scaling_config_t scaling_config{};
-					if (!g_cfg.video.disable_blit_engine_upscaling)
+					// vanillad1: X467.2 p28 (f): VANILLAD1_BLIT_DST_NOSCALE: a destination of guest-memory data stays at its guest size
+					const bool vd1_noscale = !src_is_render_target && rsx::vd1_blit_dst_noscale();
+					if (!g_cfg.video.disable_blit_engine_upscaling && !vd1_noscale)
 					{
 						scaling_config =
 						{
