@@ -70,6 +70,55 @@ namespace rsx
 		return false;
 	}
 
+	// vanillad1: X467.2 p28 (c): VANILLAD1_HANDOFF_NEAREST=<lo>-<hi>[,<lo>-<hi>...] (hex, hi exclusive, read once, logged once;
+	// unset / 0 / unparsable = as before). At a Resolution Scale != 100 RPCS3 resamples a colour surface between its host size and
+	// the guest size with VK_FILTER_LINEAR both ways (VKTextureCache.h copy_texture: the readback to guest memory;
+	// VKRenderTargets.cpp load_memory: the reload from it). Destiny's SPU hand-off buffers hold packed words (f32 depth with flag
+	// bits, a material byte and a normal, two FP16 halves), not colour: blending their bytes is garbage. A colour surface
+	// overlapping a range is resampled NEAREST both ways.
+	inline const std::vector<std::pair<u32, u32>>& vd1_handoff_nearest_ranges()
+	{
+		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* env = std::getenv("VANILLAD1_HANDOFF_NEAREST");
+			if (!env || !*env || !std::strcmp(env, "0")) return out;
+			for (const char* p = env;;)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				u32 hi = 0;
+				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (hi <= lo)
+				{
+					rsx_log.error("vanillad1: VANILLAD1_HANDOFF_NEAREST=%s not understood; resampled as before", env);
+					out.clear();
+					return out;
+				}
+				out.emplace_back(lo, hi);
+				if (!rest || *rest != ',') break;
+				p = rest + 1;
+			}
+			for (const auto& [lo, hi] : out)
+				rsx_log.notice("vanillad1: colour surfaces over 0x%x-0x%x resampled nearest at a resolution scale (VANILLAD1_HANDOFF_NEAREST)", lo, hi);
+			return out;
+		}();
+		return s_ranges;
+	}
+
+	inline bool vd1_handoff_nearest(const rsx::address_range32& range)
+	{
+		for (const auto& [lo, hi] : vd1_handoff_nearest_ranges())
+		{
+			if (range.start < hi && range.end >= lo)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][:own][:keep][,...] (hex range, hi
 	// exclusive, read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest
 	// memory, reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
@@ -229,6 +278,7 @@ namespace rsx
 		std::atomic<u32> stock_rd{0}, stock_rl{0}; // vanillad1: RCB stock range (P13.2): barriers on VANILLAD1_RCB_STOCK surfaces, reloads
 		std::atomic<u32> stock_fg{0}, stock_kept{0}; // vanillad1: RCB stock own (P13.3): foreign barriers that skipped the stock rule (own), surfaces left out (keep)
 		std::atomic<u32> stock_inh{0}, stock_noinh{0}; // vanillad1: RCB stock noinherit (P13.3): inheritances from a flagged STOCK surface, those skipped
+		std::atomic<u32> hn_rb{0}, hn_rl{0}; // vanillad1: X467.2 p28 (c): nearest readbacks / reloads
 	};
 	inline vd1_rcb_counters g_vd1_rcb;
 
@@ -262,6 +312,8 @@ namespace rsx
 			c.stock_rd.exchange(0), c.stock_rl.exchange(0), // stock_*: vanillad1: RCB stock range (P13.2)
 			c.stock_fg.exchange(0), c.stock_kept.exchange(0)); // vanillad1: RCB stock own (P13.3)
 		rsx_log.notice("vanillad1: rcb 10s stock: inh=%u noinh=%u", c.stock_inh.exchange(0), c.stock_noinh.exchange(0)); // vanillad1: RCB stock noinherit (P13.3)
+		if (!vd1_handoff_nearest_ranges().empty()) // vanillad1: X467.2 p28 (c)
+			rsx_log.notice("vanillad1: rcb 10s scaled: nearest readbacks=%u reloads=%u (VANILLAD1_HANDOFF_NEAREST)", c.hn_rb.exchange(0), c.hn_rl.exchange(0));
 	}
 
 	enum surface_state_flags : u32

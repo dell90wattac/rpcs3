@@ -330,7 +330,10 @@ namespace vk
 				target->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
 				// Allow bilinear filtering on color textures where compatibility is likely
-				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+				// vanillad1: X467.2 p28 (c): VANILLAD1_HANDOFF_NEAREST: a hand-off range holds packed words, not colour: nearest
+				const bool vd1_nearest = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT) && rsx::vd1_handoff_nearest(get_section_range());
+				if (vd1_nearest) rsx::g_vd1_rcb.hn_rb++;
+				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT && !vd1_nearest) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 
 				vk::copy_scaled_image(cmd, locked_resource, target,
 					areai{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
