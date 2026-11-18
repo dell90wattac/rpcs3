@@ -13,6 +13,19 @@
 
 namespace rsx
 {
+	// vanillad1: X467.2 p28 (a): VANILLAD1_WPOS_RULE (read once, logged once): fill_fragment_state_buffer, get_framebuffer_layout
+	bool vd1_wpos_rule()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_WPOS_RULE");
+			const bool on = env && *env && std::strcmp(env, "0") != 0;
+			if (on) rsx_log.notice("vanillad1: WPOS scaled by the surface rule, max(clip width, clip height) > Minimum Scalable Dimension (VANILLAD1_WPOS_RULE=%s)", env);
+			return on;
+		}();
+		return s_on;
+	}
+
 	void draw_command_processor::analyse_inputs_interleaved(vertex_input_layout& result, const vertex_program_metadata_t& vp_metadata)
 	{
 		const rsx_state& state = *REGS(m_ctx);
@@ -711,7 +724,14 @@ namespace rsx
 		const auto window_origin = REGS(m_ctx)->shader_window_origin();
 		const u32 window_height = REGS(m_ctx)->shader_window_height();
 		const auto pixel_center = REGS(m_ctx)->pixel_center();
-		const f32 resolution_scale = (window_height <= RSX(m_ctx)->resolution_scaling_config.min_scalable_dimension)
+		// vanillad1: X467.2 p28 (a): VANILLAD1_WPOS_RULE=1 (read once, logged once; 0 / unset = stock): WPOS is divided by the
+		// resolution scale when the raster is scaled, by the surfaces' own rule (rsx_utils.h apply_resolution_scale: the longer
+		// side > Minimum Scalable Dimension; set_viewport scales by the surface clip's), not by the window height alone. Stock
+		// leaves a wide, short target (Destiny's 256x16 grading LUT, 320x20 on the host at 125 %) with an unscaled WPOS.
+		// get_framebuffer_layout marks the fragment state dirty when the clip's side of the rule flips (the window height may not).
+		const u32 vd1_wpos_ref = vd1_wpos_rule() ?
+			std::max<u32>(REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->surface_clip_height()) : window_height;
+		const f32 resolution_scale = (vd1_wpos_ref <= RSX(m_ctx)->resolution_scaling_config.min_scalable_dimension)
 			? 1.f
 			: RSX(m_ctx)->resolution_scaling_config.scale_factor();
 

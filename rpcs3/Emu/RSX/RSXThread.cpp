@@ -121,6 +121,7 @@ bool serialize<rsx::rsx_iomap_table>(utils::serial& ar, rsx::rsx_iomap_table& o)
 namespace rsx
 {
 	std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
+	bool vd1_wpos_rule(); // vanillad1: X467.2 p28 (a): VANILLAD1_WPOS_RULE (Core/RSXDrawCommands.cpp)
 
 	// TODO: Proper context manager
 	static rsx::context s_ctx{ .rsxthr = nullptr, .register_state = &method_registers };
@@ -1449,6 +1450,19 @@ namespace rsx
 
 		m_graphics_state.clear(rsx::rtt_config_contested | rsx::rtt_config_valid);
 		m_current_framebuffer_context = context;
+
+		// vanillad1: X467.2 p28 (a): VANILLAD1_WPOS_RULE: WPOS follows the clip's side of the scale rule, so a clip that flips it
+		// re-uploads the fragment state (a register change of the shader window alone signals that in stock)
+		if (vd1_wpos_rule())
+		{
+			static bool s_vd1_scaled = false;
+			const bool scaled = std::max<u32>(layout.width, layout.height) > resolution_scaling_config.min_scalable_dimension;
+			if (scaled != s_vd1_scaled)
+			{
+				s_vd1_scaled = scaled;
+				m_graphics_state.set(rsx::fragment_state_dirty);
+			}
+		}
 
 		if (layout.width == 0 || layout.height == 0)
 		{
