@@ -10,6 +10,31 @@
 #include "vkutils/chip_class.h"
 #include <vulkan/vulkan_core.h>
 
+namespace
+{
+	// vanillad1: X467.3 VANILLAD1_AF_WORLD: the config's Anisotropic Filter Override only where the world needs it (the stock
+	// override on every sampler turns Destiny's HUD text into blocks). 0 / unset = stock; 1 = only samplers that filter
+	// linearly over a mip chain; 2 = 1, and only in draws with the depth test on (3D geometry, not the HUD's 2D draws).
+	// Elsewhere the sampler keeps the game's own register value. Read once, logged.
+	u32 vd1_af_world_mode()
+	{
+		static const u32 s_mode = []()
+		{
+			const char* env = std::getenv("VANILLAD1_AF_WORLD");
+			const u32 m = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+			if (m)
+			{
+				rsx_log.success("vanillad1: VANILLAD1_AF_WORLD=%u: the anisotropic override %s", m,
+					m >= 2 ? "only on linear mipmapped samplers in depth-tested draws" : "only on linear mipmapped samplers");
+			}
+			return m;
+		}();
+		return s_mode;
+	}
+
+	bool s_vd1_af_last_depth = false;
+}
+
 namespace vk
 {
 	VkImageViewType get_view_type(rsx::texture_dimension_extended type)
@@ -357,6 +382,16 @@ void VKGSRender::load_texture_env()
 
 	std::lock_guard lock(m_sampler_mutex);
 
+	// vanillad1: X467.3: with VANILLAD1_AF_WORLD=2 a sampler depends on the draw's depth test: a flip rebuilds them
+	const u32 vd1_af_mode = vd1_af_world_mode();
+	const bool vd1_af_on = vd1_af_mode && !g_cfg.video.strict_rendering_mode && g_cfg.video.anisotropic_level_override > 0;
+	const bool vd1_depth_on = rsx::method_registers.depth_test_enabled();
+	if (vd1_af_on && vd1_af_mode >= 2 && vd1_depth_on != s_vd1_af_last_depth)
+	{
+		s_vd1_af_last_depth = vd1_depth_on;
+		m_textures_dirty.fill(true);
+	}
+
 	for (u32 textures_ref = current_fp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
 	{
 		if (!(textures_ref & 1))
@@ -607,8 +642,20 @@ void VKGSRender::load_texture_env()
 			}
 		}
 
+		// vanillad1: X467.3: the override only on a linear, mipmapped sampler (and, at 2, in a depth-tested draw)
+		f32 vd1_af_level = af_level;
+		if (vd1_af_on)
+		{
+			const bool world = min_filter.filter == VK_FILTER_LINEAR && max_lod > min_lod &&
+				(vd1_af_mode < 2 || vd1_depth_on);
+			if (!world)
+			{
+				vd1_af_level = vk::max_aniso(tex.max_aniso_game());
+			}
+		}
+
 		if (fs_sampler_handles[i] &&
-			fs_sampler_handles[i]->matches(wrap_s, wrap_t, wrap_r, false, lod_bias, af_level, min_lod, max_lod,
+			fs_sampler_handles[i]->matches(wrap_s, wrap_t, wrap_r, false, lod_bias, vd1_af_level, min_lod, max_lod,
 				min_filter.filter, mag_filter, min_filter.mipmap_mode, border_color, compare_enabled, depth_compare_mode))
 		{
 			continue;
@@ -619,7 +666,7 @@ void VKGSRender::load_texture_env()
 			fs_sampler_handles[i],
 			wrap_s, wrap_t, wrap_r,
 			false,
-			lod_bias, af_level, min_lod, max_lod,
+			lod_bias, vd1_af_level, min_lod, max_lod,
 			min_filter.filter, mag_filter, min_filter.mipmap_mode,
 			border_color, compare_enabled, depth_compare_mode);
 	}

@@ -230,6 +230,11 @@ namespace rsx
 		return rsx::to_texture_max_anisotropy((registers[NV4097_SET_TEXTURE_CONTROL0 + (m_index * 8)] >> 4) & 0x7);
 	}
 
+	rsx::texture_max_anisotropy fragment_texture::max_aniso_game() const
+	{
+		return rsx::to_texture_max_anisotropy((registers[NV4097_SET_TEXTURE_CONTROL0 + (m_index * 8)] >> 4) & 0x7);
+	}
+
 	bool fragment_texture::alpha_kill_enabled() const
 	{
 		return ((registers[NV4097_SET_TEXTURE_CONTROL0 + (m_index * 8)] >> 2) & 0x1);

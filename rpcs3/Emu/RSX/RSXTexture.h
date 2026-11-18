@@ -59,6 +59,8 @@ namespace rsx
 		f32 min_lod() const;
 		f32 max_lod() const;
 		rsx::texture_max_anisotropy max_aniso() const;
+		// vanillad1: X467.3: the game's own register value, without the config's override
+		rsx::texture_max_anisotropy max_aniso_game() const;
 		bool alpha_kill_enabled() const;
 
 		// Control1
