@@ -468,7 +468,13 @@ namespace vk
 		}
 
 		void finish_flush()
-		{}
+		{
+			// vanillad1: X467.2 p28 (d): VANILLAD1_RCB_FLUSH_RESYNC: imp_flush just wrote the surface to guest memory
+			if (context == rsx::texture_upload_context::framebuffer_storage && rsx::vd1_rcb_flush_resync()) [[unlikely]]
+			{
+				vk::as_rtt(vram_texture)->vd1_flush_resync();
+			}
+		}
 
 		/**
 		 * Misc

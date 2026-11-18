@@ -132,6 +132,7 @@ namespace vk
 		u32 vd1_waited_us = 0;
 		bool vd1_rcb_bands(std::array<u64, 2>& out);
 		bool vd1_rcb_reload_due(rsx::surface_access access);
+		void vd1_flush_resync(); // vanillad1: X467.2 p28 (d): VANILLAD1_RCB_FLUSH_RESYNC (VKTextureCache.h finish_flush)
 
 		using drawable_surface_t::drawable_surface_t;
 

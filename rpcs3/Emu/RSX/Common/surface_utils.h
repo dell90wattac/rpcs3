@@ -119,6 +119,23 @@ namespace rsx
 		return false;
 	}
 
+	// vanillad1: X467.2 p28 (d): VANILLAD1_RCB_FLUSH_RESYNC=1 (read once, logged once; unset / 0 = as before): a flush that writes a
+	// resolution-scaled VANILLAD1_RCB_RANGE surface to guest memory (VKTextureCache.h finish_flush) takes the memory it wrote as the
+	// surface's own (vd1_seen), as stock RCB's sync_tag does at the same point: the next consuming read no longer reloads the
+	// surface's own readback (taken down and up again: at a scale, not the same picture). A surface at its guest size (100 %, or
+	// under Minimum Scalable Dimension) is left as it was (P13.3).
+	inline bool vd1_rcb_flush_resync()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_RCB_FLUSH_RESYNC");
+			const bool on = env && *env && std::strcmp(env, "0") != 0;
+			if (on) rsx_log.notice("vanillad1: a flush resyncs a scaled VANILLAD1_RCB_RANGE surface's changed-memory hash (VANILLAD1_RCB_FLUSH_RESYNC=%s)", env);
+			return on;
+		}();
+		return s_on;
+	}
+
 	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][:own][:keep][,...] (hex range, hi
 	// exclusive, read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest
 	// memory, reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).
@@ -279,6 +296,7 @@ namespace rsx
 		std::atomic<u32> stock_fg{0}, stock_kept{0}; // vanillad1: RCB stock own (P13.3): foreign barriers that skipped the stock rule (own), surfaces left out (keep)
 		std::atomic<u32> stock_inh{0}, stock_noinh{0}; // vanillad1: RCB stock noinherit (P13.3): inheritances from a flagged STOCK surface, those skipped
 		std::atomic<u32> hn_rb{0}, hn_rl{0}; // vanillad1: X467.2 p28 (c): nearest readbacks / reloads
+		std::atomic<u32> fl_resync{0}; // vanillad1: X467.2 p28 (d): flushes that resynced a scaled RANGE surface's hash
 	};
 	inline vd1_rcb_counters g_vd1_rcb;
 
@@ -312,8 +330,9 @@ namespace rsx
 			c.stock_rd.exchange(0), c.stock_rl.exchange(0), // stock_*: vanillad1: RCB stock range (P13.2)
 			c.stock_fg.exchange(0), c.stock_kept.exchange(0)); // vanillad1: RCB stock own (P13.3)
 		rsx_log.notice("vanillad1: rcb 10s stock: inh=%u noinh=%u", c.stock_inh.exchange(0), c.stock_noinh.exchange(0)); // vanillad1: RCB stock noinherit (P13.3)
-		if (!vd1_handoff_nearest_ranges().empty()) // vanillad1: X467.2 p28 (c)
-			rsx_log.notice("vanillad1: rcb 10s scaled: nearest readbacks=%u reloads=%u (VANILLAD1_HANDOFF_NEAREST)", c.hn_rb.exchange(0), c.hn_rl.exchange(0));
+		if (!vd1_handoff_nearest_ranges().empty() || vd1_rcb_flush_resync()) // vanillad1: X467.2 p28 (c), (d)
+			rsx_log.notice("vanillad1: rcb 10s scaled: nearest readbacks=%u reloads=%u (VANILLAD1_HANDOFF_NEAREST); flush resyncs=%u (VANILLAD1_RCB_FLUSH_RESYNC)",
+				c.hn_rb.exchange(0), c.hn_rl.exchange(0), c.fl_resync.exchange(0));
 	}
 
 	enum surface_state_flags : u32

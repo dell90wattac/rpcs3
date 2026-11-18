@@ -1197,6 +1197,35 @@ namespace vk
 		return true;
 	}
 
+	// vanillad1: X467.2 p28 (d): VANILLAD1_RCB_FLUSH_RESYNC. Called after a flush wrote this surface to guest memory (the pages still
+	// protected: no SPU write can land in between). A resolution-scaled colour surface under the RANGE rule takes that memory as
+	// its own, so its next consuming read does not reload its own readback (down to the guest size and up again); a later SPU
+	// write still changes the hash and reloads. Unscaled surfaces (the reload is the same picture) keep P13.3's rule as it was.
+	void render_target::vd1_flush_resync()
+	{
+		if (is_depth_surface())
+		{
+			return;
+		}
+		const auto [sw, sh] = rsx::apply_resolution_scale(resolution_scaling_config, surface_width, surface_height);
+		if (sw == surface_width && sh == surface_height)
+		{
+			return;
+		}
+		if (!rsx::vd1_rcb_covers(get_memory_range()) || !rsx::vd1_rcb_size_ok(surface_width, surface_height))
+		{
+			return;
+		}
+		std::array<u64, 2> now{};
+		if (!vd1_rcb_bands(now))
+		{
+			return;
+		}
+		vd1_seen = now;
+		vd1_seen_valid = true;
+		rsx::g_vd1_rcb.fl_resync++;
+	}
+
 	void render_target::memory_barrier(vk::command_buffer& cmd, rsx::surface_access access)
 	{
 		if (access == rsx::surface_access::gpu_reference)
