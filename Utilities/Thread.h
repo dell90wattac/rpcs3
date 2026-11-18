@@ -333,6 +333,12 @@ public:
 	// Sets the native thread priority
 	static void set_native_priority(int priority);
 
+	// vanillad1 (X466.5): VANILLAD1_COMPILE_PRIO, read once and logged: 0 / unset = stock, 1 = below normal, 2 = lowest
+	static u32 vd1_compile_prio();
+
+	// vanillad1 (X466.5): called once by an in-play compile worker (SPUW.n, RSX.Wn) as it starts; does nothing at 0
+	static void vd1_apply_compile_prio();
+
 	// Sets the preferred affinity mask for this thread
 	static void set_thread_affinity_mask(u64 mask);
 

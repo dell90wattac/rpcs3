@@ -9240,6 +9240,9 @@ struct spu_llvm_worker
 
 	void operator()()
 	{
+		// vanillad1 (X466.5): VANILLAD1_COMPILE_PRIO, the in-play SPU LLVM workers below the game's threads (nothing at 0)
+		thread_ctrl::vd1_apply_compile_prio();
+
 		// SPU LLVM Recompiler instance
 		std::unique_ptr<spu_recompiler_base> compiler;
 
@@ -9454,6 +9457,21 @@ struct spu_llvm
 		else if (hc >= 6)
 		{
 			worker_count = 2;
+		}
+
+		// vanillad1 (X466.5): VANILLAD1_SPUW_MAX=<n> caps the in-play SPU LLVM workers (unset, 0 or not a number = no cap)
+		{
+			const char* env = std::getenv("VANILLAD1_SPUW_MAX");
+			const u32 cap = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+			const u32 stock_count = worker_count;
+
+			if (cap && cap < worker_count)
+			{
+				worker_count = cap;
+			}
+
+			spu_log.notice("vanillad1: spuw: VANILLAD1_SPUW_MAX=%u, %u SPUW worker(s) (stock %u), VANILLAD1_COMPILE_PRIO=%u",
+				cap, worker_count, stock_count, thread_ctrl::vd1_compile_prio());
 		}
 
 		u32 worker_index = 0;

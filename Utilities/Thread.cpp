@@ -3861,6 +3861,44 @@ void thread_ctrl::set_native_priority(int priority)
 #endif
 }
 
+// vanillad1 (X466.5): the in-play compile workers yield to the game's threads. VANILLAD1_COMPILE_PRIO, read once:
+// 0 / unset (or anything else) = stock: the workers keep the normal priority they are created with.
+// 1 = below normal, 2 = lowest. Only spu_llvm_worker (SPUW.n) and vk::pipe_compiler (RSX.Wn) call the apply function;
+// the boot's builders (SPU Worker n, RSX Worker n, the PPU workers) are other thread groups and are not touched.
+u32 thread_ctrl::vd1_compile_prio()
+{
+	static const u32 s_mode = []() -> u32
+	{
+		const char* env = std::getenv("VANILLAD1_COMPILE_PRIO");
+		const u32 mode = env && *env >= '1' && *env <= '2' && !env[1] ? static_cast<u32>(*env - '0') : 0u;
+		sig_log.notice("vanillad1: compile prio: VANILLAD1_COMPILE_PRIO=%u (0 stock, 1 below normal, 2 lowest)", mode);
+		return mode;
+	}();
+	return s_mode;
+}
+
+void thread_ctrl::vd1_apply_compile_prio()
+{
+	const u32 mode = vd1_compile_prio();
+
+	if (!mode)
+	{
+		return;
+	}
+
+#ifdef _WIN32
+	const bool ok = !!SetThreadPriority(GetCurrentThread(), mode == 1 ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST);
+#elif defined(__linux__)
+	// SCHED_OTHER has one static priority (set_native_priority changes nothing there): a per-thread nice value instead
+	const bool ok = setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), mode == 1 ? 5 : 15) == 0;
+#else
+	set_native_priority(-1);
+	const bool ok = true;
+#endif
+
+	sig_log.notice("vanillad1: compile prio: this worker at %s%s", mode == 1 ? "below normal" : "lowest", ok ? "" : " (the call failed)");
+}
+
 u64 thread_ctrl::get_process_affinity_mask()
 {
 	static const u64 mask = []() -> u64

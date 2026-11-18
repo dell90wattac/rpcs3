@@ -34,6 +34,10 @@ namespace vk
 
 	void pipe_compiler::operator()()
 	{
+		// vanillad1 (X466.5): VANILLAD1_COMPILE_PRIO, the async pipeline workers below the game's threads (nothing at 0).
+		// The boot preload compiles inline on the RSX Worker threads (COMPILE_INLINE), never on these.
+		thread_ctrl::vd1_apply_compile_prio();
+
 		while (thread_ctrl::state() != thread_state::aborting)
 		{
 			for (auto&& job : m_work_queue.pop_all())
