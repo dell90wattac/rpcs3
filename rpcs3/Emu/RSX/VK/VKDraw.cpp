@@ -33,6 +33,64 @@ namespace
 	}
 
 	bool s_vd1_af_last_depth = false;
+
+	// vanillad1: X467.2 p28 (e): VANILLAD1_SAMPLE_NEAREST=<lo>-<hi>[,...] (hex, hi exclusive; read once, logged; unset / 0 = as
+	// before). At a Resolution Scale != 100 a texture whose guest address lies in a range is sampled NEAREST. Destiny's
+	// characters read the diffuse pair buffer (0x44813A80: two FP16 halves packed in each RGBA8 texel) at the guest pixel grid:
+	// on a scaled surface those points fall between host texels, and a linear sample blends packed bytes into per-pixel speckle.
+	const std::vector<std::pair<u32, u32>>& vd1_sample_nearest_ranges()
+	{
+		static const std::vector<std::pair<u32, u32>> s_ranges = []()
+		{
+			std::vector<std::pair<u32, u32>> out;
+			const char* env = std::getenv("VANILLAD1_SAMPLE_NEAREST");
+			if (!env || !*env || !std::strcmp(env, "0")) return out;
+			for (const char* p = env;;)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(p, &rest, 16));
+				u32 hi = 0;
+				if (rest && *rest == '-') hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+				if (hi <= lo)
+				{
+					rsx_log.error("vanillad1: VANILLAD1_SAMPLE_NEAREST=%s not understood; sampled as before", env);
+					out.clear();
+					return out;
+				}
+				out.emplace_back(lo, hi);
+				if (!rest || *rest != ',') break;
+				p = rest + 1;
+			}
+			for (const auto& [lo, hi] : out)
+				rsx_log.notice("vanillad1: textures at 0x%x-0x%x sampled nearest at a resolution scale (VANILLAD1_SAMPLE_NEAREST)", lo, hi);
+			return out;
+		}();
+		return s_ranges;
+	}
+
+	bool vd1_sample_nearest(const rsx::fragment_texture& tex)
+	{
+		const auto& ranges = vd1_sample_nearest_ranges();
+		if (ranges.empty() || g_cfg.video.resolution_scale_percent == 100u)
+		{
+			return false;
+		}
+		const u32 addr = rsx::get_address(tex.offset(), tex.location());
+		for (const auto& [lo, hi] : ranges)
+		{
+			if (addr >= lo && addr < hi)
+			{
+				static bool s_logged = false;
+				if (!s_logged)
+				{
+					s_logged = true;
+					rsx_log.notice("vanillad1: sample nearest: the first texture at 0x%x", addr);
+				}
+				return true;
+			}
+		}
+		return false;
+	}
 }
 
 namespace vk
@@ -597,6 +655,13 @@ void VKGSRender::load_texture_env()
 			mag_filter = vk::get_mag_filter(tex.mag_filter());
 		}
 		else
+		{
+			mag_filter = VK_FILTER_NEAREST;
+			min_filter.filter = VK_FILTER_NEAREST;
+			min_filter.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		}
+
+		if (vd1_sample_nearest(tex)) // vanillad1: X467.2 p28 (e): packed hand-off words at a resolution scale
 		{
 			mag_filter = VK_FILTER_NEAREST;
 			min_filter.filter = VK_FILTER_NEAREST;
