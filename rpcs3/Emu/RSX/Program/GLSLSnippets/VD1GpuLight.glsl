@@ -3,7 +3,11 @@ R"(
 // vanillad1 X300.2: Destiny's deferred lighting SPU job (spu_deferred_lighting_job) as one compute pass.
 // One workgroup = one 32x24 tile, one invocation = one pixel. Port of re/notes/X300.2/oracle.py.
 // One storage buffer holds everything (32-bit words, host order); the push block gives the offsets.
+// X467.2: VD1_SCALED 1 = the variant for a resolution-scaled frame: w x h (P+0x64 / +0x68) are the host size, the last tile
+// row / column may be partial (780 / 24 = 32.5 at 125 %; its invocations outside take part in the barriers and nothing else),
+// the push block's last two words move the rays by the host pixel centres. VD1_SCALED 0 = the guest-size pass, as before.
 #define VD1_VK %vk
+#define VD1_SCALED %scaled
 layout(local_size_x = 32, local_size_y = 24, local_size_z = 1) in;
 #if VD1_VK
 layout(set = 0, binding = 0, std430) buffer ssbo0 { uint data[]; };
@@ -22,7 +26,8 @@ layout(std140, binding = 0) uniform push_block {
 	uint n_lights;
 	uint flags;    // bit 0: write the light target, bit 1: write the G-buffer pair
 	uint o_lut;    // the 8-bit buffer's lookup: 256 x (c = s^P+0x1cc, d = s^P+0x16c), s = max((i/255)^2, 1e-4)
-	uint pad1, pad2;
+	uint bias_x;   // X467.2, VD1_SCALED: f32 bits, the rays' sub-pixel offset at the host size, 0.5 - 0.5 * W / w (unused otherwise)
+	uint bias_y;   // the same for H / h
 };
 
 shared uint s_zmin, s_zmax;
@@ -140,14 +145,28 @@ void main()
 	const uvec2 g = gl_GlobalInvocationID.xy;
 	const uint li = gl_LocalInvocationIndex, lane = g.x & 3u;
 	const uint qi = gl_LocalInvocationID.y * 8u + (gl_LocalInvocationID.x >> 2);
+#if VD1_SCALED
+	const bool inb = g.x < w && g.y < hh;   // false only in a partial tile
+	const uint pix = inb ? g.y * w + g.x : 0u;
+	const float bx = uintBitsToFloat(bias_x), by = uintBitsToFloat(bias_y);
+#else
 	const uint pix = g.y * w + g.x;
+#endif
 	if (li == 0u) { s_zmin = 0xffffffffu; s_zmax = 0u; }
 	if (li < 8u) s_vis[li] = 0u;
 	if (li < 192u) { s_qa[li] = 0u; s_q[0][li] = 0u; s_q[1][li] = 0u; s_q[2][li] = 0u; }
 	barrier();
 	const uint zw = data[o_z + pix];
+#if VD1_SCALED
+	if (inb)
+	{
+		atomicMin(s_zmin, zw & 0xffffff00u);
+		atomicMax(s_zmax, zw & 0xffffff00u);
+	}
+#else
 	atomicMin(s_zmin, zw & 0xffffff00u);
 	atomicMax(s_zmax, zw & 0xffffff00u);
+#endif
 	barrier();
 	const float zmin = uintBitsToFloat(s_zmin), zmax = uintBitsToFloat(s_zmax);
 	if (!(55188.0 > zmin)) return;   // 0x0571c: the job leaves a far tile alone (the whole group returns)
@@ -157,7 +176,11 @@ void main()
 	{
 		const uint t = data[o_lt + li * 60u + 51u] >> 24;
 		const float sx = P(0x80u), sy = P(0x94u), ox = P(0xa0u), oy = P(0xa4u);   // + the projection's off-centre terms
+#if VD1_SCALED
+		const float c0 = float(gl_WorkGroupID.x * 32u) + bx, r0 = float(gl_WorkGroupID.y * 24u) + by;
+#else
 		const float c0 = float(gl_WorkGroupID.x * 32u), r0 = float(gl_WorkGroupID.y * 24u);
+#endif
 		const float X0 = (((c0 / float(w)) * 2.0 - 1.0) + ox) / sx, X1 = ((((c0 + 32.0) / float(w)) * 2.0 - 1.0) + ox) / sx;
 		const float Y0 = (oy - (((r0 + 24.0) / float(hh)) * 2.0 - 1.0)) / sy, Y1 = (oy - ((r0 / float(hh)) * 2.0 - 1.0)) / sy;
 		if (handled(t) && visible(li, t, X0, X1, Y0, Y1, zmin, zmax)) atomicOr(s_vis[li >> 5], 1u << (li & 31u));
@@ -165,7 +188,11 @@ void main()
 
 	// ---- decode (0x07390)
 	const float depth = uintBitsToFloat(zw);
+#if VD1_SCALED
+	const float u = (float(g.x) + bx) / float(w), v = (float(g.y) + by) / float(hh);
+#else
 	const float u = float(g.x) / float(w), v = float(g.y) / float(hh);
+#endif
 	const vec3 cam = P3(0x110u);
 	const vec3 ray = (P3(0xc0u) * (1.0 - u) + P3(0xd0u) * u) * (1.0 - v) + (P3(0xe0u) * (1.0 - u) + P3(0xf0u) * u) * v;
 	const vec3 pos = cam + depth * ray;
@@ -192,6 +219,9 @@ void main()
 	const bool neg = (floatBitsToUint(ndl0) >> 31) != 0u;
 	const vec3 S = P3(0x160u);
 	const float nds = dot3(N, S);
+#if VD1_SCALED
+	if (inb)
+#endif
 	atomicOr(s_qa[qi], (neg ? (1u << lane) : 0u) | (nds > 0.0 ? 16u : 0u));
 	barrier();
 	const uint qa = s_qa[qi];
@@ -264,7 +294,11 @@ void main()
 		const float ndl = dot3(N, Lv);
 		const uint bits = (att > 0.0 ? 1u : 0u) | (ndl > 0.0 ? 2u : 0u);
 		const uint q = k % 3u; k++;
+#if VD1_SCALED
+		if (bits != 0u && inb) atomicOr(s_q[q][qi], bits);
+#else
 		if (bits != 0u) atomicOr(s_q[q][qi], bits);
+#endif
 		barrier();
 		const uint qb = s_q[q][qi];
 		if (li < 192u) s_q[(q + 2u) % 3u][li] = 0u;   // read last round, written again two rounds on
@@ -286,6 +320,9 @@ void main()
 	}
 
 	if (mat == 9u) { acc.a = 0.0; lo = 0.0; }   // material 9: no specular (every lit dump pixel: the SPU writes 0 in A and the pair's low half)
+#if VD1_SCALED
+	if (!inb) return;
+#endif
 	if ((flags & 1u) != 0u)
 	{
 		data[o_l + pix * 2u] = packHalf2x16(vec2(acc.r * 0.25, acc.g * 0.25));

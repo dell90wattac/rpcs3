@@ -3790,13 +3790,17 @@ void VKGSRender::end_conditional_rendering()
 // <config>/vd1_gpu_light_<n>.bin, the SPU's light target to <n>_spu.bin at the next ready word (tools/gpulight.py).
 namespace vk
 {
-	struct cs_vd1_gpu_light : compute_task
+	// vanillad1: X467.2 p28 (b): two variants of the shader: Scaled = VD1_SCALED 1, for a frame at a resolution-scaled host size
+	// (a partial last tile, the rays at the host pixel centres); the guest-size pass compiles the text as before (VD1_SCALED 0)
+	template <bool Scaled>
+	struct cs_vd1_gpu_light_t : compute_task
 	{
 		const vk::buffer* m_buf = nullptr;
 		u32 m_len = 0;
 		std::array<u32, 12> m_pc{};
+		bool m_scaled_ok = true;   // vanillad1: X467.2 p28 (b): the shader guards a partial tile (an override file without VD1_SCALED: no)
 
-		cs_vd1_gpu_light()
+		cs_vd1_gpu_light_t()
 		{
 			ssbo_count = 1;
 			use_push_constants = true;
@@ -3818,12 +3822,14 @@ namespace vk
 				const usz o2 = text.rfind(")\"");
 				if (o1 != umax && o2 != umax && o2 > o1) text = text.substr(o1 + 3, o2 - o1 - 3);
 				rsx_log.success("vanillad1: gpu light: the shader from %svd1_gpu_light.glsl (%u bytes)", dir, ::size32(text));
+				m_scaled_ok = text.find("VD1_SCALED") != umax; // vanillad1: X467.2 p28 (b)
 				m_src = std::move(text);
 			}
 
 			const std::pair<std::string_view, std::string> syntax_replace[] =
 			{
 				{ "%vk", "1" },
+				{ "%scaled", Scaled ? "1" : "0" }, // vanillad1: X467.2 p28 (b)
 			};
 
 			m_src = fmt::replace_all(m_src, syntax_replace);
@@ -3835,6 +3841,7 @@ namespace vk
 			m_program->bind_uniform({ *m_buf, 0, m_len }, 0, 0);
 		}
 	};
+	using cs_vd1_gpu_light = cs_vd1_gpu_light_t<false>;
 
 	// vanillad1: G-buffer byte on the GPU (X300.7): NV0039's 4 -> 1 gather from the surface's words in scratch: one byte of
 	// each host word (byte 3 = A = the guest's first byte: A8R8G8B8 surfaces are byte-swapped into guest memory) packed four
@@ -3896,10 +3903,25 @@ namespace
 		return s_mode;
 	}
 
+	// vanillad1: X467.2 p28 (b): VANILLAD1_GPU_LIGHT_SCALED=1 (read once, logged once; 0 / unset = as before): at a Resolution
+	// Scale != 100 the pass takes the hand-off surfaces at their host size (1280 x 780 at 125 %) and lights the frame there
+	bool vd1_gl_scaled()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_GPU_LIGHT_SCALED");
+			const bool on = env && *env && std::strcmp(env, "0") != 0;
+			if (on) rsx_log.notice("vanillad1: GPU lighting at the host size of a resolution-scaled frame (VANILLAD1_GPU_LIGHT_SCALED=%s)", env);
+			return on;
+		}();
+		return s_on;
+	}
+
 	struct vd1_gl_counters
 	{
 		u32 calls = 0, lit = 0, shadow = 0, slot = 0, unfilled = 0, nosurf = 0, badsurf = 0, taken = 0, dumps = 0;
 		u32 gb_gpu = 0, gb_nomatch = 0, gb_taken = 0;   // vanillad1: G-buffer byte on the GPU (X300.7)
+		u32 sc_frames = 0, sc_mismatch = 0, sc_override = 0, sc_w = 0, sc_h = 0;   // vanillad1: X467.2 p28 (b)
 		u64 last_ms = 0;
 	} s_vd1_gl;
 
@@ -3913,6 +3935,9 @@ namespace
 		rsx_log.notice("vanillad1: gpu light 10s: ready=%u lit=%u shadow=%u declined: slot=%u unfilled=%u nosurf=%u badsurf=%u taken=%u; dumps=%u; "
 			"gbuf byte: gpu=%u (copy skipped %u) no match=%u copies run=%u",
 			c.calls, c.lit, c.shadow, c.slot, c.unfilled, c.nosurf, c.badsurf, c.taken, c.dumps, c.gb_gpu, c.gb_taken, c.gb_nomatch, released);
+		if (vd1_gl_scaled()) // vanillad1: X467.2 p28 (b)
+			rsx_log.notice("vanillad1: gpu light scaled 10s: passes at a host size=%u (last %ux%u); declined: surfaces of two sizes=%u, override shader without VD1_SCALED=%u",
+				c.sc_frames, c.sc_w, c.sc_h, c.sc_mismatch, c.sc_override);
 		c = {}; c.last_ms = now;
 		released = 0;
 	}
@@ -3981,6 +4006,18 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 	const bool log_now = (mode == vd1_gl_mode::probe) && (s_probe_logs < 12 || (c.calls % 600) == 0);
 	if (log_now) s_probe_logs++;
 
+	// vanillad1: X467.2 p28 (b): the frame's w x h on a surface's host image (rsx::apply_resolution_scale, as the texture cache
+	// scales a region of a surface); with VANILLAD1_GPU_LIGHT_SCALED unset, w x h itself (the stock test below)
+	auto host_size = [&](vk::render_target* s) -> std::pair<u32, u32>
+	{
+		if (!vd1_gl_scaled()) return { w, h };
+		const auto [sw, sh] = rsx::apply_resolution_scale<true>(s->get_resolution_scaling_config(), static_cast<u16>(w), static_cast<u16>(h),
+			static_cast<u16>(s->get_surface_width<rsx::surface_metrics::pixels>()), static_cast<u16>(s->get_surface_height<rsx::surface_metrics::pixels>()));
+		return { sw, sh };
+	};
+	u32 W = 0, H = 0;   // vanillad1: X467.2 p28 (b): the pass's size (the first usable surface's host size; = w x h unscaled)
+	bool sizes_differ = false;
+
 	auto find = [&](u32 addr, u32 pitch, VkFormat fmt, const char* what) -> vk::render_target*
 	{
 		vk::render_target* s = m_rtts.get_surface_at(addr);
@@ -3990,9 +4027,10 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			c.nosurf++;
 			return nullptr;
 		}
+		const auto [sw, sh] = host_size(s); // vanillad1: X467.2 p28 (b)
 		const bool ok = !s->is_depth_surface() && s->samples() == 1 && s->format() == fmt &&
 			s->get_surface_width<rsx::surface_metrics::pixels>() == w && s->get_surface_height<rsx::surface_metrics::pixels>() >= h &&
-			s->width() == w && s->height() >= h && s->get_rsx_pitch() == pitch;
+			s->width() == sw && s->height() >= sh && s->get_rsx_pitch() == pitch;
 		if (log_now || !ok)
 		{
 			static u32 s_bad_logs = 0;
@@ -4006,6 +4044,8 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			c.badsurf++;
 			return nullptr;
 		}
+		if (!W) { W = sw; H = sh; }
+		else if (sw != W || sh != H) sizes_differ = true; // vanillad1: X467.2 p28 (b): never unscaled (all w x h)
 		return s;
 	};
 	vk::render_target* zs = find(z_ea, w * 4, VK_FORMAT_B8G8R8A8_UNORM, "depth");
@@ -4013,6 +4053,17 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 	vk::render_target* ls = find(lt_ea, lt_pitch, VK_FORMAT_R16G16B16A16_SFLOAT, "light");
 	if (!zs || !gs || !ls || mode == vd1_gl_mode::probe)
 	{
+		return;
+	}
+	// vanillad1: X467.2 p28 (b): a scaled frame: one host size for the three, and a shader that guards a partial tile
+	const bool host_scaled = (W != w || H != h);
+	if (sizes_differ || (host_scaled && !vk::get_compute_task<vk::cs_vd1_gpu_light_t<true>>()->m_scaled_ok))
+	{
+		static u32 s_sc_logs = 0;
+		if (s_sc_logs++ < 10)
+			rsx_log.notice("vanillad1: gpu light scaled: slot %u declined: %s (depth %ux%u, G-buffer A %ux%u, light %ux%u)", slot,
+				sizes_differ ? "the surfaces' host sizes differ" : "the override shader has no VD1_SCALED guard", zs->width(), zs->height(), gs->width(), gs->height(), ls->width(), ls->height());
+		(sizes_differ ? c.sc_mismatch : c.sc_override)++;
 		return;
 	}
 
@@ -4028,6 +4079,12 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			dump = true;
 		}
 	}
+	if (dump && host_scaled)
+	{
+		// vanillad1: X467.2 p28 (b): tools/gpulight.py reads guest-size dumps
+		dump = false;
+		rsx_log.notice("vanillad1: gpu light: no dump at a scaled host size (%ux%u)", W, H);
+	}
 	const bool swap = (mode == vd1_gl_mode::on) && !dump;
 
 	// vanillad1: G-buffer byte on the GPU (X300.7): this frame's NV0039 copy into the 8-bit buffer, held (or, check, run as
@@ -4039,8 +4096,9 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		vk::render_target* s = (held.dst == mk_ea && held.line_length == w && held.line_count >= h && held.out_pitch == static_cast<s32>(w)) ?
 			m_rtts.get_surface_at(held.src) : nullptr;
 		if (s && !s->is_depth_surface() && s->samples() == 1 && s->format() == VK_FORMAT_B8G8R8A8_UNORM &&
-			s->get_surface_width<rsx::surface_metrics::pixels>() == w && s->width() == w &&
-			s->get_surface_height<rsx::surface_metrics::pixels>() >= h && s->height() >= h && s->get_rsx_pitch() == static_cast<u32>(held.in_pitch))
+			s->get_surface_width<rsx::surface_metrics::pixels>() == w && s->width() == W &&
+			s->get_surface_height<rsx::surface_metrics::pixels>() >= h && s->height() >= H && s->get_rsx_pitch() == static_cast<u32>(held.in_pitch) &&
+			host_size(s) == std::pair<u32, u32>{ W, H }) // vanillad1: X467.2 p28 (b): at the pass's host size (W x H = w x h unscaled)
 		{
 			xs = s;
 		}
@@ -4059,7 +4117,7 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		return 8u * ((env && *env >= '0' && *env <= '3') ? static_cast<u32>(*env - '0') : 3u);
 	}();
 	static u32 s_gb_checks = 0;
-	const bool gb_check = xs && held.state == rsx::vd1_nv0039_args::check && !dump && (s_gb_checks++ % 10) == 0;
+	const bool gb_check = xs && held.state == rsx::vd1_nv0039_args::check && !dump && !host_scaled && (s_gb_checks++ % 10) == 0;
 
 	// The swap: the six SPU instances take the tile past the last first and exit (the PPU's waits complete as usual)
 	if (swap)
@@ -4071,16 +4129,17 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			c.taken++;
 			return;
 		}
-		ctr = (w / 32u) * (h / 24u) - 1u;
+		ctr = (w / 32u) * (h / 24u) - 1u;   // the SPU job's own last tile: the guest size (X467.2: whatever the pass's host size)
 	}
 
 	// The scratch layout (bytes): depth, G-buffer A, the 8-bit buffer, the light target, P, lights, table, LUT, [G-buffer A in],
 	// [the NV0039 source surface's words (X300.7)]
-	const u32 px = w * h;
+	// vanillad1: X467.2 p28 (b): all per-pixel arrays at the pass's size W x H (= w x h unscaled)
+	const u32 px = W * H;
 	const u32 O_Z = 0, O_G = vd1_align(O_Z + px * 4), O_M = vd1_align(O_G + px * 4), O_L = vd1_align(O_M + px);
 	const u32 O_P = vd1_align(O_L + px * 8), O_LT = vd1_align(O_P + 0x280), O_T = vd1_align(O_LT + n * 240), O_LUT = vd1_align(O_T + 0x9350);
 	const u32 O_G0 = vd1_align(O_LUT + 2048), total_l = dump ? vd1_align(O_G0 + px * 4) : O_G0;
-	const u32 O_X = total_l, total = xs ? vd1_align(O_X + px * 4) : total_l;
+	const u32 O_X = total_l, total = xs ? vd1_align(O_X + px * 4 + ((px & 3) ? 16u : 0u)) : total_l;   // + the gather's last partial word (X467.2)
 
 	auto* cmd = m_current_command_buffer;
 	for (vk::render_target* s : { zs, gs, ls })
@@ -4097,10 +4156,10 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 	{
 		VkBufferImageCopy r{};
 		r.bufferOffset = off;
-		r.bufferRowLength = w;
-		r.bufferImageHeight = h;
+		r.bufferRowLength = W;   // vanillad1: X467.2 p28 (b): the host size (= w x h unscaled)
+		r.bufferImageHeight = H;
 		r.imageSubresource = { s->aspect(), 0, 0, 1 };
-		r.imageExtent = { w, h, 1 };
+		r.imageExtent = { W, H, 1 };
 		return r;
 	};
 	for (auto [s, off] : { std::pair{ zs, O_Z }, std::pair{ gs, O_G }, std::pair{ ls, O_L } })
@@ -4130,6 +4189,13 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		for (u32 i = 0; i < bytes / 4; i++) out[i] = src[i];
 	};
 	swap_words(U_P, P, 0x280);
+	if (host_scaled)
+	{
+		// vanillad1: X467.2 p28 (b): the pass's copy of P carries the host size (the shader's w, h; the guest's P is left alone)
+		u32* pw = reinterpret_cast<u32*>(dst + U_P);
+		pw[0x64 / 4] = W;
+		pw[0x68 / 4] = H;
+	}
 	swap_words(U_LT, lights_ea, n * 240);
 	swap_words(U_T, tab_ea, 0x9350);
 	{
@@ -4144,9 +4210,22 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			lut[i * 2 + 1] = std::pow(s, p16c);
 		}
 	}
-	if (!xs)
+	if (!xs && !host_scaled)
 	{
 		std::memcpy(dst + U_M, vm::get_super_ptr<u8>(mk_ea), px);
+	}
+	else if (!xs)
+	{
+		// vanillad1: X467.2 p28 (b): the guest's 8-bit buffer (pitch w) to the host size, nearest (vkCmdBlitImage's sample points)
+		const u8* mk = vm::get_super_ptr<u8>(mk_ea);
+		for (u32 y = 0; y < H; y++)
+		{
+			const u32 gy = std::min<u32>(h - 1, static_cast<u32>((2ull * y + 1) * h / (2ull * H)));
+			for (u32 x = 0; x < W; x++)
+			{
+				dst[U_M + y * W + x] = mk[gy * w + std::min<u32>(w - 1, static_cast<u32>((2ull * x + 1) * w / (2ull * W)))];
+			}
+		}
 	}
 	up.unmap();
 	if (up.is_dirty())
@@ -4167,8 +4246,8 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 		auto* gather = vk::get_compute_task<vk::cs_vd1_gbuf_byte>();
 		gather->m_buf = sb;
 		gather->m_len = total;
-		gather->m_pc = { O_X / 4, O_M / 4, px / 4, s_gb_shift };
-		gather->run(*cmd, (px / 4 + 255) / 256, 1, 1);
+		gather->m_pc = { O_X / 4, O_M / 4, (px + 3) / 4, s_gb_shift };   // vanillad1: X467.2 p28 (b): a partial last word at an odd host size
+		gather->run(*cmd, ((px + 3) / 4 + 255) / 256, 1, 1);
 		vk::insert_buffer_memory_barrier(*cmd, sb->value, O_M, px, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
 		c.gb_gpu++;
@@ -4186,11 +4265,29 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 	}
 
-	auto* job = vk::get_compute_task<vk::cs_vd1_gpu_light>();
-	job->m_buf = sb;
-	job->m_len = O_G0;
-	job->m_pc = { O_Z / 4, O_G / 4, O_M / 4, O_L / 4, O_P / 4, O_LT / 4, O_T / 4, n, 3u, O_LUT / 4, 0u, 0u };
-	job->run(*cmd, w / 32, h / 24, 1);
+	if (!host_scaled)
+	{
+		auto* job = vk::get_compute_task<vk::cs_vd1_gpu_light>();
+		job->m_buf = sb;
+		job->m_len = O_G0;
+		job->m_pc = { O_Z / 4, O_G / 4, O_M / 4, O_L / 4, O_P / 4, O_LT / 4, O_T / 4, n, 3u, O_LUT / 4, 0u, 0u };
+		job->run(*cmd, w / 32, h / 24, 1);
+	}
+	else
+	{
+		// vanillad1: X467.2 p28 (b): the scaled variant over ceil(W / 32) x ceil(H / 24) tiles (780 / 24 = 32.5 at 125 %), the rays
+		// at the host pixel centres: host pixel k's centre is guest (k + 0.5) / s and the SPU's pixel j sits at u = j / w, so
+		// u = (k + 0.5 - 0.5 s) / W, s = W / w (VD1GpuLight.glsl bias_x / bias_y)
+		auto* job = vk::get_compute_task<vk::cs_vd1_gpu_light_t<true>>();
+		const f32 bias_x = 0.5f - 0.5f * (static_cast<f32>(W) / static_cast<f32>(w)), bias_y = 0.5f - 0.5f * (static_cast<f32>(H) / static_cast<f32>(h));
+		job->m_buf = sb;
+		job->m_len = O_G0;
+		job->m_pc = { O_Z / 4, O_G / 4, O_M / 4, O_L / 4, O_P / 4, O_LT / 4, O_T / 4, n, 3u, O_LUT / 4, std::bit_cast<u32>(bias_x), std::bit_cast<u32>(bias_y) };
+		job->run(*cmd, (W + 31) / 32, (H + 23) / 24, 1);
+		c.sc_frames++;
+		c.sc_w = W;
+		c.sc_h = H;
+	}
 	vk::insert_buffer_memory_barrier(*cmd, sb->value, 0, total, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
