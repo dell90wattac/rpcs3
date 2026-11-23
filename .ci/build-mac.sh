@@ -76,7 +76,7 @@ cmake .. \
     -DUSE_SYSTEM_OPENCV=ON \
     -G Ninja
 
-ninja; build_status=$?;
+ninja -k 0; build_status=$?; # vanillad1: -k 0, every compile error in one run
 
 cd ..
 
