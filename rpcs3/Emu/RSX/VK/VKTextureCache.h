@@ -54,6 +54,10 @@ namespace vk
 		u64 m_vd1_copy_eid = 0;
 
 	public:
+		// vanillad1: X515.1 (C, D): the bytes of a bigger replacement image this section holds (0 = none), counted in
+		// rsx::vd1_texrepl::g_live_bytes until the section is destroyed
+		u64 m_vd1_repl_bytes = 0;
+
 		using baseclass::cached_texture_section;
 
 		void create(u16 w, u16 h, u16 depth, u16 mipmaps, vk::image* image, u32 rsx_pitch, bool managed, u32 gcm_format, bool pack_swap_bytes = false)
@@ -565,6 +569,14 @@ namespace vk
 
 		// Blocks some operations when exiting
 		atomic_t<bool> m_cache_is_exiting = false;
+
+		// vanillad1: X515.1 (C): the host image shape of the replacement create_new_texture is making (0 = the guest's shape)
+		struct vd1_host_shape_t
+		{
+			u16 w = 0, h = 0, mips = 0;
+			u64 bytes = 0;
+		};
+		vd1_host_shape_t m_vd1_host_shape{};
 
 		void clear();
 

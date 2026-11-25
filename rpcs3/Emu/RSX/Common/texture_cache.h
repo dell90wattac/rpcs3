@@ -11,6 +11,7 @@
 #include "texture_cache_helpers.h"
 #include "texture_cache_blit_helpers.h"
 #include "surface_utils.h" // vanillad1: RCB range (P13): vd1_rcb_covers
+#include "vd1_texrepl.h" // vanillad1: X515.1 texture replacement
 
 #include <unordered_map>
 #include <atomic> // vanillad1: X301 counters
@@ -4050,9 +4051,23 @@ namespace rsx
 			const address_range32 tex_range = address_range32::start_length(attributes.address, tex_size);
 			invalidate_range_impl_base(cmd, tex_range, invalidation_cause::read, {}, std::forward<Args>(extras)...);
 
+			// vanillad1: X515.1 texture replacement (A-D): log the bind's keys and arm its replacement for the upload below
+			const bool vd1_texrepl_on = vd1_texrepl::any_on();
+			if (vd1_texrepl_on)
+			{
+				vd1_texrepl::prepare(std::is_same_v<RsxTextureType, rsx::fragment_texture>, attributes.address, attributes.width, attributes.height,
+					attributes.mipmaps, attributes.pitch, attributes.gcm_format, attributes.swizzled, is_unnormalized, extended_dimension,
+					static_cast<u32>(tex.min_filter()), tex.min_lod(), tex.max_lod(), subresources_layout);
+			}
+
 			// Upload from CPU. Note that sRGB conversion is handled in the FS
 			auto uploaded = upload_image_from_cpu(cmd, tex_range, attributes.width, attributes.height, attributes.depth, tex.get_exact_mipmap_count(), attributes.pitch, attributes.gcm_format,
 				texture_upload_context::shader_read, subresources_layout, extended_dimension, attributes.swizzled);
+
+			if (vd1_texrepl_on)
+			{
+				vd1_texrepl::disarm();
+			}
 
 			return
 			{

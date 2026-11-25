@@ -457,6 +457,12 @@ namespace vk
 
 	void texture_cache::on_section_destroyed(cached_texture_section& tex)
 	{
+		if (tex.m_vd1_repl_bytes) // vanillad1: X515.1 (D): a bigger replacement image leaves the live count
+		{
+			rsx::vd1_texrepl::g_live_bytes -= tex.m_vd1_repl_bytes;
+			tex.m_vd1_repl_bytes = 0;
+		}
+
 		if (tex.is_managed() && tex.exists())
 		{
 			auto disposable = vk::disposable_t::make(new cached_image_reference_t(this, tex.get_texture()));
@@ -1153,6 +1159,12 @@ namespace vk
 			fmt::throw_exception("Unreachable");
 		}
 
+		// vanillad1: X515.1 (C): a bigger replacement keeps the section at the guest's shape; only its image takes the host's
+		const bool vd1_repl_on = rsx::vd1_texrepl::repl_on();
+		const u16 vd1_img_w = m_vd1_host_shape.w ? m_vd1_host_shape.w : width;
+		const u16 vd1_img_h = m_vd1_host_shape.w ? m_vd1_host_shape.h : height;
+		const u16 vd1_img_mips = m_vd1_host_shape.w ? m_vd1_host_shape.mips : mipmaps;
+
 		// Check what actually exists at that address
 		const rsx::image_section_attributes_t search_desc = { .gcm_format = gcm_format, .width = width, .height = height, .depth = section_depth, .mipmaps = mipmaps };
 		const bool allow_dirty = (context != rsx::texture_upload_context::framebuffer_storage);
@@ -1174,7 +1186,12 @@ namespace vk
 				reusable = (image && image->sharing_mode() == VK_SHARING_MODE_CONCURRENT);
 			}
 
-			if (!reusable || !image || region.get_image_type() != type || image->depth() != depth) // TODO
+			// vanillad1: X515.1 (C): with a pack loaded, an image whose shape is not the one wanted now (a replacement's, or the
+			// guest's after one) is not reused, so guest mips never land in the corner of a bigger image
+			const bool vd1_shape_differs = vd1_repl_on && image &&
+				(image->width() != vd1_img_w || image->height() != vd1_img_h || image->mipmaps() != vd1_img_mips);
+
+			if (!reusable || !image || region.get_image_type() != type || image->depth() != depth || vd1_shape_differs) // TODO
 			{
 				// Incompatible view/type
 				region.destroy();
@@ -1245,7 +1262,7 @@ namespace vk
 				}
 			}
 
-			if (auto found = find_cached_image(vk_format, width, height, depth, mipmaps, image_type, create_flags, usage_flags, sharing_mode))
+			if (auto found = find_cached_image(vk_format, vd1_img_w, vd1_img_h, depth, vd1_img_mips, image_type, create_flags, usage_flags, sharing_mode))
 			{
 				image = found.release();
 			}
@@ -1266,7 +1283,7 @@ namespace vk
 				image = new vk::viewable_image(*m_device,
 					m_memory_types.device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 					image_type, create_format,
-					width, height, depth, mipmaps, layer, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+					vd1_img_w, vd1_img_h, depth, vd1_img_mips, layer, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
 					VK_IMAGE_TILING_OPTIMAL, usage_flags, create_flags,
 					VMM_ALLOCATION_POOL_TEXTURE_CACHE, rsx::classify_format(gcm_format));
 			}
@@ -1276,6 +1293,18 @@ namespace vk
 			region.set_gcm_format(gcm_format);
 			region.set_image_type(type);
 			region.create(width, height, section_depth, mipmaps, image, pitch, true, gcm_format);
+
+			// vanillad1: X515.1 (D): a bigger replacement image joins the live count
+			if (region.m_vd1_repl_bytes)
+			{
+				rsx::vd1_texrepl::g_live_bytes -= region.m_vd1_repl_bytes;
+				region.m_vd1_repl_bytes = 0;
+			}
+			if (m_vd1_host_shape.w && m_vd1_host_shape.bytes)
+			{
+				region.m_vd1_repl_bytes = m_vd1_host_shape.bytes;
+				rsx::vd1_texrepl::g_live_bytes += m_vd1_host_shape.bytes;
+			}
 		}
 
 		region.set_view_flags(swizzle_flags);
@@ -1364,8 +1393,37 @@ namespace vk
 			}
 		}
 
+		// vanillad1: X515.1 (B, C): the replacement texture_cache.h upload_texture prepared for this bind, if any
+		rsx::vd1_texrepl::plan_t* vd1_plan = nullptr;
+		if (context == rsx::texture_upload_context::shader_read && type == rsx::texture_dimension_extended::texture_dimension_2d &&
+			rsx::vd1_texrepl::repl_on())
+		{
+			vd1_plan = rsx::vd1_texrepl::take(rsx_range.start, gcm_format, width, height, mipmaps);
+			if (vd1_plan && vd1_plan->shift)
+			{
+				m_vd1_host_shape = { vd1_plan->w, vd1_plan->h, vd1_plan->mips, vd1_plan->image_bytes };
+			}
+		}
+
 		auto section = create_new_texture(cmd, rsx_range, width, height, depth, mipmaps, pitch, gcm_format, context, type, swizzled,
 			rsx::component_order::default_, create_flags);
+		m_vd1_host_shape = {};
+
+		// vanillad1: X515.1 (C): the range is protected now; the guest bytes must still have the key the replacement was
+		// picked by. If not: a same-size swap uploads the guest's bytes as stock; a bigger image is uploaded and its section
+		// dropped once the draw's textures are bound (VKDraw.cpp load_texture_env)
+		if (vd1_plan && !rsx::vd1_texrepl::recheck(*vd1_plan, subresource_layout))
+		{
+			if (vd1_plan->shift)
+			{
+				vd1_plan->stale_start = rsx_range.start;
+				vd1_plan->stale_length = rsx_range.length();
+			}
+			else
+			{
+				vd1_plan = nullptr;
+			}
+		}
 
 		auto image = section->get_raw_texture();
 		image->set_debug_name(fmt::format("Raw Texture @0x%x", rsx_range.start));
@@ -1415,8 +1473,16 @@ namespace vk
 		}
 
 		const u16 layer_count = (type == rsx::texture_dimension_extended::texture_dimension_cubemap) ? 6 : 1;
-		vk::upload_image(cmd, image, *p_subresource_layout, gcm_format, input_swizzled, layer_count, image->aspect(),
-			*m_texture_upload_heap, heap_align, upload_command_flags);
+		if (vd1_plan) // vanillad1: X515.1 (B, C): the pack's bytes, host memory, every mip of the image
+		{
+			vk::upload_image(cmd, image, vd1_plan->layout, gcm_format, false, 1, image->aspect(),
+				*m_texture_upload_heap, upload_heap_align_default, upload_command_flags | source_is_userptr);
+		}
+		else
+		{
+			vk::upload_image(cmd, image, *p_subresource_layout, gcm_format, input_swizzled, layer_count, image->aspect(),
+				*m_texture_upload_heap, heap_align, upload_command_flags);
+		}
 
 		vk::leave_uninterruptible();
 

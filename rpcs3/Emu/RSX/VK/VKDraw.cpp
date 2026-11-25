@@ -34,6 +34,34 @@ namespace
 
 	bool s_vd1_af_last_depth = false;
 
+	// vanillad1: X515.1 (C): per fragment unit, the LOD shift its sampler was built for
+	std::array<u8, rsx::limits::fragment_textures_count> s_vd1_texrepl_shift{};
+
+	// vanillad1: X515.1 (C): s = log2(image width / bind width) for a bigger texture replacement (a 2D DXT shader_read image
+	// wider than its bind, only with VANILLAD1_TEXREPL's pack loaded; such an image is never made otherwise), else 0
+	u8 vd1_texrepl_lod_shift(const vk::texture_cache::sampled_image_descriptor& desc, const rsx::fragment_texture& tex)
+	{
+		if (!desc.image_handle || desc.upload_context != rsx::texture_upload_context::shader_read ||
+			desc.image_type != rsx::texture_dimension_extended::texture_dimension_2d || !rsx::vd1_texrepl::repl_on())
+		{
+			return 0;
+		}
+
+		if (!rsx::vd1_texrepl::block_bytes(tex.format() & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN)))
+		{
+			return 0;
+		}
+
+		const u32 image_w = desc.image_handle->image()->width();
+		const u32 bind_w = tex.width();
+		if (!bind_w || image_w <= bind_w || (image_w % bind_w) != 0)
+		{
+			return 0;
+		}
+
+		return static_cast<u8>(std::countr_zero(image_w / bind_w));
+	}
+
 	// vanillad1: X467.2 p28 (e): VANILLAD1_SAMPLE_NEAREST=<lo>-<hi>[,...] (hex, hi exclusive; read once, logged; unset / 0 = as
 	// before). At a Resolution Scale != 100 a texture whose guest address lies in a range is sampled NEAREST. Destiny's
 	// characters read the diffuse pair buffer (0x44813A80: two FP16 halves packed in each RGBA8 texel) at the guest pixel grid:
@@ -527,6 +555,11 @@ void VKGSRender::load_texture_env()
 			check_for_cyclic_refs |= true;
 		}
 
+		// vanillad1: X515.1 (C): a bigger replacement image needs its own LOD clamps; a change rebuilds the sampler
+		const u8 vd1_lod_shift = vd1_texrepl_lod_shift(*sampler_state, tex);
+		const bool vd1_shift_changed = vd1_lod_shift != s_vd1_texrepl_shift[i];
+		s_vd1_texrepl_shift[i] = vd1_lod_shift;
+
 		if (!is_sampler_dirty)
 		{
 			if (sampler_state->format_class != previous_format_class)
@@ -535,7 +568,7 @@ void VKGSRender::load_texture_env()
 				m_graphics_state |= rsx::fragment_program_state_dirty;
 			}
 
-			if (sampler_state->format_ex)
+			if (sampler_state->format_ex && !vd1_shift_changed)
 			{
 				// Nothing to change, use cached sampler
 				continue;
@@ -719,6 +752,25 @@ void VKGSRender::load_texture_env()
 			}
 		}
 
+		// vanillad1: X515.1 (C): the image is 2^s times the bind. The host's own derivatives already pick level k + s where the
+		// guest picked k, so the clamps move by s: max always, min only when the guest set one; the bias never. A guest sampler
+		// without mips (or a mip-less min filter) would minify the bigger level 0 with nothing below it: it gets the top s + 1
+		// levels and a linear mip mode instead. After the AF test above, which reads the guest's values.
+		if (vd1_lod_shift)
+		{
+			const f32 host_last = static_cast<f32>(sampler_state->image_handle->image()->mipmaps()) - 1.f;
+			const bool guest_mips = min_filter.sample_mipmaps && mipmap_count > 1;
+			max_lod = std::min(max_lod + vd1_lod_shift, host_last);
+			if (min_lod > 0.f)
+			{
+				min_lod = std::min(min_lod + vd1_lod_shift, host_last);
+			}
+			if (!guest_mips && min_filter.filter == VK_FILTER_LINEAR)
+			{
+				min_filter.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+			}
+		}
+
 		if (fs_sampler_handles[i] &&
 			fs_sampler_handles[i]->matches(wrap_s, wrap_t, wrap_r, false, lod_bias, vd1_af_level, min_lod, max_lod,
 				min_filter.filter, mag_filter, min_filter.mipmap_mode, border_color, compare_enabled, depth_compare_mode))
@@ -822,6 +874,14 @@ void VKGSRender::load_texture_env()
 	}
 
 	m_samplers_dirty.store(false);
+
+	// vanillad1: X515.1 (C): a bigger replacement whose guest bytes changed before the protect: this draw shows it once, then
+	// its section goes as after a CPU write and every unit re-resolves at the next draw
+	if (u32 vd1_start = 0, vd1_length = 0; rsx::vd1_texrepl::take_stale(vd1_start, vd1_length))
+	{
+		m_texture_cache.invalidate_range(*m_current_command_buffer, utils::address_range32::start_length(vd1_start, vd1_length), rsx::invalidation_cause::write);
+		m_samplers_dirty.store(true);
+	}
 
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
