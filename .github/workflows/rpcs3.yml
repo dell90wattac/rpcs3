@@ -335,6 +335,10 @@ jobs:
             echo "$key=$val" >> "${{ github.env }}"
           done < .ci/ci-vars.env
 
+      - name: Fix openal-soft for MSVC 14.52 (vanillad1)
+        shell: bash
+        run: python .ci/fix-openal-msvc.py
+
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@main
 
