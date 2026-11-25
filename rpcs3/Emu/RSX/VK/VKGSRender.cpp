@@ -12,6 +12,7 @@
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
+#include "vd1_shadow_scaled.h" // vanillad1: X515.2
 
 #include "vkutils/buffer_object.h"
 #include "vkutils/scratch.h"
@@ -2686,7 +2687,7 @@ void VKGSRender::load_program_env()
 	const bool update_fragment_constants = !!(m_graphics_state & rsx::pipeline_state::fragment_constants_dirty);
 	const bool update_vertex_env = !!(m_graphics_state & rsx::pipeline_state::vertex_state_dirty);
 	const bool update_fragment_env = !!(m_graphics_state & rsx::pipeline_state::fragment_state_dirty);
-	const bool update_fragment_texture_env = !!(m_graphics_state & rsx::pipeline_state::fragment_texture_state_dirty);
+	bool update_fragment_texture_env = !!(m_graphics_state & rsx::pipeline_state::fragment_texture_state_dirty); // vanillad1: X515.2 may set it
 	const bool update_instruction_buffers = (!!m_interpreter_state && is_interpreter);
 	const bool update_raster_env = (ctx->polygon_stipple_enabled() && !!(m_graphics_state & rsx::pipeline_state::polygon_stipple_pattern_dirty));
 	const bool update_instancing_data = ctx->current_draw_clause.is_trivial_instanced_draw;
@@ -2772,6 +2773,11 @@ void VKGSRender::load_program_env()
 			m_prog_buffer->fill_fragment_constants_buffer({ reinterpret_cast<float*>(buf), fragment_constants_size },
 				*ensure(m_fragment_prog), current_fragment_program, true);
 
+			if (vk::vd1_shadow::on()) // vanillad1: X515.2: a scaled shadow depth's texel constant at the host size
+			{
+				vk::vd1_shadow::patch_constants(reinterpret_cast<f32*>(buf), fragment_constants_size / sizeof(f32), current_fp_metadata.referenced_textures_mask);
+			}
+
 			m_fragment_constants_ring_info.unmap();
 
 			m_fragment_constants_buffer_info = m_fragment_constants_ring_info.window<16>(m_fragment_constants_dynamic_offset, fragment_constants_size, gpu_limits.maxUniformBufferRange);
@@ -2789,6 +2795,12 @@ void VKGSRender::load_program_env()
 
 		m_fragment_env_buffer_info = m_fragment_env_ring_info.window<32>(m_fragment_env_dynamic_offset, 32, gpu_limits.maxUniformBufferRange);
 		m_fragment_env_dynamic_offset -= m_fragment_env_buffer_info.offset;
+	}
+
+	// vanillad1: X515.2: a unit whose texel constant moved to the host size reads its UN coordinates at the host size too
+	if (vk::vd1_shadow::on() && vk::vd1_shadow::apply_scale(current_fragment_program.texture_params, current_fp_metadata.referenced_textures_mask))
+	{
+		update_fragment_texture_env = true;
 	}
 
 	if (update_fragment_texture_env)

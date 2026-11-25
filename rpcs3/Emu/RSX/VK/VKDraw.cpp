@@ -6,6 +6,7 @@
 
 #include "VKAsyncScheduler.h"
 #include "VKGSRender.h"
+#include "vd1_shadow_scaled.h" // vanillad1: X515.2
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
 #include <vulkan/vulkan_core.h>
@@ -507,6 +508,7 @@ void VKGSRender::load_texture_env()
 		if (!tex.enabled())
 		{
 			*sampler_state = {};
+			vk::vd1_shadow::clear(i); // vanillad1: X515.2
 			continue;
 		}
 
@@ -543,6 +545,13 @@ void VKGSRender::load_texture_env()
 				slot.next = (slot.next + 1) % ::size32(slot.entries);
 				slot.used = std::max(slot.used, slot.next == 0 ? ::size32(slot.entries) : slot.next);
 			}
+		}
+
+		// vanillad1: X515.2: a resolution-scaled shadow depth read with UN coordinates is noted here; its texel constant and
+		// coordinates move to the host size in load_program_env. A change re-reads the texture parameters and refills the constants
+		if (vk::vd1_shadow::on() && vk::vd1_shadow::note(i, *sampler_state, tex))
+		{
+			m_graphics_state |= rsx::pipeline_state::fragment_program_state_dirty | rsx::pipeline_state::fragment_constants_dirty;
 		}
 
 		if (!sampler_state->validate())
