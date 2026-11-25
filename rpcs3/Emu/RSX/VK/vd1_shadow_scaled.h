@@ -74,14 +74,14 @@ namespace vk::vd1_shadow
 		{
 			const u32 gw = tex.width(), gh = tex.height();
 			const u32 hw = desc.image_handle->image()->width(), hh = desc.image_handle->image()->height();
-			const auto near = [pct](u32 host, u32 guest)
+			const auto vd1_close = [pct](u32 host, u32 guest)
 			{
 				const s64 want = static_cast<s64>(guest) * pct / 100;
 				return std::abs(static_cast<s64>(host) - want) <= 2;
 			};
 
 			// The whole surface at the configured scale; anything else (a bigger reused image, a copy) stays as before
-			if (gw && gh && hw != gw && near(hw, gw) && near(hh, gh))
+			if (gw && gh && hw != gw && vd1_close(hw, gw) && vd1_close(hh, gh))
 			{
 				u.guest_w = gw;
 				u.guest_h = gh;
