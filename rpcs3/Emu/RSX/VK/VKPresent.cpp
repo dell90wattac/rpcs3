@@ -11,6 +11,7 @@
 #include "upscalers/fsr_pass.h"
 #include "upscalers/nearest_pass.hpp"
 #include "upscalers/smaa_pass.h" // vanillad1: SMAA (X467.4)
+#include "upscalers/vd1_area_shrink.h" // vanillad1: X515.3
 #include "util/asm.hpp"
 #include "util/video_provider.h"
 
@@ -705,6 +706,11 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
 		}
 
+		if (vk::vd1_area_shrink_on()) // vanillad1: X515.3: 0 / unset = the upscaler alone, as before
+		{
+			m_upscaler = std::make_unique<vk::vd1_area_shrink_pass>(std::move(m_upscaler));
+		}
+
 		if (vk::vd1_smaa_level()) // vanillad1: SMAA (X467.4): 0 / unset = the upscaler alone, as before
 		{
 			m_upscaler = std::make_unique<vk::smaa_upscale_pass>(std::move(m_upscaler));
@@ -718,6 +724,32 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		if (auto smaa = dynamic_cast<vk::smaa_upscale_pass*>(m_upscaler.get()))
 		{
 			image_to_flip = smaa->antialias(*m_current_command_buffer, image_to_flip);
+		}
+	}
+
+	// vanillad1: X515.3: VANILLAD1_AREA_SHRINK: a frame bigger than the output area is shrunk to exactly that area by an
+	// area average, after SMAA and before the screenshot copy and the output pass (which then copy it 1:1). Not for 3D.
+	if (image_to_flip && !image_to_flip2 && !avconfig.stereo_enabled && vk::vd1_area_shrink_on())
+	{
+		vk::upscaler* vd1_chain = m_upscaler.get();
+		if (auto smaa = dynamic_cast<vk::smaa_upscale_pass*>(vd1_chain))
+		{
+			vd1_chain = smaa->inner();
+		}
+
+		const u32 out_w = static_cast<u32>(aspect_ratio.width());
+		const u32 out_h = static_cast<u32>(aspect_ratio.height());
+		auto area = dynamic_cast<vk::vd1_area_shrink_pass*>(vd1_chain);
+
+		if (area && out_w && out_h && out_w <= buffer_width && out_h <= buffer_height && (out_w < buffer_width || out_h < buffer_height))
+		{
+			if (auto shrunk = area->shrink(*m_current_command_buffer, image_to_flip, buffer_width, buffer_height, out_w, out_h);
+				shrunk != image_to_flip)
+			{
+				image_to_flip = shrunk;
+				buffer_width = out_w;
+				buffer_height = out_h;
+			}
 		}
 	}
 

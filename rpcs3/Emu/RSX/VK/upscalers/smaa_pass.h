@@ -78,6 +78,9 @@ namespace vk
 		explicit smaa_upscale_pass(std::unique_ptr<upscaler> inner);
 		~smaa_upscale_pass() override;
 
+		// vanillad1: X515.3: the wrapped upscaler (VKPresent.cpp finds the area shrink behind SMAA)
+		upscaler* inner() const { return m_inner.get(); }
+
 		// The anti-aliased copy of src (same size; B8G8R8A8 / R8G8B8A8 sources only), or src itself when SMAA can't run
 		vk::viewable_image* antialias(const vk::command_buffer& cmd, vk::viewable_image* src);
 
