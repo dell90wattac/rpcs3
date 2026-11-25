@@ -935,7 +935,9 @@ bool Emulator::BootRsxCapture(const std::string& path)
 	g_cfg.video.disable_on_disk_shader_cache.set(true);
 
 	vm::init();
-	vm::reserve_map(vm::main, 0, 0x1FFF0000, vm::page_64k_size);
+	// vanillad1: X515.4: the replay's main memory at 0x10000, as a game's (PPUModule.cpp); based at 0, the replay's first
+	// vm::alloc (its rsx_context) was placed at 0, which allocate_context reads as failure ("Capture Replay: context alloc failed")
+	vm::reserve_map(vm::main, 0x10000, 0x1FFF0000, vm::page_64k_size);
 	g_fxo->init(false);
 
 	// Initialize progress dialog
