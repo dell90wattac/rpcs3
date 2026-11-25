@@ -1,7 +1,5 @@
 #include "stdafx.h"
 #include "sys_rsx.h"
-#include <cstdlib>
-#include <cstring>
 
 #include "Emu/System.h"
 #include "Emu/system_config.h"
@@ -256,23 +254,7 @@ error_code sys_rsx_memory_allocate(cpu_thread& cpu, vm::ptr<u32> mem_handle, vm:
 
 	cpu.state += cpu_flag::wait;
 
-	u32 mem_size = static_cast<u32>(size);
-
-	// vanillad1: X467.1 VANILLAD1_GCM_LOCAL_FULL=1: the SDK's 249 MB request (0x0F900000) is granted the whole 256 MB block
-	// (the hardware's size; the 7 MB a real console's system keeps are not used by RPCS3). Destiny sizes its resource heap 0
-	// (the textures' top mips among them) from localSize - 0x01fa0000. Read once, logged; unset / 0 = as before.
-	static const bool s_vd1_local_full = []()
-	{
-		const char* env = std::getenv("VANILLAD1_GCM_LOCAL_FULL");
-		const bool on = env && *env && std::strcmp(env, "0") != 0;
-		if (on) sys_rsx.success("vanillad1: VANILLAD1_GCM_LOCAL_FULL=%s: a 0x0F900000 local memory request gets 0x10000000", env);
-		return on;
-	}();
-	if (s_vd1_local_full && mem_size == 0x0F900000)
-	{
-		mem_size = 0x10000000;
-		sys_rsx.success("vanillad1: gcm local full: local memory 0x%x granted (asked 0x%x)", mem_size, static_cast<u32>(size));
-	}
+	const u32 mem_size = static_cast<u32>(size);
 
 	if (vm::falloc(rsx::constants::local_mem_base, mem_size, vm::video))
 	{
