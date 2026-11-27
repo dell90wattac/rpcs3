@@ -9,6 +9,19 @@ namespace rsx
 {
 	namespace reports
 	{
+		// vanillad1: X515.9 p30: read once, logged once
+		u32 vd1_zpass_count()
+		{
+			static const u32 s_mode = []() -> u32
+			{
+				const char* env = std::getenv("VANILLAD1_ZPASS_COUNT");
+				const u32 v = (env && *env) ? static_cast<u32>(std::strtoul(env, nullptr, 0)) : 0;
+				if (v) rsx_log.notice("vanillad1: ZPASS reports carry the real pixel count (VANILLAD1_ZPASS_COUNT=%u: 1 lens flare proxies, 2 every report, 4 precise host queries)", v);
+				return v;
+			}();
+			return s_mode;
+		}
+
 		ZCULL_control::ZCULL_control()
 		{
 			for (auto& query : m_occlusion_query_data)
@@ -140,6 +153,9 @@ namespace rsx
 				m_current_task->owned = true;
 				end_occlusion_query(m_current_task);
 				m_pending_writes.push_back({});
+				// vanillad1: X515.9 p30: one draw of 48 elements = Destiny's lens flare proxy disc
+				m_pending_writes.back().vd1_real = (vd1_zpass_count() & 2) ||
+					((vd1_zpass_count() & 1) && m_current_task->num_draws == 1 && m_current_task->vd1_elems == 48);
 
 				m_current_task->active = false;
 				m_current_task->pending = true;
@@ -219,6 +235,7 @@ namespace rsx
 
 					m_current_task->data_type = 0;
 					m_current_task->num_draws = 0;
+					m_current_task->vd1_elems = 0;
 					m_current_task->result = 0;
 					m_current_task->active = true;
 					m_current_task->owned = false;
@@ -325,7 +342,7 @@ namespace rsx
 		{
 			if (m_current_task)
 			{
-				m_current_task->num_draws++;
+				if (!m_current_task->num_draws++) m_current_task->vd1_elems = rsx::method_registers.current_draw_clause.get_elements_count(); // vanillad1
 				m_current_task->sync_tag = m_timer++;
 			}
 		}
@@ -335,7 +352,7 @@ namespace rsx
 			m_sync_tag = std::max(m_sync_tag, payload.query->sync_tag);
 		}
 
-		void ZCULL_control::write(vm::addr_t sink, u64 timestamp, u32 type, u32 value)
+		void ZCULL_control::write(vm::addr_t sink, u64 timestamp, u32 type, u32 value, bool vd1_real)
 		{
 			ensure(sink);
 
@@ -351,7 +368,7 @@ namespace rsx
 			case CELL_GCM_ZPASS_PIXEL_CNT:
 				if (value)
 				{
-					value = (g_cfg.video.precise_zpass_count) ?
+					value = (g_cfg.video.precise_zpass_count || vd1_real) ?
 						scale_result(value) :
 						u16{ umax };
 				}
@@ -378,12 +395,12 @@ namespace rsx
 			// Reports are strongly ordered.
 			rsx::mm_flush_partial(writer->sync_tag);
 
-			write(writer->sink, timestamp, writer->type, value);
+			write(writer->sink, timestamp, writer->type, value, writer->vd1_real);
 			on_report_completed(writer->sink);
 
 			for (auto& addr : writer->sink_alias)
 			{
-				write(addr, timestamp, writer->type, value);
+				write(addr, timestamp, writer->type, value, writer->vd1_real);
 			}
 		}
 

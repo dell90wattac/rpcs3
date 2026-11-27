@@ -29,11 +29,16 @@ namespace rsx
 
 	namespace reports
 	{
+		// vanillad1: X515.9 p30: VANILLAD1_ZPASS_COUNT bits: 1 the real pixel count for lens flare proxies,
+		// 2 for every report, 4 precise host queries; unset / 0 = as before (65535 for any hit)
+		u32 vd1_zpass_count();
+
 		struct occlusion_query_info
 		{
 			u32 driver_handle;
 			u32 result;
 			u32 num_draws;
+			u32 vd1_elems; // vanillad1: elements of the query's first draw
 			u32 data_type;
 			u64 sync_tag;
 			u64 timestamp;
@@ -49,6 +54,7 @@ namespace rsx
 			u64 sync_tag;
 			occlusion_query_info* query;
 			queued_report_write* forwarder;
+			bool vd1_real = false; // vanillad1: this report carries the real count
 
 			vm::addr_t sink;                      // Memory location of the report
 			std::vector<vm::addr_t> sink_alias;   // Aliased memory addresses
@@ -145,7 +151,7 @@ namespace rsx
 			void free_query(occlusion_query_info* query);
 
 			// Write report to memory
-			void write(vm::addr_t sink, u64 timestamp, u32 type, u32 value);
+			void write(vm::addr_t sink, u64 timestamp, u32 type, u32 value, bool vd1_real = false);
 			void write(queued_report_write* writer, u64 timestamp, u32 value);
 
 			// Retire operation

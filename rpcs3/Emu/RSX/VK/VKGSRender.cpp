@@ -507,7 +507,7 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	for (u32 n = 0; n < rsx::reports::occlusion_query_count; ++n)
 		m_occlusion_query_data[n].driver_handle = n;
 
-	if (g_cfg.video.precise_zpass_count)
+	if (g_cfg.video.precise_zpass_count || (rsx::reports::vd1_zpass_count() & 4)) // vanillad1: X515.9
 	{
 		m_occlusion_query_manager->set_control_flags(VK_QUERY_CONTROL_PRECISE_BIT, 0);
 	}
@@ -3549,7 +3549,7 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* 
 		for (const auto occlusion_id : data.indices)
 		{
 			query->result += m_occlusion_query_manager->get_query_result(occlusion_id);
-			if (query->result && !g_cfg.video.precise_zpass_count)
+			if (query->result && !g_cfg.video.precise_zpass_count && !rsx::reports::vd1_zpass_count()) // vanillad1: X515.9
 			{
 				// We only need one hit unless precise zcull is requested
 				break;

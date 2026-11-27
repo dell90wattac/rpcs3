@@ -627,6 +627,12 @@ namespace vk
 			enabled_features.occlusionQueryPrecise = VK_TRUE;
 		}
 
+		// vanillad1: X515.9 p30: VANILLAD1_ZPASS_COUNT bit 4 asks for precise host queries (no RSX header here)
+		if (const char* vd1_e = std::getenv("VANILLAD1_ZPASS_COUNT"); vd1_e && (std::strtoul(vd1_e, nullptr, 0) & 4))
+		{
+			enabled_features.occlusionQueryPrecise = VK_TRUE;
+		}
+
 		// enabled_features.shaderSampledImageArrayDynamicIndexing = TRUE;  // Unused currently but will be needed soon
 		enabled_features.shaderClipDistance = VK_TRUE;
 		// enabled_features.shaderCullDistance = VK_TRUE;  // Alt notation of clip distance
