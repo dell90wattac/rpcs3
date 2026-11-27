@@ -322,16 +322,25 @@ namespace vk
 
 		// vanillad1: passthrough deny range (L20.2.1): VANILLAD1_PT_DENY=<start>-<end> (hex) stages the
 		// blocks overlapping the range; passthrough stays on everywhere else
-		static const std::pair<u32, u32> s_pt_deny = []() -> std::pair<u32, u32>
+		// vanillad1: X515.11 p30: several ranges, comma separated (the first as before)
+		static const std::vector<std::pair<u32, u32>> s_pt_deny = []() -> std::vector<std::pair<u32, u32>>
 		{
+			std::vector<std::pair<u32, u32>> out;
 			const char* env = std::getenv("VANILLAD1_PT_DENY");
-			if (!env || !*env) return { 0, 0 };
-			char* rest = nullptr;
-			const u32 lo = static_cast<u32>(std::strtoul(env, &rest, 16));
-			const u32 hi = (rest && *rest == '-') ? static_cast<u32>(std::strtoul(rest + 1, nullptr, 16)) : 0;
-			if (hi <= lo) return { 0, 0 };
-			rsx_log.notice("vanillad1: no passthrough DMA for 0x%x-0x%x (VANILLAD1_PT_DENY)", lo, hi);
-			return { lo, hi };
+			while (env && *env)
+			{
+				char* rest = nullptr;
+				const u32 lo = static_cast<u32>(std::strtoul(env, &rest, 16));
+				char* rest2 = rest;
+				const u32 hi = (rest && *rest == '-') ? static_cast<u32>(std::strtoul(rest + 1, &rest2, 16)) : 0;
+				if (hi > lo)
+				{
+					rsx_log.notice("vanillad1: no passthrough DMA for 0x%x-0x%x (VANILLAD1_PT_DENY)", lo, hi);
+					out.emplace_back(lo, hi);
+				}
+				env = (rest2 && *rest2 == ',') ? rest2 + 1 : nullptr;
+			}
+			return out;
 		}();
 
 		bool allow_host_buffers = false;
@@ -349,11 +358,17 @@ namespace vk
 				allow_host_buffers = false;
 			}
 
-			if (allow_host_buffers && !s_dma_label_hint && s_pt_deny.second > s_pt_deny.first &&
-				base_address < s_pt_deny.second && u64{base_address} + expected_length > s_pt_deny.first)
+			if (allow_host_buffers && !s_dma_label_hint)
 			{
-				allow_host_buffers = false;
-				rsx_log.notice("vanillad1: staged DMA block 0x%x-0x%x (VANILLAD1_PT_DENY)", base_address, base_address + expected_length - 1);
+				for (const auto& vd1_r : s_pt_deny)
+				{
+					if (base_address < vd1_r.second && u64{base_address} + expected_length > vd1_r.first)
+					{
+						allow_host_buffers = false;
+						rsx_log.notice("vanillad1: staged DMA block 0x%x-0x%x (VANILLAD1_PT_DENY)", base_address, base_address + expected_length - 1);
+						break;
+					}
+				}
 			}
 
 			if (!allow_host_buffers)
