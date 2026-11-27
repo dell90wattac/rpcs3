@@ -295,6 +295,100 @@ namespace rsx
 	// vanillad1: RCB stock own (P13.3): the address a texture lookup (surface_store.h get_merged_texture_memory_region) is resolving, 0 outside one
 	inline thread_local u32 vd1_lookup_addr = 0;
 
+	// vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE=<lo>-<hi>[:<n>] (hex guest addresses, hi exclusive; n = textures logged per 10 s,
+	// decimal, default 60; read once, logged once; unset = as before): for a texture a draw samples whose address is in the range,
+	// the log says how the texture cache satisfied it: texture_cache.h upload_texture logs the result (vd1_tex_trace_result) and,
+	// while it resolves the texture, surface_store.h get_merged_texture_memory_region logs every overlapping surface it considered.
+	// Every line starts "vanillad1: tex trace:". One texture = one unit of the budget (its result line and the lines under it).
+	struct vd1_tex_trace_cfg
+	{
+		u32 lo = 0;
+		u32 hi = 0;
+		u32 budget = 60;
+	};
+
+	inline const vd1_tex_trace_cfg& vd1_tex_trace_config()
+	{
+		static const vd1_tex_trace_cfg s_cfg = []()
+		{
+			vd1_tex_trace_cfg out{};
+			const char* env = std::getenv("VANILLAD1_TEX_TRACE");
+			if (!env || !*env)
+			{
+				return out;
+			}
+
+			char* rest = nullptr;
+			const u32 lo = static_cast<u32>(std::strtoul(env, &rest, 16));
+			if (!rest || *rest != '-')
+			{
+				rsx_log.error("vanillad1: VANILLAD1_TEX_TRACE=%s not understood; off", env);
+				return out;
+			}
+
+			const u32 hi = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+			u32 budget = 60;
+			if (rest && *rest == ':')
+			{
+				budget = static_cast<u32>(std::strtoul(rest + 1, nullptr, 10));
+			}
+
+			if (hi <= lo || !budget)
+			{
+				rsx_log.error("vanillad1: VANILLAD1_TEX_TRACE=%s not understood; off", env);
+				return out;
+			}
+
+			out.lo = lo;
+			out.hi = hi;
+			out.budget = budget;
+			rsx_log.notice("vanillad1: tex trace: sampled textures in 0x%x-0x%x are logged, %u a 10 s (VANILLAD1_TEX_TRACE)", lo, hi, budget);
+			return out;
+		}();
+
+		return s_cfg;
+	}
+
+	inline bool vd1_tex_trace_covers(u32 address)
+	{
+		const auto& cfg = vd1_tex_trace_config();
+		return cfg.hi && address >= cfg.lo && address < cfg.hi;
+	}
+
+	// vanillad1: X515.10 p30: one traced texture against the 10 s budget (RSX thread only); what went over is counted and logged once a window
+	inline bool vd1_tex_trace_take()
+	{
+		static s64 s_window = 0;
+		static u32 s_used = 0;
+		static u32 s_over = 0;
+
+		const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (!s_window || now - s_window >= 10000)
+		{
+			if (s_over)
+			{
+				rsx_log.notice("vanillad1: tex trace: %u more textures in the last window were over the budget", s_over);
+			}
+
+			s_window = now;
+			s_used = 0;
+			s_over = 0;
+		}
+
+		if (s_used >= vd1_tex_trace_config().budget)
+		{
+			s_over++;
+			return false;
+		}
+
+		s_used++;
+		return true;
+	}
+
+	// vanillad1: X515.10 p30: true while upload_texture resolves a traced texture (the surface lookup under it logs its sections)
+	inline thread_local bool vd1_tex_trace_on = false;
+
 	// vanillad1: RCB range (P13): set while the texture cache copies a surface out to guest memory (VKTextureCache.h
 	// copy_texture, the Write Color Buffers readback): that read must not reload a surface in
 	// VANILLAD1_RCB_RANGE (the SPUs have not lit the fresh blit yet).

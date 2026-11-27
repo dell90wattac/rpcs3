@@ -962,6 +962,60 @@ namespace rsx
 			capture::capture_draw_memory(this);
 		}
 
+		// vanillad1: X515.10 p30: VANILLAD1_DRAW_SYNC=<lo>-<hi> (hex guest addresses, hi exclusive; read once, logged once; unset = as
+		// before): after each draw, one byte of every page of each enabled fragment texture that starts in the range is read from guest
+		// memory (the pages inside the range only), as a frame capture does (rsx_capture.cpp capture_draw_memory): a Write Color Buffers
+		// surface there is written back to guest memory at once. A probe (it costs readbacks), not a fix.
+		static const std::pair<u32, u32> s_vd1_draw_sync = []() -> std::pair<u32, u32>
+		{
+			const char* env = std::getenv("VANILLAD1_DRAW_SYNC");
+			if (!env || !*env)
+			{
+				return { 0u, 0u };
+			}
+
+			char* rest = nullptr;
+			const u32 lo = static_cast<u32>(std::strtoul(env, &rest, 16));
+			const u32 hi = (rest && *rest == '-') ? static_cast<u32>(std::strtoul(rest + 1, nullptr, 16)) : 0u;
+			if (hi <= lo)
+			{
+				rsx_log.error("vanillad1: VANILLAD1_DRAW_SYNC=%s not understood; off", env);
+				return { 0u, 0u };
+			}
+
+			rsx_log.notice("vanillad1: draw sync: sampled textures in 0x%x-0x%x are read from guest memory after each draw (VANILLAD1_DRAW_SYNC)", lo, hi);
+			return { lo, hi };
+		}();
+
+		if (s_vd1_draw_sync.second && !capture_current_frame) [[unlikely]]
+		{
+			static volatile u32 s_vd1_draw_sync_sink = 0;
+			u32 acc = 0;
+
+			for (const auto& tex : method_registers.fragment_textures)
+			{
+				if (!tex.enabled())
+				{
+					continue;
+				}
+
+				const u32 addr = rsx::get_address(tex.offset(), tex.location());
+				if (addr < s_vd1_draw_sync.first || addr >= s_vd1_draw_sync.second)
+				{
+					continue;
+				}
+
+				const u64 length = u64{tex.pitch()} * tex.height();
+				const u64 last = std::min<u64>(u64{addr} + length, u64{s_vd1_draw_sync.second});
+				for (u64 page = addr; page < last; page += 4096)
+				{
+					acc += *static_cast<const volatile u8*>(vm::base(static_cast<u32>(page)));
+				}
+			}
+
+			s_vd1_draw_sync_sink = acc;
+		}
+
 		in_begin_end = false;
 		m_frame_stats.draw_calls++;
 

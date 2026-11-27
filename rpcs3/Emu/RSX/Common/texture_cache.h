@@ -3786,6 +3786,115 @@ namespace rsx
 			desc.cache_range = utils::address_range32::start_length(attributes.address, mipchain_length);
 		}
 
+		// vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE: the name of a deferred request, for the result line
+		static const char* vd1_tex_trace_op(deferred_request_command op)
+		{
+			switch (op)
+			{
+			case deferred_request_command::copy_image_static: return "copy of one section (cached)";
+			case deferred_request_command::copy_image_dynamic: return "copy of one section (not cached)";
+			case deferred_request_command::cubemap_gather: return "cubemap gather";
+			case deferred_request_command::cubemap_unwrap: return "cubemap unwrap";
+			case deferred_request_command::atlas_gather: return "atlas merged from sections";
+			case deferred_request_command::_3d_gather: return "3D gather";
+			case deferred_request_command::_3d_unwrap: return "3D unwrap";
+			case deferred_request_command::mipmap_gather: return "mipmap gather";
+			case deferred_request_command::blit_image_static: return "scaled copy of one section";
+			case deferred_request_command::linear_reinterpret: return "linear reinterpret";
+			default: return "nothing";
+			}
+		}
+
+		// vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE: how upload_texture satisfied one sampled texture in the range: the path, the
+		// texture coordinate transform, the surface or the copy regions behind it, and the bound colour target (which pass this is)
+		template <typename SurfaceStoreType>
+		void vd1_tex_trace_result(const image_section_attributes_t& attr, const sampled_image_descriptor& result, SurfaceStoreType& rtts)
+		{
+			u32 rt_addr = 0, rt_w = 0, rt_h = 0;
+			rtts.vd1_bound_color_target(rt_addr, rt_w, rt_h);
+
+			const bool is_view = result.image_handle ? true : false;
+			const bool is_deferred = !is_view && result.external_subresource_desc.op != deferred_request_command::nop;
+			const bool is_surface = result.upload_context == texture_upload_context::framebuffer_storage;
+
+			const char* path = "upload from guest memory";
+			s32 scale_x = 0, scale_y = 0, bias_x = 0, bias_y = 0;
+			u32 clamped = 0;
+			if (is_view)
+			{
+				if (is_surface)
+				{
+					path = result.is_cyclic_reference ? "surface used directly (bound now, cyclic)" :
+						result.texcoord_xform.clamp ? "surface with a clip" : "surface used directly";
+				}
+				else
+				{
+					path = result.texcoord_xform.clamp ? "cached section with a clip" : "cached section";
+				}
+			}
+			else if (is_deferred)
+			{
+				path = vd1_tex_trace_op(result.external_subresource_desc.op);
+			}
+
+			if (is_view || is_deferred)
+			{
+				scale_x = static_cast<s32>(result.texcoord_xform.scale[0] * 10000.f);
+				scale_y = static_cast<s32>(result.texcoord_xform.scale[1] * 10000.f);
+				bias_x = static_cast<s32>(result.texcoord_xform.bias[0] * 10000.f);
+				bias_y = static_cast<s32>(result.texcoord_xform.bias[1] * 10000.f);
+				clamped = result.texcoord_xform.clamp ? 1u : 0u;
+			}
+
+			rsx_log.notice("vanillad1: tex trace: 0x%x %ux%u fmt 0x%x pitch %u: %s | context %u ref 0x%x scale %d,%d bias %d,%d /10000 clamp %u sections %u | target 0x%x %ux%u",
+				attr.address, static_cast<u32>(attr.width), static_cast<u32>(attr.height), attr.gcm_format, attr.pitch, path,
+				static_cast<u32>(result.upload_context), result.ref_address, scale_x, scale_y, bias_x, bias_y, clamped,
+				static_cast<u32>(result.external_subresource_desc.sections_to_copy.size()), rt_addr, rt_w, rt_h);
+
+			if (is_view && is_surface)
+			{
+				if (auto surface = rtts.get_surface_at(result.ref_address))
+				{
+					rsx_log.notice("vanillad1: tex trace:   the surface: 0x%x %ux%u pitch %u bpp %u %s tag %llu memory %s",
+						result.ref_address, surface->get_surface_width(), surface->get_surface_height(), surface->get_rsx_pitch(),
+						static_cast<u32>(surface->get_bpp()), surface->is_depth_surface() ? "depth" : "colour", surface->last_use_tag,
+						surface->test() ? "same" : "changed");
+				}
+			}
+
+			for (const auto& section : result.external_subresource_desc.sections_to_copy)
+			{
+				u32 guest_w = 0, guest_h = 0, guest_pitch = 0, guest_bpp = 0;
+				u64 tag = 0;
+				const char* kind = "not a surface";
+				const char* memory = "-";
+				if (auto surface = rtts.get_surface_at(section.base_addr))
+				{
+					guest_w = surface->get_surface_width();
+					guest_h = surface->get_surface_height();
+					guest_pitch = surface->get_rsx_pitch();
+					guest_bpp = surface->get_bpp();
+					tag = surface->last_use_tag;
+					kind = surface->is_depth_surface() ? "depth" : "colour";
+					memory = surface->test() ? "same" : "changed";
+				}
+
+				u32 image_w = 0, image_h = 0;
+				if (section.src)
+				{
+					image_w = static_cast<u32>(section.src->width());
+					image_h = static_cast<u32>(section.src->height());
+				}
+
+				rsx_log.notice("vanillad1: tex trace:   copy from 0x%x image %ux%u: src %u,%u %ux%u -> dst %u,%u %ux%u slice %u level %u xform %u | guest %ux%u pitch %u bpp %u %s tag %llu memory %s",
+					section.base_addr, image_w, image_h,
+					static_cast<u32>(section.src_x), static_cast<u32>(section.src_y), static_cast<u32>(section.src_w), static_cast<u32>(section.src_h),
+					static_cast<u32>(section.dst_x), static_cast<u32>(section.dst_y), static_cast<u32>(section.dst_w), static_cast<u32>(section.dst_h),
+					static_cast<u32>(section.dst_z), static_cast<u32>(section.level), static_cast<u32>(section.xform),
+					guest_w, guest_h, guest_pitch, guest_bpp, kind, tag, memory);
+			}
+		}
+
 		template <typename RsxTextureType, typename surface_store_type, typename ...Args>
 		sampled_image_descriptor upload_texture(commandbuffer_type& cmd, const RsxTextureType& tex, surface_store_type& m_rtts, Args&&... extras)
 		{
@@ -3900,9 +4009,19 @@ namespace rsx
 			vd1_wait_cache_mutex(false);
 			reader_lock lock(m_cache_mutex);
 
+			// vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE: a texture in the range (within the 10 s budget) has its lookup and its result logged
+			const bool vd1_tt = rsx::vd1_tex_trace_covers(attributes.address) && rsx::vd1_tex_trace_take();
+			rsx::vd1_tex_trace_on = vd1_tt;
+
 			auto result = fast_texture_search(cmd, attributes, scale, tex.decoded_remap(),
 				options, lookup_range, extended_dimension, m_rtts,
 				std::forward<Args>(extras)...);
+
+			rsx::vd1_tex_trace_on = false;
+			if (vd1_tt) [[unlikely]]
+			{
+				vd1_tex_trace_result(attributes, result, m_rtts);
+			}
 
 			if (result.validate())
 			{

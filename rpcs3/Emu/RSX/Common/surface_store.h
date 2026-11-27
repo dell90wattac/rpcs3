@@ -1307,6 +1307,33 @@ namespace rsx
 			return (m_bound_depth_stencil.first == address);
 		}
 
+		// vanillad1: X515.10 p30: the first bound colour target (else the depth target): its address and guest size, to tell the
+		// VANILLAD1_TEX_TRACE lines apart by pass
+		void vd1_bound_color_target(u32& address, u32& width, u32& height)
+		{
+			address = 0;
+			width = 0;
+			height = 0;
+
+			for (const auto& i : m_bound_render_target_ids)
+			{
+				if (auto surface = m_bound_render_targets[i].second)
+				{
+					address = m_bound_render_targets[i].first;
+					width = surface->get_surface_width();
+					height = surface->get_surface_height();
+					return;
+				}
+			}
+
+			if (auto surface = m_bound_depth_stencil.second)
+			{
+				address = m_bound_depth_stencil.first;
+				width = surface->get_surface_width();
+				height = surface->get_surface_height();
+			}
+		}
+
 		template <typename commandbuffer_type>
 		rsx::simple_array<surface_overlap_info> get_merged_texture_memory_region(commandbuffer_type& cmd, u32 texaddr, u32 required_width, u32 required_height, u32 required_pitch, u8 required_bpp, rsx::surface_access access)
 		{
@@ -1332,6 +1359,18 @@ namespace rsx
 				~vd1_lookup_scope() { vd1_lookup_addr = 0; }
 			} vd1_scope(texaddr);
 
+			// vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE: upload_texture is resolving a texture in the traced range; this lookup and
+			// every surface it considers are logged (sections bottom to top: the last one is drawn over the others)
+			const bool vd1_tt = vd1_tex_trace_on;
+			if (vd1_tt) [[unlikely]]
+			{
+				u32 vd1_rt_addr = 0, vd1_rt_w = 0, vd1_rt_h = 0;
+				vd1_bound_color_target(vd1_rt_addr, vd1_rt_w, vd1_rt_h);
+				rsx_log.notice("vanillad1: tex trace:   lookup 0x%x %ux%u pitch %u bpp %u | target 0x%x %ux%u | write tag %llu",
+					texaddr, required_width, required_height, required_pitch, static_cast<u32>(required_bpp),
+					vd1_rt_addr, vd1_rt_w, vd1_rt_h, write_tag);
+			}
+
 			auto process_list_function = [&](surface_ranged_map& data, bool is_depth)
 			{
 				for (auto it = data.begin_range(test_range); it != data.end(); ++it)
@@ -1348,7 +1387,16 @@ namespace rsx
 					}
 
 					if (!rsx::pitch_compatible(surface, required_pitch, required_height))
+					{
+						if (vd1_tt) // vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE
+						{
+							rsx_log.notice("vanillad1: tex trace:   left out, pitch differs: 0x%x %ux%u pitch %u %s tag %llu",
+								range.start, surface->get_surface_width(), surface->get_surface_height(), surface->get_rsx_pitch(),
+								is_depth ? "depth" : "colour", surface->last_use_tag);
+						}
+
 						continue;
+					}
 
 					// 2D tests are done in format-agnostic rectangles (1bpp)
 					const u32 surface_width_in_bytes = surface->template get_surface_width<rsx::surface_metrics::bytes>();
@@ -1417,9 +1465,22 @@ namespace rsx
 								surface->template get_surface_height<rsx::surface_metrics::pixels>()) & vd1_stock_keep))
 						{
 							g_vd1_rcb.stock_kept++;
+							if (vd1_tt) // vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE
+							{
+								rsx_log.notice("vanillad1: tex trace:   left out, its memory changed (stock keep): 0x%x %ux%u pitch %u tag %llu",
+									range.start, surface->get_surface_width(), surface->get_surface_height(), surface->get_rsx_pitch(), surface->last_use_tag);
+							}
+
 							continue;
 						}
 						if (!is_depth && vd1_rcb_covers(surface->get_memory_range())) g_vd1_rcb.drops++; // vanillad1: RCB keep (P13.1)
+						if (vd1_tt) // vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE
+						{
+							rsx_log.notice("vanillad1: tex trace:   dropped, its memory changed: 0x%x %ux%u pitch %u %s tag %llu",
+								range.start, surface->get_surface_width(), surface->get_surface_height(), surface->get_rsx_pitch(),
+								is_depth ? "depth" : "colour", surface->last_use_tag);
+						}
+
 						dirty.emplace_back(range.start, is_depth);
 						continue;
 					}
@@ -1483,6 +1544,27 @@ namespace rsx
 
 					return a.surface->last_use_tag < b.surface->last_use_tag;
 				});
+			}
+
+			if (vd1_tt) [[unlikely]] // vanillad1: X515.10 p30: VANILLAD1_TEX_TRACE: the sections kept, bottom to top
+			{
+				u32 vd1_n = 0;
+				for (const auto& e : result)
+				{
+					vd1_n++;
+					rsx_log.notice("vanillad1: tex trace:   section %u of %u: 0x%x %ux%u pitch %u bpp %u %s tag %llu%s%s | src %u,%u %ux%u -> dst %u,%u %ux%u",
+						vd1_n, static_cast<u32>(result.size()), e.base_address,
+						e.surface->get_surface_width(), e.surface->get_surface_height(), e.surface->get_rsx_pitch(), static_cast<u32>(e.surface->get_bpp()),
+						e.is_depth ? "depth" : "colour", e.surface->last_use_tag,
+						e.is_clipped ? " clipped" : "", e.is_reloaded ? " cpu-upload" : "",
+						static_cast<u32>(e.src_area.x), static_cast<u32>(e.src_area.y), static_cast<u32>(e.src_area.width), static_cast<u32>(e.src_area.height),
+						static_cast<u32>(e.dst_area.x), static_cast<u32>(e.dst_area.y), static_cast<u32>(e.dst_area.width), static_cast<u32>(e.dst_area.height));
+				}
+
+				if (!vd1_n)
+				{
+					rsx_log.notice("vanillad1: tex trace:   no surface section");
+				}
 			}
 
 			return result;
