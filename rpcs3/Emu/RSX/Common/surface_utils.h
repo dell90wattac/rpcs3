@@ -153,6 +153,47 @@ namespace rsx
 		return s_on;
 	}
 
+	// vanillad1: X515.7 p30: VANILLAD1_POOL_GUEST_SIZE=1 (read once, logged once; unset / 0 = as before): bind_surface_address
+	// (surface_store.h) takes a surface from the invalidated pool only if its guest size equals the request's, not only its
+	// image size. A split remainder of a resolution-scaled surface (clone_surface: its image scaled by its SOURCE's rule, its own
+	// guest size, e.g. guest 128x78, image 256x156 at 200 %) otherwise comes back as an unscaled 256x156 target that still says
+	// 128x78 (and keeps its memory range): every later lookup finds it "clipped" and merges the stale strips around it (fault A).
+	inline bool vd1_pool_guest_size()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_POOL_GUEST_SIZE");
+			const bool on = env && *env && std::strcmp(env, "0") != 0;
+			if (on) rsx_log.notice("vanillad1: the surface pool hands out a surface only at the requested guest size (VANILLAD1_POOL_GUEST_SIZE=%s)", env);
+			return on;
+		}();
+		return s_on;
+	}
+
+	// vanillad1: X515.7 p30: one pooled surface refused by VANILLAD1_POOL_GUEST_SIZE: the first 8 logged in full, then a count per 10 s
+	// (printed at the first refusal after the window, so only when there were any; RSX thread only)
+	inline void vd1_pool_refused(u32 address, u32 pool_w, u32 pool_h, u32 req_w, u32 req_h, u32 image_w, u32 image_h)
+	{
+		static u32 s_logged = 0, s_window = 0;
+		static s64 s_since = 0;
+		const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (!s_since) s_since = now;
+		s_window++;
+		if (s_logged < 8)
+		{
+			s_logged++;
+			rsx_log.notice("vanillad1: pool: a %ux%u image of guest %ux%u refused for a %ux%u bind at 0x%x (VANILLAD1_POOL_GUEST_SIZE)",
+				image_w, image_h, pool_w, pool_h, req_w, req_h, address);
+		}
+		if (now - s_since >= 10000)
+		{
+			rsx_log.notice("vanillad1: pool guest size 10s: refused=%u (last: guest %ux%u for %ux%u at 0x%x)", s_window, pool_w, pool_h, req_w, req_h, address);
+			s_window = 0;
+			s_since = now;
+		}
+	}
+
 	// vanillad1: RCB stock range (P13.2): VANILLAD1_RCB_STOCK=<lo>-<hi>[:<w>x<h>][:init][:own][:keep][,...] (hex range, hi
 	// exclusive, read once). Colour surfaces overlapping a range follow stock Read Color Buffers (initialised from guest
 	// memory, reloaded when the 3-word tag changed) whatever the config says. Unset / empty / unparsable = false (stock).

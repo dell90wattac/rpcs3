@@ -557,6 +557,16 @@ namespace rsx
 					auto &surface = *It;
 					if (Traits::surface_matches_properties(surface, format, width, height, antialias, scaling_config, true))
 					{
+						// vanillad1: X515.7 p30: VANILLAD1_POOL_GUEST_SIZE: the image size matched; the guest size must too (the same format and
+						// samples: then the native pitch follows the width). Reuse never resets surface_width / surface_height / native_pitch.
+						if (vd1_pool_guest_size() &&
+							(static_cast<usz>(surface->surface_width) != width || static_cast<usz>(surface->surface_height) != height)) [[unlikely]]
+						{
+							vd1_pool_refused(address, surface->surface_width, surface->surface_height, static_cast<u32>(width), static_cast<u32>(height),
+								static_cast<u32>(surface->width()), static_cast<u32>(surface->height()));
+							continue;
+						}
+
 						new_surface_storage = std::move(surface);
 						Traits::notify_surface_reused(new_surface_storage);
 
