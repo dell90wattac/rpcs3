@@ -3929,11 +3929,29 @@ namespace
 		return s_on;
 	}
 
+	// vanillad1: X515.6 p30: VANILLAD1_GPU_LIGHT_ZRELOAD=1 (read once, logged once; unset / 0 = as before): at the ready word the
+	// depth hand-off surface (0x445A3A80) whose memory no longer matches its tag (test() fails: the SPUs rewrote the flushed raw
+	// depth as linear depth) but whose RCB hash says "same" (a frame identical to the one before) is reloaded from guest memory
+	// anyway: its RCB record is cleared, so the read barrier takes the "first" branch (VKRenderTargets.cpp vd1_rcb_reload_due).
+	// Stock RCB leaves the blit's raw words in the image: every tile reads far depth and the frame is unlit (fault D).
+	bool vd1_gl_zreload()
+	{
+		static const bool s_on = []()
+		{
+			const char* env = std::getenv("VANILLAD1_GPU_LIGHT_ZRELOAD");
+			const bool on = env && *env && std::strcmp(env, "0") != 0;
+			if (on) rsx_log.notice("vanillad1: GPU lighting reloads a changed depth hand-off the RCB hash calls the same (VANILLAD1_GPU_LIGHT_ZRELOAD=%s)", env);
+			return on;
+		}();
+		return s_on;
+	}
+
 	struct vd1_gl_counters
 	{
 		u32 calls = 0, lit = 0, shadow = 0, slot = 0, unfilled = 0, nosurf = 0, badsurf = 0, taken = 0, dumps = 0;
 		u32 gb_gpu = 0, gb_nomatch = 0, gb_taken = 0;   // vanillad1: G-buffer byte on the GPU (X300.7)
 		u32 sc_frames = 0, sc_mismatch = 0, sc_override = 0, sc_w = 0, sc_h = 0;   // vanillad1: X467.2 p28 (b)
+		u32 zsame = 0, zreload = 0;   // vanillad1: X515.6 p30: lit frames with a stale "same" depth hand-off; reloads VANILLAD1_GPU_LIGHT_ZRELOAD forced
 		u64 last_ms = 0;
 	} s_vd1_gl;
 
@@ -3945,8 +3963,8 @@ namespace
 		if (now - c.last_ms < 10000) return;
 		c.last_ms = now;
 		rsx_log.notice("vanillad1: gpu light 10s: ready=%u lit=%u shadow=%u declined: slot=%u unfilled=%u nosurf=%u badsurf=%u taken=%u; dumps=%u; "
-			"gbuf byte: gpu=%u (copy skipped %u) no match=%u copies run=%u",
-			c.calls, c.lit, c.shadow, c.slot, c.unfilled, c.nosurf, c.badsurf, c.taken, c.dumps, c.gb_gpu, c.gb_taken, c.gb_nomatch, released);
+			"gbuf byte: gpu=%u (copy skipped %u) no match=%u copies run=%u zsame=%u zreload=%u", // zsame, zreload: vanillad1: X515.6 p30
+			c.calls, c.lit, c.shadow, c.slot, c.unfilled, c.nosurf, c.badsurf, c.taken, c.dumps, c.gb_gpu, c.gb_taken, c.gb_nomatch, released, c.zsame, c.zreload);
 		if (vd1_gl_scaled()) // vanillad1: X467.2 p28 (b)
 			rsx_log.notice("vanillad1: gpu light scaled 10s: passes at a host size=%u (last %ux%u); declined: surfaces of two sizes=%u, override shader without VD1_SCALED=%u",
 				c.sc_frames, c.sc_w, c.sc_h, c.sc_mismatch, c.sc_override);
@@ -4154,6 +4172,27 @@ void VKGSRender::vd1_gpu_light_ready(u32 ea)
 	const u32 O_X = total_l, total = xs ? vd1_align(O_X + px * 4 + ((px & 3) ? 16u : 0u)) : total_l;   // + the gather's last partial word (X467.2)
 
 	auto* cmd = m_current_command_buffer;
+
+	// vanillad1: X515.6 p30: the depth hand-off as its read barrier is about to judge it under the RCB rule (VKRenderTargets.cpp
+	// memory_barrier: in VANILLAD1_RCB_RANGE and size, a tag, a record): the hash says "same" (no reload) while its memory has
+	// changed since the surface last matched it (test() fails). Counted whatever the switch says; VANILLAD1_GPU_LIGHT_ZRELOAD
+	// clears the record so the barrier reloads it from guest memory (the reload of every other lit frame, one 2.5 MB upload).
+	if (zs->vd1_seen_valid && zs->last_use_tag &&
+		rsx::vd1_rcb_covers(zs->get_memory_range()) &&
+		rsx::vd1_rcb_size_ok(zs->get_surface_width<rsx::surface_metrics::pixels>(), zs->get_surface_height<rsx::surface_metrics::pixels>()))
+	{
+		std::array<u64, 2> zb{};
+		if (zs->vd1_rcb_bands(zb) && zb == zs->vd1_seen && !zs->test())
+		{
+			if (swap) c.zsame++;
+			if (vd1_gl_zreload())
+			{
+				zs->vd1_seen_valid = false;
+				c.zreload++;
+			}
+		}
+	}
+
 	for (vk::render_target* s : { zs, gs, ls })
 	{
 		s->read_barrier(*cmd);
