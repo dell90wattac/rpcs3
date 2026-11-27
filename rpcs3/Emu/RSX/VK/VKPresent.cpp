@@ -35,6 +35,54 @@ namespace
 			return VK_FORMAT_R16G16B16A16_SFLOAT;
 		}
 	}
+
+	// vanillad1: X515.8 p30: VANILLAD1_FLIP_GUARD (read once, logged once; unset / 0 = as before; stats = count, change nothing;
+	// anything else = on). The flip takes the NEWEST surface overlapping the display buffer and presents it only if it starts at
+	// the buffer and covers it; otherwise it flushes every overlapping section and uploads guest memory, which then holds whatever
+	// was flushed last over the picture. Destiny keeps G-buffer B (FP16 512x312, pitch 5120: 80 % of a 1280-wide row) inside display
+	// buffer 0; a frame where that surface carries the newer tag (a later write, or a reload at a barrier, which retags) shows a
+	// rectangle of normals (fault B). On: such a frame presents the newest surface that does cover the buffer and was written since
+	// the last flip; with none, the stock path as before.
+	enum class vd1_flip_guard_mode { off, stats, on };
+
+	vd1_flip_guard_mode vd1_flip_guard()
+	{
+		static const vd1_flip_guard_mode s_mode = []()
+		{
+			const char* env = std::getenv("VANILLAD1_FLIP_GUARD");
+			if (!env || !*env || !std::strcmp(env, "0")) return vd1_flip_guard_mode::off;
+			const bool stats = !std::strcmp(env, "stats");
+			rsx_log.notice("vanillad1: flip guard %s: a display buffer whose newest surface does not cover it %s (VANILLAD1_FLIP_GUARD=%s)",
+				stats ? "stats" : "on", stats ? "is counted, nothing changed" : "is presented from the covering surface written this frame", env);
+			return stats ? vd1_flip_guard_mode::stats : vd1_flip_guard_mode::on;
+		}();
+		return s_mode;
+	}
+
+	struct vd1_flip_guard_counters
+	{
+		u32 rescued = 0;        // frames presented from (on) / that would be presented from (stats) the covering surface
+		u32 no_candidate = 0;   // frames whose newest surface does not cover the buffer and no covering surface was written this frame
+		u64 last_ms = 0;
+		u64 last_flip_tag = 0;  // rsx::g_rsx_shared_tag at the previous flip: a surface tagged after it was written this frame
+	} s_vd1_fg;
+
+	void vd1_flip_guard_tick()
+	{
+		const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+		auto& c = s_vd1_fg;
+		if (!c.last_ms) { c.last_ms = now; return; }
+		if (now - c.last_ms < 10000) return;
+		if (c.rescued || c.no_candidate)
+		{
+			rsx_log.notice("vanillad1: flip guard 10s: rescued=%u no_candidate=%u (%s)", c.rescued, c.no_candidate,
+				vd1_flip_guard() == vd1_flip_guard_mode::on ? "on" : "stats: nothing changed");
+		}
+		c.rescued = 0;
+		c.no_candidate = 0;
+		c.last_ms = now;
+	}
 }
 
 bool VKGSRender::reinitialize_swapchain()
@@ -357,6 +405,54 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 					std::min(surface_height, info->height));
 			}
 		}
+
+		// vanillad1: X515.8 p30: VANILLAD1_FLIP_GUARD: the newest surface does not cover the buffer (the stock path below uploads guest
+		// memory): the newest one that starts at the buffer, covers it (the stock fit test) and was written since the last flip
+		if (!viable && info->eye == 0 && vd1_flip_guard() != vd1_flip_guard_mode::off)
+		{
+			vk::render_target* vd1_cover = nullptr;
+			for (u32 i = overlap_info.size(); i-- > 0;)
+			{
+				const auto& s = overlap_info[i];
+				auto rtt = vk::as_rtt(s.surface);
+				if (s.base_address == info->address && rtt->last_use_tag >= s_vd1_fg.last_flip_tag &&
+					rtt->get_surface_width<rsx::surface_metrics::samples>() >= info->width &&
+					rtt->get_surface_height<rsx::surface_metrics::samples>() >= info->height)
+				{
+					vd1_cover = rtt;
+					break;
+				}
+			}
+
+			if (!vd1_cover)
+			{
+				s_vd1_fg.no_candidate++;
+			}
+			else
+			{
+				s_vd1_fg.rescued++;
+				static u32 s_logs = 0;
+				if (s_logs++ < 8)
+				{
+					rsx_log.notice("vanillad1: flip guard: 0x%x %ux%u: the newest surface 0x%x %ux%u (format %d) does not cover it; %s the %ux%u surface written this frame (%s)",
+						info->address, info->width, info->height, section.base_address,
+						surface->get_surface_width<rsx::surface_metrics::pixels>(), surface->get_surface_height<rsx::surface_metrics::pixels>(),
+						static_cast<int>(surface->format()), vd1_flip_guard() == vd1_flip_guard_mode::on ? "presenting" : "would present",
+						vd1_cover->get_surface_width<rsx::surface_metrics::pixels>(), vd1_cover->get_surface_height<rsx::surface_metrics::pixels>(),
+						vd1_flip_guard() == vd1_flip_guard_mode::on ? "on" : "stats");
+				}
+
+				if (vd1_flip_guard() == vd1_flip_guard_mode::on)
+				{
+					image_to_flip = vd1_cover->get_surface(rsx::surface_access::transfer_read);
+
+					std::tie(info->width, info->height) = rsx::apply_resolution_scale<true>(
+						resolution_scaling_config,
+						std::min(vd1_cover->get_surface_width<rsx::surface_metrics::samples>(), info->width),
+						std::min(vd1_cover->get_surface_height<rsx::surface_metrics::samples>(), info->height));
+				}
+			}
+		}
 	}
 	else if (auto surface = m_texture_cache.find_texture_from_dimensions<true>(info->address, info->format);
 			 surface && surface->get_width() >= info->width && surface->get_height() >= info->height)
@@ -421,6 +517,13 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 			image_to_flip = dst_img.get();
 			m_texture_cache.dispose_reusable_image(dst_img);
 		}
+	}
+
+	// vanillad1: X515.8 p30: VANILLAD1_FLIP_GUARD: this flip's tag mark and the 10 s line (only when a counter is non-zero)
+	if (info->eye == 0 && vd1_flip_guard() != vd1_flip_guard_mode::off)
+	{
+		s_vd1_fg.last_flip_tag = rsx::g_rsx_shared_tag.load();
+		vd1_flip_guard_tick();
 	}
 
 	return image_to_flip;
