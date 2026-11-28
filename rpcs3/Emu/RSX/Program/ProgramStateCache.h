@@ -8,6 +8,9 @@
 #include "util/fnv_hash.hpp"
 #include "util/v128.hpp"
 #include <util/bless.hpp>
+#include "Emu/vd1_live.h"
+
+#include <array>
 
 #include <span>
 #include <unordered_map>
@@ -227,6 +230,26 @@ protected:
 	fragment_program_type __null_fragment_program;
 	pipeline_storage_type __null_pipeline_handle;
 
+	// vanillad1: X527 PMEMO (live): the last 4 non-null pipelines by their key (vp id, fp id, the properties before
+	// validate_pipeline_properties narrows them, as pipeline_key holds them). A value in m_storage is written once from the
+	// null placeholder and never replaced until clear(), so a memo of non-null results is exact. Only lookups with a cache hint
+	// use it (the RSX thread; the shader cache loader's threads pass none). PMEMO=2: check mode (the memo looked up, stock used,
+	// a different answer counted).
+	struct vd1_pmemo_t
+	{
+		u32 vp_id = umax;
+		u32 fp_id = umax;
+		pipeline_properties props{};
+		pipeline_type* pipe = nullptr;
+	};
+	std::array<vd1_pmemo_t, 4> m_vd1_pmemo{};
+	u32 m_vd1_pmemo_next = 0;
+
+public:
+	u32 m_vd1_pmemo_stats[3]{}; // hits, misses, check-mode mismatches (read and cleared by the backend's 10-s line)
+
+protected:
+
 	/// bool here to inform that the program was preexisting.
 	std::tuple<const vertex_program_type&, bool> search_vertex_program(
 		rsx::program_cache_hint_t* cache_hint,
@@ -373,6 +396,29 @@ public:
 		const bool already_existing_vertex_program = std::get<1>(vp_search);
 		const vertex_program_type& vertex_program = std::get<0>(vp_search);
 		const fragment_program_type& fragment_program = std::get<0>(fp_search);
+
+		// vanillad1: X527 PMEMO: before the key's copy, its hash and the map search
+		const u32 vd1_pm = cache_hint ? vd1::live(vd1::lf::PMEMO) : 0;
+		pipeline_type* vd1_hit = nullptr;
+		if (vd1_pm && already_existing_vertex_program && already_existing_fragment_program)
+		{
+			for (const auto& m : m_vd1_pmemo)
+			{
+				if (m.pipe && m.vp_id == vertex_program.id && m.fp_id == fragment_program.id && m.props == pipeline_properties)
+				{
+					vd1_hit = m.pipe;
+					break;
+				}
+			}
+			m_vd1_pmemo_stats[vd1_hit ? 0 : 1]++;
+			if (vd1_hit && vd1_pm == 1)
+			{
+				backend_traits::validate_pipeline_properties(vertex_program, fragment_program, pipeline_properties); // stock's side effect
+				m_cache_miss_flag = false;
+				return { vd1_hit, &vertex_program, &fragment_program };
+			}
+		}
+
 		const pipeline_key key = { vertex_program.id, fragment_program.id, pipeline_properties };
 
 		m_cache_miss_flag = true;
@@ -386,6 +432,18 @@ public:
 			if (const auto I = m_storage.find(key); I != m_storage.end())
 			{
 				m_cache_miss_flag = (I->second == __null_pipeline_handle);
+				if (vd1_pm && I->second) // vanillad1: X527 PMEMO: remember it (the pre-validate key, as stored)
+				{
+					if (vd1_hit && vd1_hit != I->second.get()) m_vd1_pmemo_stats[2]++;
+					if (!vd1_hit)
+					{
+						auto& m = m_vd1_pmemo[m_vd1_pmemo_next++ & 3];
+						m.vp_id = key.vertex_program_id;
+						m.fp_id = key.fragment_program_id;
+						m.props = key.properties;
+						m.pipe = I->second.get();
+					}
+				}
 				return { I->second.get(), &vertex_program, &fragment_program };
 			}
 		}
@@ -474,5 +532,6 @@ public:
 		m_fragment_shader_cache.clear();
 		m_vertex_shader_cache.clear();
 		m_storage.clear();
+		for (auto& m : m_vd1_pmemo) m.pipe = nullptr; // vanillad1: X527 PMEMO
 	}
 };

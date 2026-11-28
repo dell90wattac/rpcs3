@@ -281,6 +281,8 @@ namespace rsx
 		u32 m_fp_original_textures_mask = 0; // textures the real program reads
 		// vanillad1: start scan cap (X301.1): counts for the 10-s log line
 		struct vd1_fpscan_t { u32 ticks, prefetch, longscan, capped, full, by_set, by_flip, by_write; u64 last_ms; } m_vd1_fpscan{};
+		// vanillad1: X527 FPMRU / VPHINT (RSXThread.cpp): the backend names the programs its lookup found (after get_graphics_pipeline)
+		void vd1_prog_note(const void* vertex_program, const void* fragment_program);
 
 		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
 		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};

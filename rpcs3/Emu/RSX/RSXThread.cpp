@@ -2257,6 +2257,146 @@ namespace rsx
 		return true;
 	}
 
+	namespace
+	{
+		// vanillad1: X527 FPMRU (live): the last 8 fragment programs by guest address, with the bytes the analysis read. A
+		// prefetch whose bytes are equal (the prefix before the start and every instruction slot through END; the inline
+		// constant slots skipped, as the analysis, the X302 hash and fragment_program_compare skip them) reuses the analysis,
+		// and, when the properties also equal those its last lookup ran with, seeds the program hint with the program that
+		// lookup found (the same map entry search_fragment_program would find). A state change after the prefetch still runs
+		// get_current_fragment_program, whose invalidate_fragment_program drops a hint whose properties differ. Never cached:
+		// FPSCAN's long scans, the NOP substitute. FPMRU=2: check mode (stock analysis and lookup, differences counted).
+		struct vd1_fp_props_t
+		{
+			decltype(RSXFragmentProgram::ucode_length) ucode_length{};
+			decltype(RSXFragmentProgram::ctrl) ctrl{};
+			decltype(RSXFragmentProgram::texture_state) texture_state{};
+			decltype(RSXFragmentProgram::texcoord_control_mask) texcoord_control_mask{};
+			decltype(RSXFragmentProgram::two_sided_lighting) two_sided_lighting{};
+			decltype(RSXFragmentProgram::mrt_buffers_count) mrt_buffers_count{};
+
+			static vd1_fp_props_t of(const RSXFragmentProgram& p)
+			{
+				vd1_fp_props_t r;
+				r.ucode_length = p.ucode_length;
+				r.ctrl = p.ctrl;
+				r.texture_state = p.texture_state;
+				r.texcoord_control_mask = p.texcoord_control_mask;
+				r.two_sided_lighting = p.two_sided_lighting;
+				r.mrt_buffers_count = p.mrt_buffers_count;
+				return r;
+			}
+
+			bool operator==(const vd1_fp_props_t& o) const
+			{
+				return ucode_length == o.ucode_length && ctrl == o.ctrl && texture_state == o.texture_state &&
+					texcoord_control_mask == o.texcoord_control_mask && two_sided_lighting == o.two_sided_lighting &&
+					mrt_buffers_count == o.mrt_buffers_count;
+			}
+		};
+
+		struct vd1_fpmru_t
+		{
+			u32 addr = 0;
+			std::vector<u8> bytes;
+			program_hash_util::fragment_program_utils::fragment_program_metadata meta{};
+			void* prog = nullptr;
+			vd1_fp_props_t props{};
+		};
+
+		// vanillad1: X527 VPHINT (live, with E20 on): E20's entries also keep the program the last lookup found for their
+		// words and the properties it ran with (vertex_program_compare::compare_properties' fields); an E20 hit with equal
+		// properties seeds the vertex hint, so search_vertex_program's hash and compare are skipped. E20's word compare
+		// covers the map key's data, jump table and mask. VPHINT=2: check mode.
+		struct vd1_vp_entry
+		{
+			u32 entry = umax;
+			u32 base_address = 0;
+			std::vector<u32> raw;
+			std::vector<u32> data;
+			std::set<u32> jump_table;
+			bit_set<rsx::max_vertex_program_instructions> instruction_mask;
+			program_hash_util::vertex_program_utils::vertex_program_metadata metadata{};
+			void* prog = nullptr;
+			u32 out_mask = 0, ctrl = 0;
+			decltype(RSXVertexProgram::texture_state) tex{};
+		};
+
+		struct vd1_prog_cache_t
+		{
+			std::array<vd1_fpmru_t, 8> fp{};
+			u32 fp_next = 0;
+			s32 fp_cur = -1;               // the entry of the last prefetch's bytes, -1 none
+			void* fp_would = nullptr;      // check mode: the hint a seed would have set
+			std::array<vd1_vp_entry, 16> vp{};
+			u32 vp_next = 0;
+			vd1_vp_entry* vp_cur = nullptr;
+			void* vp_would = nullptr;
+			u32 fp_hit = 0, fp_miss = 0, fp_seed = 0, fp_bad = 0, vp_seed = 0, vp_bad = 0;
+		};
+
+		vd1_prog_cache_t& vd1_pc()
+		{
+			static auto* s = new vd1_prog_cache_t(); // the RSX thread only; never freed (as E20's array was)
+			return *s;
+		}
+
+		bool vd1_fpmru_match(const void* ptr, const vd1_fpmru_t& e)
+		{
+			const u32 start = e.meta.program_start_offset;
+			const u8* g = static_cast<const u8*>(ptr);
+			const u8* c = e.bytes.data();
+			if (start && std::memcmp(g, c, start) != 0)
+			{
+				return false;
+			}
+			for (u32 off = start, end = start + e.meta.program_ucode_length; off < end; off += 16)
+			{
+				if (std::memcmp(g + off, c + off, 16) != 0)
+				{
+					return false;
+				}
+				if (program_hash_util::fragment_program_utils::is_any_src_constant(v128::loadu(g, off / 16)))
+				{
+					off += 16; // the inline constant: free to differ
+				}
+			}
+			return true;
+		}
+
+		bool vd1_meta_equal(const program_hash_util::fragment_program_utils::fragment_program_metadata& a,
+			const program_hash_util::fragment_program_utils::fragment_program_metadata& b)
+		{
+			return a.program_start_offset == b.program_start_offset && a.program_ucode_length == b.program_ucode_length &&
+				a.program_constants_buffer_length == b.program_constants_buffer_length &&
+				a.referenced_textures_mask == b.referenced_textures_mask && a.bx2_texture_reads_mask == b.bx2_texture_reads_mask &&
+				a.has_pack_instructions == b.has_pack_instructions && a.has_branch_instructions == b.has_branch_instructions &&
+				a.is_nop_shader == b.is_nop_shader && a.ucode_hash == b.ucode_hash && a.vd1_long_scan == b.vd1_long_scan;
+		}
+	}
+
+	void thread::vd1_prog_note(const void* vertex_program, const void* fragment_program)
+	{
+		auto& pc = vd1_pc();
+		if (pc.fp_cur >= 0 && fragment_program)
+		{
+			if (pc.fp_would && pc.fp_would != fragment_program) pc.fp_bad++;
+			auto& e = pc.fp[pc.fp_cur];
+			e.prog = const_cast<void*>(fragment_program);
+			e.props = vd1_fp_props_t::of(current_fragment_program);
+		}
+		if (pc.vp_cur && vertex_program)
+		{
+			if (pc.vp_would && pc.vp_would != vertex_program) pc.vp_bad++;
+			pc.vp_cur->prog = const_cast<void*>(vertex_program);
+			pc.vp_cur->out_mask = current_vertex_program.output_mask;
+			pc.vp_cur->ctrl = current_vertex_program.ctrl;
+			pc.vp_cur->tex = current_vertex_program.texture_state;
+		}
+		pc.fp_would = nullptr;
+		pc.vp_would = nullptr;
+	}
+
 	void thread::prefetch_fragment_program()
 	{
 		if (!m_graphics_state.test(rsx::pipeline_state::fragment_program_ucode_dirty))
@@ -2279,7 +2419,55 @@ namespace rsx
 		// program's output (the result those draws had anyway, without the scan); a draw that uses the output gets
 		// the stock scan. 2 = the NOP program for every such draw.
 		const u32 vd1_fpscan = vd1::live(vd1::lf::FPSCAN);
-		current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr, vd1_fpscan != 0);
+		// vanillad1: X527 FPMRU (see vd1_fpmru_t)
+		auto& vd1_p = vd1_pc();
+		const u32 vd1_mru = vd1::live(vd1::lf::FPMRU);
+		const u32 vd1_addr = rsx::get_address(program_offset, program_location);
+		vd1_p.fp_cur = -1;
+		vd1_p.fp_would = nullptr;
+		for (u32 i = 0; vd1_mru && i < vd1_p.fp.size(); ++i)
+		{
+			if (!vd1_p.fp[i].bytes.empty() && vd1_p.fp[i].addr == vd1_addr)
+			{
+				vd1_p.fp_cur = static_cast<s32>(i);
+				break;
+			}
+		}
+		const bool vd1_mru_hit = vd1_p.fp_cur >= 0 && vd1_fpmru_match(data_ptr, vd1_p.fp[vd1_p.fp_cur]);
+		if (vd1_mru_hit && vd1_mru == 1)
+		{
+			current_fp_metadata = vd1_p.fp[vd1_p.fp_cur].meta;
+			vd1_p.fp_hit++;
+		}
+		else
+		{
+			current_fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr, vd1_fpscan != 0);
+			if (vd1_mru_hit)
+			{
+				vd1_p.fp_hit++;
+				if (!vd1_meta_equal(current_fp_metadata, vd1_p.fp[vd1_p.fp_cur].meta)) vd1_p.fp_bad++; // check mode
+			}
+			else if (vd1_mru && current_fp_metadata.vd1_long_scan)
+			{
+				if (vd1_p.fp_cur >= 0) vd1_p.fp[vd1_p.fp_cur].bytes.clear(); // never cached: FPSCAN's path stays stock
+				vd1_p.fp_cur = -1;
+			}
+			else if (vd1_mru)
+			{
+				vd1_p.fp_miss++;
+				if (vd1_p.fp_cur < 0)
+				{
+					vd1_p.fp_cur = static_cast<s32>(vd1_p.fp_next);
+					vd1_p.fp_next = (vd1_p.fp_next + 1) % ::size32(vd1_p.fp);
+				}
+				auto& e = vd1_p.fp[vd1_p.fp_cur];
+				const auto* p = static_cast<const u8*>(data_ptr);
+				e.addr = vd1_addr;
+				e.meta = current_fp_metadata;
+				e.prog = nullptr;
+				e.bytes.assign(p, p + current_fp_metadata.program_start_offset + current_fp_metadata.program_ucode_length);
+			}
+		}
 		bool vd1_capped = vd1_fpscan != 0 && current_fp_metadata.vd1_long_scan;
 		auto& vd1_fs = m_vd1_fpscan;
 		vd1_fs.prefetch++;
@@ -2308,9 +2496,12 @@ namespace rsx
 			}
 			else if (now - vd1_fs.last_ms >= 10000)
 			{
-				rsx_log.notice("vanillad1: fp scan 10s: FPSCAN=%u prefetch=%u long=%u capped=%u full=%u dirty by: set=%u flip=%u write=%u",
-					vd1_fpscan, vd1_fs.prefetch, vd1_fs.longscan, vd1_fs.capped, vd1_fs.full, vd1_fs.by_set, vd1_fs.by_flip, vd1_fs.by_write);
+				rsx_log.notice("vanillad1: fp scan 10s: FPSCAN=%u prefetch=%u long=%u capped=%u full=%u dirty by: set=%u flip=%u write=%u; "
+					"FPMRU=%u hits %u misses %u seeds %u bad %u; VPHINT=%u seeds %u bad %u",
+					vd1_fpscan, vd1_fs.prefetch, vd1_fs.longscan, vd1_fs.capped, vd1_fs.full, vd1_fs.by_set, vd1_fs.by_flip, vd1_fs.by_write,
+					vd1_mru, vd1_p.fp_hit, vd1_p.fp_miss, vd1_p.fp_seed, vd1_p.fp_bad, vd1::live(vd1::lf::VPHINT), vd1_p.vp_seed, vd1_p.vp_bad);
 				vd1_fs = {};
+				vd1_p.fp_hit = vd1_p.fp_miss = vd1_p.fp_seed = vd1_p.fp_bad = vd1_p.vp_seed = vd1_p.vp_bad = 0;
 				vd1_fs.last_ms = now;
 
 				// vanillad1 (X466.2): the SPU return shortcut's lookups (VANILLAD1_SPU_MIRROR_STATS=1; unlocked counters)
@@ -2366,6 +2557,28 @@ namespace rsx
 			// The texture parameters transfer routine is optimized and only writes data for textures consumed by the ucode.
 			m_graphics_state |= rsx::pipeline_state::fragment_texture_state_dirty;
 		}
+
+		// vanillad1: X527 FPMRU: the seed (the NOP substitute is not these bytes: no entry for it)
+		if (vd1_p.fp_cur >= 0)
+		{
+			auto& e = vd1_p.fp[vd1_p.fp_cur];
+			if (m_fp_nop_substituted || vd1_capped)
+			{
+				vd1_p.fp_cur = -1;
+			}
+			else if (vd1_mru_hit && e.prog && e.props == vd1_fp_props_t::of(current_fragment_program))
+			{
+				if (vd1_mru == 1)
+				{
+					rsx::program_cache_hint_t::cache_fragment_program(&m_program_cache_hint, current_fragment_program, e.prog);
+					vd1_p.fp_seed++;
+				}
+				else
+				{
+					vd1_p.fp_would = e.prog; // check mode: compared with the lookup's own answer in vd1_prog_note
+				}
+			}
+		}
 	}
 
 	void thread::prefetch_vertex_program()
@@ -2386,25 +2599,18 @@ namespace rsx
 
 		// vanillad1: vertex program cache (X302): the analysis depends only on the entry point and the words it walked, so an
 		// exact match of those words repeats its result. ~65 % of the game's program switches hit 16 entries.
-		struct vd1_vp_entry
-		{
-			u32 entry = umax;
-			u32 base_address = 0;
-			std::vector<u32> raw;
-			std::vector<u32> data;
-			std::set<u32> jump_table;
-			bit_set<rsx::max_vertex_program_instructions> instruction_mask;
-			program_hash_util::vertex_program_utils::vertex_program_metadata metadata{};
-		};
-
-		static auto* s_vd1_vp_cache = new std::array<vd1_vp_entry, 16>();
-		static u32 s_vd1_vp_next = 0;
+		// (vd1_vp_entry: with FPMRU above; X527 VPHINT adds the program its last lookup found)
+		auto& vd1_p = vd1_pc();
+		auto* s_vd1_vp_cache = &vd1_p.vp;
+		u32& s_vd1_vp_next = vd1_p.vp_next;
+		vd1_p.vp_cur = nullptr;
+		vd1_p.vp_would = nullptr;
 
 		const bool vd1_vp_on = vd1::live(vd1::lf::E20) != 0;
 		bool vd1_vp_hit = false;
 		if (vd1_vp_on)
 		{
-			for (const auto& e : *s_vd1_vp_cache)
+			for (auto& e : *s_vd1_vp_cache)
 			{
 				if (e.entry == transform_program_start &&
 					std::memcmp(method_registers.transform_program.data() + (e.base_address * 4), e.raw.data(), e.raw.size() * sizeof(u32)) == 0)
@@ -2416,6 +2622,7 @@ namespace rsx
 					current_vertex_program.instruction_mask = e.instruction_mask;
 					current_vp_metadata = e.metadata;
 					vd1_vp_hit = true;
+					vd1_p.vp_cur = &e;
 					break;
 				}
 			}
@@ -2442,10 +2649,28 @@ namespace rsx
 				e.jump_table = current_vertex_program.jump_table;
 				e.instruction_mask = current_vertex_program.instruction_mask;
 				e.metadata = current_vp_metadata;
+				e.prog = nullptr; // vanillad1: X527 VPHINT: set by the next lookup (vd1_prog_note)
+				vd1_p.vp_cur = &e;
 			}
 		}
 
 		current_vertex_program.texture_state.import(current_vp_texture_state, current_vp_metadata.referenced_textures_mask);
+
+		// vanillad1: X527 VPHINT: the seed
+		if (const u32 vd1_vh = vd1::live(vd1::lf::VPHINT); vd1_vh && vd1_vp_hit && vd1_p.vp_cur && vd1_p.vp_cur->prog &&
+			vd1_p.vp_cur->out_mask == current_vertex_program.output_mask && vd1_p.vp_cur->ctrl == current_vertex_program.ctrl &&
+			vd1_p.vp_cur->tex == current_vertex_program.texture_state)
+		{
+			if (vd1_vh == 1)
+			{
+				rsx::program_cache_hint_t::cache_vertex_program(&m_program_cache_hint, current_vertex_program, vd1_p.vp_cur->prog);
+				vd1_p.vp_seed++;
+			}
+			else
+			{
+				vd1_p.vp_would = vd1_p.vp_cur->prog;
+			}
+		}
 
 		if (!m_graphics_state.test(rsx::pipeline_state::vertex_program_state_dirty))
 		{

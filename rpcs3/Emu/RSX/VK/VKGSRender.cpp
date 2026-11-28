@@ -2644,6 +2644,8 @@ bool VKGSRender::load_program()
 			m_pipeline_properties,
 			shadermode != shader_mode::recompiler, true);
 
+		vd1_prog_note(m_vertex_prog, m_fragment_prog); // vanillad1: X527 FPMRU / VPHINT: what the lookup found
+
 		vk::leave_uninterruptible();
 
 		if (m_prog_buffer->check_cache_missed())
@@ -3158,9 +3160,12 @@ void VKGSRender::vd1_subn_on_submit()
 	const u64 now = m_vd1_last_submit_us / 1000;
 	if (!s.last_ms) { s.last_ms = now; return; }
 	if (now - s.last_ms < 10000) return;
+	auto& pm = m_prog_buffer->m_vd1_pmemo_stats; // vanillad1: X527 PMEMO
 	rsx_log.notice("vanillad1: subn 10s: SUBN=%u primary submits %u (by SUBN %u, empty %u), draws %llu, max %u a submit; "
-		"submits with 1-15 draws %u, 16-63 %u, 64-255 %u, 256-1023 %u, 1024+ %u",
-		vd1::live(vd1::lf::SUBN), s.submits, s.by_subn, s.empty, s.draws, s.max_draws, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4]);
+		"submits with 1-15 draws %u, 16-63 %u, 64-255 %u, 256-1023 %u, 1024+ %u; PMEMO=%u hits %u misses %u bad %u",
+		vd1::live(vd1::lf::SUBN), s.submits, s.by_subn, s.empty, s.draws, s.max_draws, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4],
+		vd1::live(vd1::lf::PMEMO), pm[0], pm[1], pm[2]);
+	pm[0] = pm[1] = pm[2] = 0;
 	s = {};
 	s.last_ms = now;
 }
