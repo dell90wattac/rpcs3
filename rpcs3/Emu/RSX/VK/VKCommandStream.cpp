@@ -115,6 +115,18 @@ namespace vk
 
 	void vd1_cs_worker_t::operator()()
 	{
+		// vanillad1: X527: VANILLAD1_CS_CPU=<hex mask> pins the worker (e.g. 2 = the RSX thread's SMT sibling under the split, which
+		// leaves the SPUs' cores alone); unset: the OS places it. Logged once.
+		if (const char* env = std::getenv("VANILLAD1_CS_CPU"); env && *env)
+		{
+			const u64 mask = std::strtoull(env, nullptr, 16);
+			if (mask)
+			{
+				thread_ctrl::set_thread_affinity_mask(mask);
+			}
+			rsx_log.notice("vanillad1: submit worker pinned to 0x%x (VANILLAD1_CS_CPU)", mask);
+		}
+
 		vd1_cs::s_running = true;
 
 		while (thread_ctrl::state() != thread_state::aborting)
