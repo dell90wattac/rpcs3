@@ -2645,7 +2645,14 @@ namespace rsx
 				again.vd1_bound = data.vd1_bound;
 				again.vd1_retag = true;
 				data = std::move(again);
-				return 0;
+
+				// vanillad1: X527 FFRECHECK (live): the fresh classification was made under this lock with the current tag, so it
+				// is checked below like a new fault's instead of going to the stock path (X527, 200 %: ~600 of 955 hand-off faults
+				// in 10 s were "cache changed" with sections still flushable, each a flush request that parks the RSX thread)
+				if (!vd1::live(vd1::lf::FFRECHECK))
+				{
+					return 0;
+				}
 			}
 
 			for (const auto* surface : data.sections_to_flush)
