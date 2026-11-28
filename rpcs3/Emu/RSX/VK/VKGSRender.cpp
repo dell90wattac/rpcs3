@@ -4630,6 +4630,7 @@ namespace
 	struct vd1_sd_counters
 	{
 		u32 labels = 0, ran = 0, retired = 0, late = 0, spu_live = 0, slot = 0, unfilled = 0, abort = 0, nosurf = 0, badsurf = 0, taken = 0;
+		u32 pre = 0; u64 pre_us = 0, pre_max = 0; // vanillad1: X527 SDPRE
 		u32 spins = 0, gpu_waits = 0, timeouts = 0, checks = 0, check_bad = 0, dumps = 0;
 		u64 spin_us = 0, spin_max = 0, gpu_us = 0, gpu_max = 0, retire_us = 0, retire_max = 0;
 		u64 last_ms = 0, last_flip = 0;
@@ -4644,10 +4645,11 @@ namespace
 		const u64 frames = std::max<u64>(flip - c.last_flip, 1);
 		rsx_log.notice("vanillad1: gpu sdsm 10s: %llu frames, labels=%u ran=%u retired=%u (late %u) live SDSMSPU=%u declined: slot=%u unfilled=%u abort=%u nosurf=%u badsurf=%u taken=%u; "
 			"self-jump %.3f ms a frame (%u waits, max %.2f ms); GPU wait %.3f ms a frame (%u, max %.2f ms, timeouts %u); retire %.3f ms a frame (max %.2f ms); "
-			"checks %u (bad %u), dumps %u",
+			"checks %u (bad %u), dumps %u; SDPRE=%u pre-flushes %u, %.3f ms a frame (max %.2f ms)",
 			frames, c.labels, c.ran, c.retired, c.late, c.spu_live, c.slot, c.unfilled, c.abort, c.nosurf, c.badsurf, c.taken,
 			c.spin_us / 1000. / frames, c.spins, c.spin_max / 1000., c.gpu_us / 1000. / frames, c.gpu_waits, c.gpu_max / 1000., c.timeouts,
-			c.retire_us / 1000. / frames, c.retire_max / 1000., c.checks, c.check_bad, c.dumps);
+			c.retire_us / 1000. / frames, c.retire_max / 1000., c.checks, c.check_bad, c.dumps,
+			vd1::live(vd1::lf::SDPRE), c.pre, c.pre_us / 1000. / frames, c.pre_max / 1000.);
 		const u32 dumps = c.dumps;
 		c = {};
 		c.last_ms = now;
@@ -4728,6 +4730,22 @@ void VKGSRender::vd1_sdsm_label(u32 ea, u32 value)
 	const u32 wait_ea = vd1_sd_be32(P + 0x25c);
 	m_vd1_sd.wait_ea = wait_ea;   // the stats time the SPUs' frames too
 	m_vd1_sd.state = 2;
+
+	// vanillad1: X527 SDPRE (live, with the SPUs doing the job: VANILLAD1_GPU_SDSM=stats): the six SPU instances read the depth
+	// copy (z_ea) the moment this word lands, while its GPU copy and readback still sit in this thread's command buffer, so
+	// each read faulted and waited (X527, 200 %: ~800 faults and ~2-3 s of SPU time per 10 s, plus the blocks' ~1 s). Here
+	// this thread runs the stock CPU-read flush of the range itself (on_access_violation on the RSX thread: the command
+	// buffer submitted, the copy, the write-back to guest memory, the unprotect) before the word lands: the SPUs then read
+	// current, unprotected memory. This thread waits for the GPU here instead of at the self-jump a few commands later.
+	if (mode != sd_on && vd1::live(vd1::lf::SDPRE))
+	{
+		const u64 t_pre = get_system_time();
+		on_access_violation(z_ea, false);
+		const u64 d_pre = get_system_time() - t_pre;
+		c.pre++;
+		c.pre_us += d_pre;
+		c.pre_max = std::max(c.pre_max, d_pre);
+	}
 
 	if (mode == sd_stats)
 	{
