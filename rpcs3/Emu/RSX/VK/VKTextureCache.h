@@ -260,6 +260,13 @@ namespace vk
 					return false;
 				}
 
+				// vanillad1: X527 EVBACK (live): <n> more pauses between polls; each poll is a driver call, and at 200 % the SPUs'
+				// fault handlers spun here for 24,673 polls a frame (Frida, the plaza). 0 = one pause, as before
+				for (u32 vd1_i = vd1::live(vd1::lf::EVBACK); vd1_i; vd1_i--)
+				{
+					utils::pause();
+				}
+
 				utils::pause();
 			}
 

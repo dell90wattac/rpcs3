@@ -7,6 +7,7 @@
 #include "shared.h"
 
 #include "Emu/Cell/timers.hpp"
+#include "Emu/vd1_live.h" // vanillad1: X527 EVBACK
 
 #include "util/sysinfo.hpp"
 #include "util/asm.hpp"
@@ -637,6 +638,12 @@ namespace vk
 					rsx_log.error("[vulkan] vk::wait_for_event has timed out!");
 					return VK_TIMEOUT;
 				}
+			}
+
+			// vanillad1: X527 EVBACK (live): <n> more pauses between polls (each poll is a driver call); 0 = as before
+			for (u32 vd1_i = vd1::live(vd1::lf::EVBACK); vd1_i; vd1_i--)
+			{
+				utils::pause();
 			}
 
 			utils::pause();
