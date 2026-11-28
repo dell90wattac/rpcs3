@@ -91,6 +91,12 @@ namespace rsx
 					RSX(ctx)->vd1_gpu_light_ready(dst_address);
 					nv0039::vd1_release_held(RSX(ctx)); // vanillad1: G-buffer byte on the GPU (X300.7): not taken: the copy runs before the word lands
 				}
+				// vanillad1: sdsm on the GPU (X301.2): sdsm's start label is one inline word (the frame's sequence) into its sync
+				// word; the backend checks the address and may run the job on the GPU and retire the SPU instances before it lands
+				else if (count == 1 && RSX(ctx)->m_vd1_sdsm_on)
+				{
+					RSX(ctx)->vd1_sdsm_label(dst_address, *reinterpret_cast<const be_t<u32>*>(fifo_span.data()));
+				}
 
 				const auto dst = vm::_ptr<u8>(dst_address);
 				const auto src = reinterpret_cast<const u8*>(fifo_span.data());

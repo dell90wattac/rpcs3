@@ -338,6 +338,27 @@ protected:
 	std::unique_ptr<vk::buffer> m_vd1_gl_readback;
 	std::string m_vd1_gl_spu_file;   // a dump waiting for the SPU's result (written at the next ready word)
 	u32 m_vd1_gl_spu_ea[4]{};        // light target, its pitch, G-buffer A, w | h << 16
+	// vanillad1: sdsm on the GPU (X301.2): VANILLAD1_GPU_SDSM (VKGSRender.cpp)
+	void vd1_sdsm_label(u32 ea, u32 value) override;
+	void vd1_sdsm_selfjump(u32 ea, bool spinning) override;
+	void vd1_sdsm_retire(bool timed_out_ok);
+	struct vd1_sdsm_pending_t
+	{
+		u32 state = 0;          // 0 none, 1 recorded (the GPU pass in flight), 2 the SPUs' job (stats only)
+		u32 mode = 0;           // the mode the frame was recorded in
+		u32 wait_ea = 0;        // the self-jump block (P[0x25c])
+		u32 w = 0, h = 0;
+		bool check = false;     // this frame is compared with the SPUs' output
+		u64 t_label = 0;        // get_system_time() at the label
+		u32 rb_bounds = 0, rb_ha = 0, rb_hb = 0, rb_q = 0, rb_lin = 0, rb_len = 0;   // the readback layout (bytes)
+		std::array<u8, 0x2b0> P{};
+	};
+	vd1_sdsm_pending_t m_vd1_sd{};
+	std::unique_ptr<vk::buffer> m_vd1_sd_work;       // device local: input, outputs, constants
+	std::unique_ptr<vk::buffer> m_vd1_sd_readback;   // host visible: bounds, half_a, half_b, quarter, [linear depth]
+	std::unique_ptr<vk::event> m_vd1_sd_event;       // set once the readback copies are done
+	u32 m_vd1_sd_spin_ea = 0;                        // the self-jump being timed
+	u64 m_vd1_sd_spin_t0 = 0, m_vd1_sd_spin_last = 0;
 	void notify_tile_unbound(u32 tile) override;
 
 	bool on_access_violation(u32 address, bool is_writing) override;
