@@ -19,6 +19,7 @@
     <ClInclude Include="Emu\RSX\VK\upscalers\upscaling.h" />
     <ClInclude Include="Emu\RSX\VK\VKAsyncScheduler.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommandStream.h" />
+    <ClInclude Include="Emu\RSX\VK\vd1_cmdstream.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommonDecompiler.h" />
     <ClInclude Include="Emu\RSX\VK\VKCompute.h" />
     <ClInclude Include="Emu\RSX\VK\VKDataHeapManager.h" />
@@ -79,6 +80,7 @@
     <ClCompile Include="Emu\RSX\VK\upscalers\smaa\smaa_pass.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKAsyncScheduler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommandStream.cpp" />
+    <ClCompile Include="Emu\RSX\VK\vd1_cmdstream.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommonDecompiler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCompute.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKDataHeapManager.cpp" />

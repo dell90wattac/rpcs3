@@ -62,3 +62,9 @@ namespace vk
 
 	inline VkBool32 to_bool32(bool x) { return x ? VK_TRUE : VK_FALSE; }
 }
+
+// vanillad1: X527 C1 stage 3 (CSREC): the vkCmd* shim. Function-like macros map every vkCmd* name RPCS3 records with (and the
+// VKProcTable.h pointers) to wrappers that encode calls on the RSX thread's deferred primary command buffer and call through
+// for every other buffer. Must stay after <vulkan/vulkan.h> and VKProcTable.h. VD1_CS_NO_SHIM before the first include of
+// this header = declarations only (vd1_cmdstream.cpp).
+#include "vd1_cmdstream.h"

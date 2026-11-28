@@ -645,6 +645,7 @@ if(TARGET 3rdparty_vulkan)
         RSX/VK/vkutils/unique_resource.cpp
         RSX/VK/VKAsyncScheduler.cpp
         RSX/VK/VKCommandStream.cpp
+        RSX/VK/vd1_cmdstream.cpp
         RSX/VK/VKCommonDecompiler.cpp
         RSX/VK/VKCommonPipelineLayout.cpp
         RSX/VK/VKCompute.cpp

@@ -73,6 +73,19 @@ namespace vk
 
 	void command_buffer::reset()
 	{
+		// vanillad1: X527 CSREC: a primary-chain buffer is reset through the stream while the RSX thread encodes; a direct
+		// reset first replays the stream (the primary pool is touched by one thread at a time)
+		if (vd1_deferrable) [[unlikely]]
+		{
+			if (vk::vd1_cs_rec_active())
+			{
+				vk::vd1_cs_rec_reset(commands, 0);
+				return;
+			}
+
+			vk::vd1_cs_rec_quiesce();
+		}
+
 		// Do the driver reset
 		CHECK_RESULT(vkResetCommandBuffer(commands, 0));
 	}
@@ -108,7 +121,23 @@ namespace vk
 		begin_infos.pInheritanceInfo = &inheritance_info;
 		begin_infos.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 		begin_infos.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		CHECK_RESULT(vkBeginCommandBuffer(commands, &begin_infos));
+
+		// vanillad1: X527 CSREC: the mode is latched here for the whole recording (a live flip applies from the next buffer)
+		vd1_rec_mode = vd1_deferrable ? static_cast<u8>(vk::vd1_cs_rec_begin_mode()) : u8{0};
+		if (vd1_rec_mode)
+		{
+			vk::vd1_cs_rec_begin(commands, begin_infos.flags, vd1_rec_mode);
+		}
+		else
+		{
+			if (vd1_deferrable)
+			{
+				vk::vd1_cs_rec_quiesce(); // recorded directly: nothing of the stream may still be pending on this pool
+			}
+
+			CHECK_RESULT(vkBeginCommandBuffer(commands, &begin_infos));
+		}
+
 		is_open = true;
 
 		clear_state_cache();
@@ -122,7 +151,16 @@ namespace vk
 			return;
 		}
 
-		CHECK_RESULT(vkEndCommandBuffer(commands));
+		if (vd1_rec_mode) // vanillad1: X527 CSREC: END packet; CSREC=1 replays it all here, 2/3 at the submit
+		{
+			vd1_seal_token = vk::vd1_cs_seal(commands);
+			vd1_rec_mode = 0;
+		}
+		else
+		{
+			CHECK_RESULT(vkEndCommandBuffer(commands));
+		}
+
 		is_open = false;
 	}
 
@@ -144,6 +182,7 @@ namespace vk
 		}
 
 		submit_info.commands = this->commands;
+		submit_info.vd1_replay_token = std::exchange(vd1_seal_token, 0); // vanillad1: X527 CSREC
 		queue_submit(submit_info, flush);
 		clear_flags();
 	}

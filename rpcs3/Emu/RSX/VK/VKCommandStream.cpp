@@ -62,6 +62,19 @@ namespace vk
 			return n;
 		}
 
+		// X527 review F3: the newest stream token among the queued packets; their buffers are replayed BEFORE s_token is taken,
+		// so the token covers only the vkQueueSubmit calls and fault threads' inline submits never wait behind a replay
+		static u64 newest_token()
+		{
+			u64 newest = 0;
+			std::lock_guard q(s_qlock);
+			for (const auto& p : s_queue)
+			{
+				newest = std::max(newest, p.vd1_replay_token);
+			}
+			return newest;
+		}
+
 		static void maybe_log()
 		{
 			const u64 now = get_system_time();
@@ -103,6 +116,10 @@ namespace vk
 
 		const u64 t0 = get_system_time();
 		u32 n = 0;
+		if (const u64 newest = vd1_cs::newest_token()) // X527 CSREC (review F3): the queued buffers' replay outside the token
+		{
+			vd1_cs_replay_until(newest);
+		}
 		{
 			std::lock_guard tk(vd1_cs::s_token); // waits for a packet the worker is running
 			n = vd1_cs::run_locked();
@@ -127,6 +144,7 @@ namespace vk
 			rsx_log.notice("vanillad1: submit worker pinned to 0x%x (VANILLAD1_CS_CPU)", mask);
 		}
 
+		vd1_cs_rec_set_worker(); // vanillad1: X527 CSREC (stats: replays by the worker)
 		vd1_cs::s_running = true;
 
 		while (thread_ctrl::state() != thread_state::aborting)
@@ -135,8 +153,19 @@ namespace vk
 
 			if (vd1_cs::s_inflight)
 			{
+				if (const u64 newest = vd1_cs::newest_token()) // X527 CSREC (review F3): replay outside the token
+				{
+					vd1_cs_replay_until(newest);
+				}
+
 				std::lock_guard tk(vd1_cs::s_token);
 				vd1_cs::st_worker += vd1_cs::run_locked();
+				continue;
+			}
+
+			if (vd1_cs_rec_backlog()) // vanillad1: X527 CSREC=3: published chunks, replayed ahead of their submit
+			{
+				vd1_cs_rec_replay_published();
 				continue;
 			}
 
@@ -148,6 +177,12 @@ namespace vk
 		std::lock_guard tk(vd1_cs::s_token);
 		vd1_cs::st_worker += vd1_cs::run_locked();
 	}
+	void vd1_cs_wake() // vanillad1: X527 CSREC=3: a chunk was published
+	{
+		vd1_cs::s_wake++;
+		vd1_cs::s_wake.notify_one();
+	}
+
 	// global submit guard to prevent race condition on queue submit
 	shared_mutex g_submit_mutex;
 
@@ -165,6 +200,14 @@ namespace vk
 	static void queue_submit_impl(const queue_submit_t& submit_info)
 	{
 		ensure(submit_info.pfence);
+
+		// vanillad1: X527 CSREC: the buffer's packets reach the real VkCommandBuffer first (no-op when already replayed: CSREC=1,
+		// the replay before the token (review F3), or the worker's eager CSREC=3 batches). Never g_submit_mutex inside it.
+		if (submit_info.vd1_replay_token) [[unlikely]]
+		{
+			vd1_cs_replay_until(submit_info.vd1_replay_token);
+		}
+
 		acquire_global_submit_lock();
 		VkSubmitInfo info
 		{
@@ -192,7 +235,11 @@ namespace vk
 
 		// Access to this method must be externally synchronized.
 		// Offloader is guaranteed to never call this for async flushes.
-		vk::descriptors::flush();
+		{
+			const bool vd1_hold = vd1_cs_rec_hold_begin(); // vanillad1: X527 CSREC=3: no worker replay while sets are written (risks R7)
+			vk::descriptors::flush();
+			if (vd1_hold) vd1_cs_rec_hold_end();
+		}
 
 		if (!flush && g_cfg.video.multithreaded_rsx)
 		{

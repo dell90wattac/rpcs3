@@ -37,6 +37,7 @@ namespace vk
 		std::array<VkPipelineStageFlags, 4> wait_stages {};
 		u32 wait_semaphores_count = 0;
 		u32 signal_semaphores_count = 0;
+		u64 vd1_replay_token = 0; // vanillad1: X527 CSREC: the stream position this buffer's packets end at (0 = none); replayed before the submit
 
 		queue_submit_t() = default;
 		queue_submit_t(VkQueue queue_, vk::fence* fence_)
@@ -94,6 +95,11 @@ namespace vk
 			f32 blend[4]{};
 		}
 		vd1_dyn;
+
+		// vanillad1: X527 C1 stage 3 (CSREC): the primary chain's buffers go through the packet stream (vd1_cmdstream.h)
+		bool vd1_deferrable = false; // set by command_buffer_chain::vd1_mark_deferrable (VKGSRender's primary chain only)
+		u8 vd1_rec_mode = 0;         // CSREC mode latched at begin(); 0 = recorded directly
+		u64 vd1_seal_token = 0;      // end() of a deferred recording -> carried by the next submit
 
 		enum command_buffer_data_flag : u32
 		{

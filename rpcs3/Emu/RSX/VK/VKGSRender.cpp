@@ -424,6 +424,8 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		g_fxo->need<vk::vd1_cs_thread>();
 	}
 
+	vk::vd1_cs_rec_init(vk::vd1_cs_boot_on() && !g_cfg.video.multithreaded_rsx); // vanillad1: X527 C1 stage 3 (CSREC): the packet arena
+
 	if (!m_instance.create("RPCS3"))
 	{
 		rsx_log.fatal("Could not find a Vulkan compatible GPU driver. Your GPU(s) may not support Vulkan, or you need to install the Vulkan runtime and drivers");
@@ -497,6 +499,7 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	// create command buffer...
 	m_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
 	m_primary_cb_list.create(m_command_buffer_pool, vk::command_buffer::access_type_hint::flush_only);
+	m_primary_cb_list.vd1_mark_deferrable(); // vanillad1: X527 CSREC: only this chain; its pool has no other user (C1 trap 7)
 	m_current_command_buffer = m_primary_cb_list.get();
 	m_current_command_buffer->begin();
 
@@ -1578,6 +1581,8 @@ void VKGSRender::bind_viewport()
 
 void VKGSRender::on_init_thread()
 {
+	vk::vd1_cs_rec_set_producer(); // vanillad1: X527 CSREC: this thread encodes the primary chain from its next begin()
+
 	if (m_device == VK_NULL_HANDLE)
 	{
 		fmt::throw_exception("No Vulkan device was created");
@@ -1622,6 +1627,7 @@ void VKGSRender::on_init_thread()
 
 void VKGSRender::on_exit()
 {
+	vk::vd1_cs_rec_stop(m_current_command_buffer); // vanillad1: X527 CSREC: replay all; the open buffer and every later one are recorded directly
 	GSRender::on_exit();
 	vk::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
 	zcull_ctrl.release();

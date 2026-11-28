@@ -3,6 +3,7 @@
   <ItemGroup>
     <ClCompile Include="Emu\RSX\VK\VKAsyncScheduler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommandStream.cpp" />
+    <ClCompile Include="Emu\RSX\VK\vd1_cmdstream.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommonDecompiler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCompute.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKDataHeapManager.cpp" />
@@ -115,6 +116,7 @@
     <ClInclude Include="Emu\RSX\VK\VKVertexProgram.h" />
     <ClInclude Include="Emu\RSX\VK\VulkanAPI.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommandStream.h" />
+    <ClInclude Include="Emu\RSX\VK\vd1_cmdstream.h" />
     <ClInclude Include="Emu\RSX\VK\VKQueryPool.h" />
     <ClInclude Include="Emu\RSX\VK\VKPipelineCompiler.h" />
     <ClInclude Include="Emu\RSX\VK\VKProgramPipeline.h" />

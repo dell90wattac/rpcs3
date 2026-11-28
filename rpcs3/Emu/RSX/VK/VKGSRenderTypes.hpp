@@ -302,6 +302,15 @@ namespace vk
 			}
 		}
 
+		// vanillad1: X527 CSREC: this chain's buffers may record through the packet stream (VKGSRender's primary chain)
+		void vd1_mark_deferrable()
+		{
+			for (auto& cb : m_cb_list)
+			{
+				cb.vd1_deferrable = true;
+			}
+		}
+
 		void destroy()
 		{
 			for (auto& cb : m_cb_list)
