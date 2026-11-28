@@ -3131,8 +3131,43 @@ void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)
 	{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_rtts); prepare_rtts(context); } // vanillad1: RSX timers (P3)
 }
 
+namespace
+{
+	// vanillad1: X527 SUBN: draws per primary submit, a line per 10 s
+	struct vd1_subn_stats_t
+	{
+		u32 submits = 0, by_subn = 0, empty = 0, max_draws = 0;
+		u64 draws = 0;
+		u32 hist[5]{}; // 1-15, 16-63, 64-255, 256-1023, 1024+ draws
+		u64 last_ms = 0;
+	} s_vd1_subn;
+}
+
+void VKGSRender::vd1_subn_on_submit()
+{
+	auto& s = s_vd1_subn;
+	const u32 d = m_vd1_draws_in_cb;
+	m_vd1_draws_in_cb = 0;
+	m_vd1_last_submit_us = get_system_time();
+	s.submits++;
+	if (m_vd1_flush_why == 'S') s.by_subn++;
+	s.draws += d;
+	s.max_draws = std::max(s.max_draws, d);
+	if (!d) s.empty++;
+	else s.hist[d < 16 ? 0 : d < 64 ? 1 : d < 256 ? 2 : d < 1024 ? 3 : 4]++;
+	const u64 now = m_vd1_last_submit_us / 1000;
+	if (!s.last_ms) { s.last_ms = now; return; }
+	if (now - s.last_ms < 10000) return;
+	rsx_log.notice("vanillad1: subn 10s: SUBN=%u primary submits %u (by SUBN %u, empty %u), draws %llu, max %u a submit; "
+		"submits with 1-15 draws %u, 16-63 %u, 64-255 %u, 256-1023 %u, 1024+ %u",
+		vd1::live(vd1::lf::SUBN), s.submits, s.by_subn, s.empty, s.draws, s.max_draws, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4]);
+	s = {};
+	s.last_ms = now;
+}
+
 void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
 {
+	vd1_subn_on_submit(); // vanillad1: X527 SUBN (reads m_vd1_flush_why before the label flush resets it)
 	if (m_vd1_flush_why == '?') m_vd1_flush_why = 'P'; // vanillad1: label safety (X421)
 	vd1_label_flush(); // vanillad1: label batching (P9): the batch first (the primary submit writes commands_complete_event for newer labels)
 
@@ -4631,6 +4666,7 @@ namespace
 	{
 		u32 labels = 0, ran = 0, retired = 0, late = 0, spu_live = 0, slot = 0, unfilled = 0, abort = 0, nosurf = 0, badsurf = 0, taken = 0;
 		u32 pre = 0; u64 pre_us = 0, pre_max = 0; // vanillad1: X527 SDPRE
+		u64 pre_pending = 0, pre_since_us = 0; u32 pre_pending_max = 0; // vanillad1: X527 SUBN: the command buffer at the pre-flush
 		u32 spins = 0, gpu_waits = 0, timeouts = 0, checks = 0, check_bad = 0, dumps = 0;
 		u64 spin_us = 0, spin_max = 0, gpu_us = 0, gpu_max = 0, retire_us = 0, retire_max = 0;
 		u64 last_ms = 0, last_flip = 0;
@@ -4645,11 +4681,12 @@ namespace
 		const u64 frames = std::max<u64>(flip - c.last_flip, 1);
 		rsx_log.notice("vanillad1: gpu sdsm 10s: %llu frames, labels=%u ran=%u retired=%u (late %u) live SDSMSPU=%u declined: slot=%u unfilled=%u abort=%u nosurf=%u badsurf=%u taken=%u; "
 			"self-jump %.3f ms a frame (%u waits, max %.2f ms); GPU wait %.3f ms a frame (%u, max %.2f ms, timeouts %u); retire %.3f ms a frame (max %.2f ms); "
-			"checks %u (bad %u), dumps %u; SDPRE=%u pre-flushes %u, %.3f ms a frame (max %.2f ms)",
+			"checks %u (bad %u), dumps %u; SDPRE=%u pre-flushes %u, %.3f ms a frame (max %.2f ms), unsubmitted draws %.0f (max %u), %.2f ms since the last submit",
 			frames, c.labels, c.ran, c.retired, c.late, c.spu_live, c.slot, c.unfilled, c.abort, c.nosurf, c.badsurf, c.taken,
 			c.spin_us / 1000. / frames, c.spins, c.spin_max / 1000., c.gpu_us / 1000. / frames, c.gpu_waits, c.gpu_max / 1000., c.timeouts,
 			c.retire_us / 1000. / frames, c.retire_max / 1000., c.checks, c.check_bad, c.dumps,
-			vd1::live(vd1::lf::SDPRE), c.pre, c.pre_us / 1000. / frames, c.pre_max / 1000.);
+			vd1::live(vd1::lf::SDPRE), c.pre, c.pre_us / 1000. / frames, c.pre_max / 1000.,
+			c.pre ? double(c.pre_pending) / c.pre : 0., c.pre_pending_max, c.pre ? c.pre_since_us / 1000. / c.pre : 0.);
 		const u32 dumps = c.dumps;
 		c = {};
 		c.last_ms = now;
@@ -4737,9 +4774,14 @@ void VKGSRender::vd1_sdsm_label(u32 ea, u32 value)
 	// this thread runs the stock CPU-read flush of the range itself (on_access_violation on the RSX thread: the command
 	// buffer submitted, the copy, the write-back to guest memory, the unprotect) before the word lands: the SPUs then read
 	// current, unprotected memory. This thread waits for the GPU here instead of at the self-jump a few commands later.
-	if (mode != sd_on && vd1::live(vd1::lf::SDPRE))
+	// X527 build 6: also with VANILLAD1_GPU_SDSM=1 while live SDSMSPU=1 hands the frame back to the SPUs (an A/B of the GPU job
+	// against the SPUs' best path on one boot).
+	if ((mode != sd_on || vd1::live(vd1::lf::SDSMSPU)) && vd1::live(vd1::lf::SDPRE))
 	{
 		const u64 t_pre = get_system_time();
+		c.pre_pending += m_vd1_draws_in_cb;
+		c.pre_pending_max = std::max(c.pre_pending_max, m_vd1_draws_in_cb);
+		c.pre_since_us += m_vd1_last_submit_us ? t_pre - std::min(t_pre, m_vd1_last_submit_us) : 0;
 		on_access_violation(z_ea, false);
 		const u64 d_pre = get_system_time() - t_pre;
 		c.pre++;

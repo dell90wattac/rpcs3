@@ -359,6 +359,10 @@ protected:
 	std::unique_ptr<vk::event> m_vd1_sd_event;       // set once the readback copies are done
 	u32 m_vd1_sd_spin_ea = 0;                        // the self-jump being timed
 	u64 m_vd1_sd_spin_t0 = 0, m_vd1_sd_spin_last = 0;
+	// vanillad1: X527 SUBN (live, VKDraw.cpp begin): draws recorded into the open primary command buffer since its last submit
+	u32 m_vd1_draws_in_cb = 0;
+	u64 m_vd1_last_submit_us = 0;
+	void vd1_subn_on_submit();
 	void notify_tile_unbound(u32 tile) override;
 
 	bool on_access_violation(u32 address, bool is_writing) override;

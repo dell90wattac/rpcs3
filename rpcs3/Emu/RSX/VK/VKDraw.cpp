@@ -1524,6 +1524,16 @@ void VKGSRender::begin()
 		return;
 	}
 
+	// vanillad1: X527 SUBN=<n> (live): once the open primary command buffer holds n draws, submit it before this draw records
+	// anything (the same flush a fault or a label makes between draws), so the GPU starts on a long pass while this thread is
+	// still recording it. At 200 % the RSX thread waited ~3.5-4 ms a frame for the G-buffer at sdsm's start word (SDPRE) and
+	// in the fault service: the pass reached the GPU only when its readback was asked for. 0 = stock.
+	if (const u32 subn = vd1::live(vd1::lf::SUBN); subn && m_vd1_draws_in_cb >= subn) [[unlikely]]
+	{
+		m_vd1_flush_why = 'S'; // vanillad1: X527 SUBN
+		flush_command_queue();
+	}
+
 	init_buffers(rsx::framebuffer_creation_context::context_draw);
 
 	if (m_graphics_state & rsx::pipeline_state::invalidate_pipeline_bits)
@@ -1678,6 +1688,8 @@ void VKGSRender::end()
 	}
 
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
+
+	m_vd1_draws_in_cb++; // vanillad1: X527 SUBN (counted always: the 10-s line shows draws per submit with SUBN off too)
 
 	rsx::thread::end();
 }
