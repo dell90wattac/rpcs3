@@ -82,4 +82,5 @@ namespace vk
 	bool vd1_cs_boot_on();      // VANILLAD1_CS=1, read once
 	void vd1_cs_help_drain();   // runs every queued submit on the calling thread (no-op when none is queued or running)
 	void vd1_cs_wake();         // wakes the submit worker (X527 CSREC=3: a chunk was published)
+	void vd1_cs_help_drain_try(); // X527 CSTRY: a poller's help-drain that never waits (live CSTRY; 0 = vd1_cs_help_drain)
 }

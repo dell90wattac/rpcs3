@@ -1643,6 +1643,27 @@ namespace vd1_rec::api
 		replay_locked(token);
 	}
 
+	// X527 CSTRY: as vd1_cs_replay_until, but never waits for the replay lock: false when another thread (the worker) holds it,
+	// so a poller (event::status) does not stall behind a whole buffer's replay
+	bool vd1_cs_replay_until_try(u64 token)
+	{
+		if (!token || s_replayed.load() >= token) [[likely]]
+		{
+			return true;
+		}
+
+		if (!s_replay.try_lock())
+		{
+			return false;
+		}
+
+		const u64 published = s_published.load();
+		ensure(token <= published, "vanillad1: CSREC: a submit token beyond what is published");
+		replay_locked(token);
+		s_replay.unlock();
+		return true;
+	}
+
 	void vd1_cs_rec_quiesce()
 	{
 		if (!s_enabled.observe())
@@ -1755,6 +1776,7 @@ namespace vk
 	void vd1_cs_rec_reset(VkCommandBuffer cb, VkCommandBufferResetFlags flags) { vd1_rec::api::vd1_cs_rec_reset(cb, flags); }
 	u64 vd1_cs_seal(VkCommandBuffer cb) { return vd1_rec::api::vd1_cs_seal(cb); }
 	void vd1_cs_replay_until(u64 token) { vd1_rec::api::vd1_cs_replay_until(token); }
+	bool vd1_cs_replay_until_try(u64 token) { return vd1_rec::api::vd1_cs_replay_until_try(token); }
 	void vd1_cs_rec_quiesce() { vd1_rec::api::vd1_cs_rec_quiesce(); }
 	bool vd1_cs_rec_backlog() { return vd1_rec::api::vd1_cs_rec_backlog(); }
 	void vd1_cs_rec_replay_published() { vd1_rec::api::vd1_cs_rec_replay_published(); }

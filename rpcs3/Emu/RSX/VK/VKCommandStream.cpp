@@ -130,6 +130,41 @@ namespace vk
 		vd1_cs::st_help_us += get_system_time() - t0;
 	}
 
+	// X527 CSTRY (live): the help-drain of a poller (event::status: the fault fast path's copy checks, label and query polls).
+	// It never waits: if the worker holds the replay lock or the token, the poller returns and polls again, instead of
+	// stalling behind a whole buffer's replay (X527: CSUB + CSREC=2, 1,896 help calls / 516 ms in 10 s). 0 = vd1_cs_help_drain.
+	void vd1_cs_help_drain_try()
+	{
+		if (!vd1_cs::s_inflight) [[likely]]
+		{
+			return;
+		}
+
+		if (!vd1::live(vd1::lf::CSTRY))
+		{
+			vd1_cs_help_drain();
+			return;
+		}
+
+		if (const u64 newest = vd1_cs::newest_token())
+		{
+			if (!vd1_cs_replay_until_try(newest))
+			{
+				return;
+			}
+		}
+
+		if (!vd1_cs::s_token.try_lock())
+		{
+			return;
+		}
+
+		const u32 n = vd1_cs::run_locked();
+		vd1_cs::s_token.unlock();
+		vd1_cs::st_helped += n;
+		vd1_cs::st_help_calls++;
+	}
+
 	void vd1_cs_worker_t::operator()()
 	{
 		// vanillad1: X527: VANILLAD1_CS_CPU=<hex mask> pins the worker (e.g. 2 = the RSX thread's SMT sibling under the split, which

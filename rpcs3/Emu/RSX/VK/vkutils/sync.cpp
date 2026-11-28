@@ -16,6 +16,7 @@
 namespace vk
 {
 	void vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB), VKCommandStream.cpp
+	void vd1_cs_help_drain_try(); // vanillad1: X527 CSTRY
 
 	namespace globals
 	{
@@ -382,7 +383,7 @@ namespace vk
 
 	VkResult event::status() const
 	{
-		vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): the command buffer that sets this may still be queued (one load when none is)
+		vd1_cs_help_drain_try(); // vanillad1: X527 C1 (CSUB): the command buffer that sets this may still be queued (one load when none is; CSTRY: never waits)
 
 		if (m_backend != sync_backend::gpu_label) [[ likely ]]
 		{

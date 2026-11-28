@@ -48,6 +48,7 @@ namespace vk
 	void vd1_cs_rec_reset(VkCommandBuffer cb, VkCommandBufferResetFlags flags);            // RESET packet
 	u64  vd1_cs_seal(VkCommandBuffer cb);            // END packet; returns the token the buffer's submit carries (CSREC=1: replayed here)
 	void vd1_cs_replay_until(u64 token);             // any thread: runs every packet before `token` (no-op if done)
+	bool vd1_cs_replay_until_try(u64 token);         // X527 CSTRY: as above, false at once when the replay lock is held
 	void vd1_cs_rec_quiesce();                       // before a direct call on a primary-chain buffer: replay everything
 	bool vd1_cs_rec_backlog();                       // CSREC=3: published packets the worker may replay ahead of the submit
 	void vd1_cs_rec_replay_published();              // worker: replay a bounded batch of what is published
