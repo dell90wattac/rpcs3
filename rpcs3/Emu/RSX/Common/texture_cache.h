@@ -188,6 +188,28 @@ namespace rsx
 		inline std::atomic<u64> g_last_log{0};
 	}
 
+	// vanillad1: X527: why vd1_flush_all_ready took or declined a fault, and why a copy was not ready (vd1_copy_done), counted
+	// while VANILLAD1_FAULT_STATS is set; VKGSRender logs them every 10 s ("vanillad1: ff why 10s: ...")
+	namespace vd1_ff_why
+	{
+		enum : u32
+		{
+			empty, retag_clean, retag_stock, notsync, always, range, excl_fb, notready, pending, ok,
+			cd_nofence, cd_unsub, cd_timeout, cd_done, cd_set,
+			count
+		};
+
+		inline std::atomic<u64> g[count]{};
+
+		inline void bump(u32 r)
+		{
+			if (vd1_fault_stats_secs()) [[unlikely]]
+			{
+				g[r].fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+
 	// vanillad1: fault fast path (X300.3): VANILLAD1_FAULT_FAST_WAIT_US=<n> (decimal, read once; default 1000, 0 = never wait):
 	// how long a fault waits for a copy whose command buffer was submitted but has not finished on the GPU, before it falls
 	// back to the stock flush request
@@ -2617,6 +2639,7 @@ namespace rsx
 
 			if (data.sections_to_flush.empty())
 			{
+				vd1_ff_why::bump(vd1_ff_why::empty);
 				return 0;
 			}
 
@@ -2631,6 +2654,7 @@ namespace rsx
 				if (again.num_flushable == 0)
 				{
 					data.vd1_retag = true;
+					vd1_ff_why::bump(vd1_ff_why::retag_clean);
 					return 1;
 				}
 
@@ -2651,6 +2675,7 @@ namespace rsx
 				// in 10 s were "cache changed" with sections still flushable, each a flush request that parks the RSX thread)
 				if (!vd1::live(vd1::lf::FFRECHECK))
 				{
+					vd1_ff_why::bump(vd1_ff_why::retag_stock);
 					return 0;
 				}
 			}
@@ -2661,6 +2686,8 @@ namespace rsx
 				if (!surface->is_synchronized() || surface->get_memory_read_flags() == memory_read_flags::flush_always ||
 					!vd1_fault_fast_covers(surface->get_section_range()))
 				{
+					vd1_ff_why::bump(!surface->is_synchronized() ? vd1_ff_why::notsync :
+						surface->get_memory_read_flags() == memory_read_flags::flush_always ? vd1_ff_why::always : vd1_ff_why::range);
 					return 0;
 				}
 			}
@@ -2670,6 +2697,7 @@ namespace rsx
 				// flush_set would resync this render target from the flushed ones (the surface cache's state): stock path
 				if (excluded->get_context() == texture_upload_context::framebuffer_storage)
 				{
+					vd1_ff_why::bump(vd1_ff_why::excl_fb);
 					return 0;
 				}
 			}
@@ -2681,6 +2709,7 @@ namespace rsx
 				const int vd1_state = static_cast<int>(ready(*surface));
 				if (vd1_state == 0)
 				{
+					vd1_ff_why::bump(vd1_ff_why::notready);
 					return 0;
 				}
 				if (vd1_state == 2)
@@ -2691,12 +2720,14 @@ namespace rsx
 
 			if (vd1_pending)
 			{
+				vd1_ff_why::bump(vd1_ff_why::pending);
 				return vd1_pending;
 			}
 
 			// No transfer below (every section is synchronized and flush_once): the write-back to guest memory and the unprotect
 			flush_set(cmd, data, {}, std::forward<Args>(extras)...);
 			unprotect_set(data);
+			vd1_ff_why::bump(vd1_ff_why::ok);
 			return 1;
 		}
 

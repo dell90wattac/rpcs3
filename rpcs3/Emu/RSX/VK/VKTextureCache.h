@@ -236,16 +236,19 @@ namespace vk
 		{
 			if (!synchronized || !dma_fence)
 			{
+				rsx::vd1_ff_why::bump(rsx::vd1_ff_why::cd_nofence); // vanillad1: X527
 				return false;
 			}
 
 			if (dma_fence->status() == VK_EVENT_SET)
 			{
+				rsx::vd1_ff_why::bump(rsx::vd1_ff_why::cd_set);
 				return true;
 			}
 
 			if (!wait_us || !m_vd1_copy_eid || vk::current_event_id() < m_vd1_copy_eid)
 			{
+				rsx::vd1_ff_why::bump(rsx::vd1_ff_why::cd_unsub);
 				return false;
 			}
 
@@ -257,6 +260,7 @@ namespace vk
 			{
 				if (utils::get_tsc() - t0 > limit)
 				{
+					rsx::vd1_ff_why::bump(rsx::vd1_ff_why::cd_timeout);
 					return false;
 				}
 
@@ -270,6 +274,7 @@ namespace vk
 				utils::pause();
 			}
 
+			rsx::vd1_ff_why::bump(rsx::vd1_ff_why::cd_done);
 			return true;
 		}
 

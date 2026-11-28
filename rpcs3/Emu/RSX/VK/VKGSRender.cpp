@@ -2436,6 +2436,20 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 	if (rsx::vd1_fault_stats_secs()) [[unlikely]] // vanillad1: fault stats (X300.3)
 	{
 		vd1_fault::maybe_dump(int_flip_index);
+
+		// vanillad1: X527: why the fault fast path took or declined faults (rsx::vd1_ff_why), every 10 s
+		static u64 s_why_last_us = 0;
+		if (const u64 now = get_system_time(); now - s_why_last_us >= 10'000'000)
+		{
+			s_why_last_us = now;
+			auto take = [](u32 r) { return static_cast<u32>(rsx::vd1_ff_why::g[r].exchange(0)); };
+			namespace w = rsx::vd1_ff_why;
+			rsx_log.notice("vanillad1: ff why 10s: ok=%u empty=%u retag_clean=%u retag_stock=%u notsync=%u always=%u range=%u excl_fb=%u notready=%u pending=%u"
+				" | copy_done: set=%u done=%u nofence=%u unsubmitted=%u timeout=%u",
+				take(w::ok), take(w::empty), take(w::retag_clean), take(w::retag_stock), take(w::notsync), take(w::always), take(w::range),
+				take(w::excl_fb), take(w::notready), take(w::pending), take(w::cd_set), take(w::cd_done), take(w::cd_nofence), take(w::cd_unsub),
+				take(w::cd_timeout));
+		}
 	}
 
 	if (m_queue_status & flush_queue_state::deadlock)
