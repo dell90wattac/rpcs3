@@ -419,6 +419,11 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	g_fxo->need<rsx::dma_manager>();
 	g_fxo->need<vk::driver_manager_thread>();
 
+	if (vk::vd1_cs_boot_on() && !g_cfg.video.multithreaded_rsx) // vanillad1: X527 C1 stage 1 (CSUB): the submit worker
+	{
+		g_fxo->need<vk::vd1_cs_thread>();
+	}
+
 	if (!m_instance.create("RPCS3"))
 	{
 		rsx_log.fatal("Could not find a Vulkan compatible GPU driver. Your GPU(s) may not support Vulkan, or you need to install the Vulkan runtime and drivers");
@@ -820,6 +825,7 @@ VKGSRender::~VKGSRender()
 	}
 
 	//Wait for device to finish up with resources
+	vk::vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): nothing left queued on the submit worker
 	vkDeviceWaitIdle(*m_device);
 
 	// Globals. TODO: Refactor lifetime management
@@ -2092,6 +2098,8 @@ void VKGSRender::vd1_label_stall_dump(u32 get, u32 put)
 // vanillad1: label batching (P9): end the open batch: the newest label id, one submit, then the label counts as released
 void VKGSRender::vd1_label_flush()
 {
+	const char vd1_why = m_vd1_flush_why; // vanillad1: X527 C1 (CSUB): a guest waiting on these labels gets them now ('E', 'A')
+
 	if (!m_vd1_label_cb)
 	{
 		m_vd1_flush_why = '?'; // vanillad1: label safety (X421)
@@ -2117,6 +2125,11 @@ void VKGSRender::vd1_label_flush()
 
 	vk::queue_submit_t submit_info = { m_device->get_graphics_queue(), nullptr };
 	cmd->submit(submit_info);
+
+	if (vd1_why == 'E' || vd1_why == 'A') // vanillad1: X527 C1 (CSUB): the FIFO is empty or the guest acquires: submit now, not on the worker's wake
+	{
+		vk::vd1_cs_help_drain();
+	}
 
 	m_host_dma_ctrl->host_ctx()->on_label_release();
 	m_frame_stats.vd1_lbatches++;
@@ -2183,6 +2196,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	{
 		// All texture loads already seen by the host GPU
 		// Wait for all previously submitted labels to be flushed
+		vk::vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): the labels' command buffers reach the queue first
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
 		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('C', type, address, args); // vanillad1: label safety (X421)
 		return false;
@@ -2201,6 +2215,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 		m_vd1_flush_why = 'F'; // vanillad1: label safety (X421)
 		vd1_label_flush(); // vanillad1: label batching (P9)
 		if (m_vd1_ltrace) [[unlikely]] vd1_ltrace('F', type, address, args); // vanillad1: label safety (X421)
+		vk::vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): the labels' command buffers reach the queue first
 		{ rsx::scoped_stat_timer vd1_timer(m_profiler.enabled, m_frame_stats.vd1_drain); m_host_dma_ctrl->drain_label_queue(); } // vanillad1: RSX timers (P3)
 		return false;
 	}
@@ -3243,6 +3258,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	// Reset framebuffer information
 	const auto color_bpp = get_format_block_size_in_bytes(m_framebuffer_layout.color_format);
 	const auto samples = get_format_sample_count(m_framebuffer_layout.aa_mode);
+	bool vd1_ff_copied = false; // vanillad1: X527 FFSUB: a readback copy in VANILLAD1_FAULT_FAST's ranges was recorded below
 
 	for (u8 i = 0; i < rsx::limits::color_buffers_count; ++i)
 	{
@@ -3252,7 +3268,10 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		{
 			const utils::address_range32 rsx_range = m_surface_info[i].get_memory_range();
 			m_texture_cache.set_memory_read_flags(rsx_range, rsx::memory_read_flags::flush_once);
-			m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, rsx_range);
+			if (m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, rsx_range) && rsx::vd1_fault_fast_covers(rsx_range))
+			{
+				vd1_ff_copied = true;
+			}
 		}
 
 		m_surface_info[i].address = m_surface_info[i].pitch = 0;
@@ -3269,7 +3288,10 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		{
 			const utils::address_range32 surface_range = m_depth_surface_info.get_memory_range();
 			m_texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
-			m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range);
+			if (m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range) && rsx::vd1_fault_fast_covers(surface_range))
+			{
+				vd1_ff_copied = true; // vanillad1: X527 FFSUB
+			}
 		}
 
 		m_depth_surface_info.address = m_depth_surface_info.pitch = 0;
@@ -3278,6 +3300,27 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		m_depth_surface_info.depth_format = m_framebuffer_layout.depth_format;
 		m_depth_surface_info.bpp = get_format_block_size_in_bytes(m_framebuffer_layout.depth_format);
 		m_depth_surface_info.samples = samples;
+	}
+
+	// vanillad1: X527 FFSUB (live): the readback copies just recorded for VANILLAD1_FAULT_FAST's ranges go to the GPU now.
+	// The SPUs read those surfaces right after this target switch: a fault waits (vd1_copy_done) only for a copy already
+	// submitted, and one still in this command buffer takes the stock flush request, which parks this thread until the
+	// faulting thread has submitted its own work (X527: 554 of 709 hand-off faults in 10 s at 200 %). With CSUB the submit
+	// itself runs on the worker.
+	if (vd1_ff_copied && vd1::live(vd1::lf::FFSUB))
+	{
+		static u32 s_ffsub_flushes = 0;
+		static u64 s_ffsub_last_us = 0;
+		s_ffsub_flushes++;
+
+		if (const u64 now = get_system_time(); now - s_ffsub_last_us >= 10'000'000)
+		{
+			rsx_log.notice("vanillad1: ffsub 10s: flushes=%u (FFSUB=%u)", s_ffsub_flushes, vd1::live(vd1::lf::FFSUB));
+			s_ffsub_flushes = 0;
+			s_ffsub_last_us = now;
+		}
+
+		flush_command_queue();
 	}
 
 	// Bind created rtts as current fbo...

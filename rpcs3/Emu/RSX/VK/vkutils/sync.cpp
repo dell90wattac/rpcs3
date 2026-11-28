@@ -14,6 +14,8 @@
 
 namespace vk
 {
+	void vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB), VKCommandStream.cpp
+
 	namespace globals
 	{
 		static std::unique_ptr<gpu_debug_marker_pool> g_gpu_debug_marker_pool;
@@ -178,6 +180,11 @@ namespace vk
 
 	void fence::wait_flush()
 	{
+		if (!flushed)
+		{
+			vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): a queued submit of this fence runs here, not later on the worker
+		}
+
 		while (!flushed)
 		{
 			utils::pause();
@@ -374,6 +381,8 @@ namespace vk
 
 	VkResult event::status() const
 	{
+		vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): the command buffer that sets this may still be queued (one load when none is)
+
 		if (m_backend != sync_backend::gpu_label) [[ likely ]]
 		{
 			return vkGetEventStatus(*m_device, m_vk_event);

@@ -65,4 +65,20 @@ namespace vk
 	};
 
 	using driver_manager_thread = named_thread<driver_manager_t>;
+
+	// vanillad1: X527 C1 stage 1 (CSUB): the RSX thread's deferred queue submits run on a worker thread. VANILLAD1_CS=1 at boot
+	// starts the worker (unset: no thread, the stock path); the live flag CSUB sends deferred submits to it. Every submit, queued
+	// or inline, reaches the VkQueue in call order: packets run only under one executor token, in FIFO order, and an inline
+	// submit (flush, another thread, CSUB off) first runs whatever is queued. Any thread about to wait for GPU work (a fence's
+	// flush, an event or label poll, a device wait) runs the queue itself first ("help-drain"), so nothing waits on the worker.
+	struct vd1_cs_worker_t
+	{
+		static constexpr std::string_view thread_name = "VD1 Submit Worker"sv;
+		void operator()();
+	};
+
+	using vd1_cs_thread = named_thread<vd1_cs_worker_t>;
+
+	bool vd1_cs_boot_on();      // VANILLAD1_CS=1, read once
+	void vd1_cs_help_drain();   // runs every queued submit on the calling thread (no-op when none is queued or running)
 }

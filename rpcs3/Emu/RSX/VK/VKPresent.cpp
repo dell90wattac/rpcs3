@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "VKGSRender.h"
+#include "VKCommandStream.h" // vanillad1: X527 C1 (CSUB)
 #include "vkutils/buffer_object.h"
 #include "vkutils/memory.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
@@ -132,6 +133,7 @@ bool VKGSRender::reinitialize_swapchain()
 	m_upscaler.reset();
 
 	// Drain all the queues
+	vk::vd1_cs_help_drain(); // vanillad1: X527 C1 (CSUB): nothing left queued on the submit worker
 	vkDeviceWaitIdle(*m_device);
 
 	// Clean the FBO caches
@@ -206,6 +208,10 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
+		// vanillad1: X527 C1 (CSUB): the frame's queued submits reach the queue before the present (only the RSX thread queues,
+		// and it is here, so the worker stays idle during it; other threads' inline submits beside a present are stock behaviour)
+		vk::vd1_cs_help_drain();
+
 		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
 		{
 		case VK_SUCCESS:
